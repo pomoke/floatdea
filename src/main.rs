@@ -1,8 +1,7 @@
 mod data;
 
-use std::collections::{HashMap, HashSet};
-
 use eframe::{App, egui};
+use egui::TextBuffer;
 
 use crate::data::Snippet;
 
@@ -25,8 +24,22 @@ fn main() -> eframe::Result {
 #[derive(Clone, Debug)]
 struct HomePage {
     items: Vec<Snippet>,
-    sub_windows: HashSet<usize>,
-    close_windows: Vec<usize>,
+    views: Vec<View>,
+    next_view_id: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct View {
+    id: u64,
+    item_id: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum ViewAction {
+    #[default]
+    None,
+    Close,
+    Duplicate,
 }
 
 impl Default for HomePage {
@@ -42,14 +55,24 @@ impl Default for HomePage {
                     content: "Welcome to FloatDea!".to_owned(),
                 },
             ],
-            sub_windows: HashSet::new(),
-            close_windows: vec![],
+            views: Vec::new(),
+            next_view_id: 0,
         }
     }
 }
 
+impl HomePage {
+    fn open_view(&mut self, item_id: usize) {
+        let id = self.next_view_id;
+        self.next_view_id += 1;
+        self.views.push(View { id, item_id });
+    }
+}
+
 impl App for HomePage {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let mut open_requests = Vec::new();
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -61,18 +84,29 @@ impl App for HomePage {
                     let btn = ui.button(&item.title);
                     btn.context_menu(|ui| if ui.button("delete").clicked() {});
                     if btn.clicked() {
-                        self.sub_windows.insert(id);
+                        open_requests.push(id);
                     }
                 }
             });
 
-        for id in &self.sub_windows {
-            let title = self.items[*id].title.as_str();
-            let content = self.items[*id].content.as_str();
-            let close = ui.show_viewport_immediate(
-                egui::ViewportId::from_hash_of(title),
-                egui::ViewportBuilder::default(),
+        for item_id in open_requests {
+            self.open_view(item_id);
+        }
+
+        let mut closed_views = Vec::new();
+
+        for view in &self.views {
+            let item = &self.items[view.item_id];
+            let title = item.title.as_str();
+            let content = item.content.as_str();
+            let action = ui.show_viewport_immediate(
+                egui::ViewportId::from_hash_of(("snippet-view", view.id)),
+                egui::ViewportBuilder::default()
+                    .with_title(format!("{} - FloatDea", title))
+                    .with_inner_size([480.0, 320.0]),
                 |child_ui, _viewport_class| {
+                    let mut action = ViewAction::None;
+
                     egui::CentralPanel::default()
                         .frame(
                             egui::Frame::new()
@@ -80,41 +114,86 @@ impl App for HomePage {
                                 .fill(child_ui.visuals().panel_fill),
                         )
                         .show(child_ui, |ui| {
-                            ui.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                                "{} - FloatDea",
-                                title
-                            )));
-
                             egui::Frame::new()
                                 .inner_margin(egui::Margin::same(12))
                                 .show(ui, |ui| {
                                     egui::ScrollArea::vertical()
                                         .auto_shrink([false, false])
                                         .show(ui, |ui| {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(content).size(15.0),
-                                                )
-                                                .selectable(true)
-                                                .wrap(),
-                                            );
+                                            let text_edit_id =
+                                                ui.make_persistent_id(("snippet-content", view.id));
+                                            let saved_selection =
+                                                egui::TextEdit::load_state(ui.ctx(), text_edit_id)
+                                                    .and_then(|state| state.cursor.char_range());
+                                            let secondary_pressed =
+                                                ui.input(|input| input.pointer.secondary_pressed());
+
+                                            let mut read_only_content = content;
+                                            let mut output =
+                                                egui::TextEdit::multiline(&mut read_only_content)
+                                                    .id(text_edit_id)
+                                                    .font(egui::FontId::proportional(18.0))
+                                                    .desired_width(f32::INFINITY)
+                                                    .frame(egui::Frame::NONE)
+                                                    .show(ui);
+
+                                            if secondary_pressed
+                                                && output.response.contains_pointer()
+                                            {
+                                                output.state.cursor.set_char_range(saved_selection);
+                                                output.state.store(ui.ctx(), output.response.id);
+                                            }
+
+                                            output.response.context_menu(|ui| {
+                                                if let Some(selection) = saved_selection {
+                                                    let selected = content
+                                                        .char_range(
+                                                            selection.as_sorted_char_range(),
+                                                        )
+                                                        .to_owned();
+                                                    if selected.is_empty() {
+                                                        if ui.button("Copy All").clicked() {
+                                                            ui.copy_text(content.to_owned());
+                                                            ui.close();
+                                                        }
+                                                    } else {
+                                                        if ui.button("Copy").clicked() {
+                                                            ui.copy_text(selected);
+                                                            ui.close();
+                                                        }
+                                                    }
+                                                } else {
+                                                    if ui.button("Copy All").clicked() {
+                                                        ui.copy_text(content.to_owned());
+                                                        ui.close();
+                                                    }
+                                                }
+
+                                                if ui.button("Edit...").clicked() {}
+                                                ui.separator();
+                                                if ui.button("Duplicate").clicked() {
+                                                    action = ViewAction::Duplicate;
+                                                    ui.close();
+                                                }
+                                            });
                                         });
                                 });
                         });
 
                     if child_ui.input(|input| input.viewport().close_requested()) {
-                        return true;
+                        action = ViewAction::Close;
                     }
-                    false
+                    action
                 },
             );
-            if close {
-                self.close_windows.push(*id);
+
+            match action {
+                ViewAction::None => {}
+                ViewAction::Close => closed_views.push(view.id),
+                ViewAction::Duplicate => {}
             }
         }
-        for id in &self.close_windows {
-            self.sub_windows.remove(id);
-        }
-        self.close_windows.clear();
+
+        self.views.retain(|view| !closed_views.contains(&view.id));
     }
 }
