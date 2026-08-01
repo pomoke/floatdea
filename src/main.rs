@@ -32,6 +32,7 @@ struct HomePage {
 struct View {
     id: u64,
     item_id: usize,
+    editable: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -65,7 +66,11 @@ impl HomePage {
     fn open_view(&mut self, item_id: usize) {
         let id = self.next_view_id;
         self.next_view_id += 1;
-        self.views.push(View { id, item_id });
+        self.views.push(View {
+            id,
+            item_id,
+            editable: false,
+        });
     }
 }
 
@@ -95,10 +100,10 @@ impl App for HomePage {
 
         let mut closed_views = Vec::new();
 
-        for view in &self.views {
-            let item = &self.items[view.item_id];
+        for view in &mut self.views {
+            let item = &mut self.items[view.item_id];
             let title = item.title.as_str();
-            let content = item.content.as_str();
+            let content = &mut item.content;
             let action = ui.show_viewport_immediate(
                 egui::ViewportId::from_hash_of(("snippet-view", view.id)),
                 egui::ViewportBuilder::default()
@@ -128,14 +133,32 @@ impl App for HomePage {
                                             let secondary_pressed =
                                                 ui.input(|input| input.pointer.secondary_pressed());
 
-                                            let mut read_only_content = content;
-                                            let mut output =
-                                                egui::TextEdit::multiline(&mut read_only_content)
-                                                    .id(text_edit_id)
-                                                    .font(egui::FontId::proportional(18.0))
-                                                    .desired_width(f32::INFINITY)
-                                                    .frame(egui::Frame::NONE)
-                                                    .show(ui);
+                                            let mut text_edit =
+                                                |text: &mut dyn egui::TextBuffer| {
+                                                    egui::TextEdit::multiline(text)
+                                                        .id(text_edit_id)
+                                                        .font(egui::FontId::proportional(18.0))
+                                                        .desired_width(f32::INFINITY)
+                                                        .frame(egui::Frame::NONE)
+                                                        .show(ui)
+                                                };
+
+                                            let mut output = if view.editable {
+                                                text_edit(content)
+                                            } else {
+                                                let mut read_only_content = content.as_str();
+                                                text_edit(&mut read_only_content)
+                                            };
+
+                                            let saved_selection =
+                                                saved_selection.map(|mut range| {
+                                                    range.primary =
+                                                        output.galley.clamp_cursor(&range.primary);
+                                                    range.secondary = output
+                                                        .galley
+                                                        .clamp_cursor(&range.secondary);
+                                                    range
+                                                });
 
                                             if secondary_pressed
                                                 && output.response.contains_pointer()
@@ -144,8 +167,20 @@ impl App for HomePage {
                                                 output.state.store(ui.ctx(), output.response.id);
                                             }
 
+                                            let current_selection = if secondary_pressed
+                                                && output.response.contains_pointer()
+                                            {
+                                                saved_selection
+                                            } else {
+                                                output.cursor_range
+                                            };
+
+                                            if output.response.changed() {
+                                                ui.ctx().request_repaint();
+                                            }
+
                                             output.response.context_menu(|ui| {
-                                                if let Some(selection) = saved_selection {
+                                                if let Some(selection) = current_selection {
                                                     let selected = content
                                                         .char_range(
                                                             selection.as_sorted_char_range(),
@@ -169,7 +204,17 @@ impl App for HomePage {
                                                     }
                                                 }
 
-                                                if ui.button("Edit...").clicked() {}
+                                                if ui
+                                                    .button(if view.editable {
+                                                        "Exit Edit"
+                                                    } else {
+                                                        "Edit..."
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    view.editable = !view.editable;
+                                                    ui.close();
+                                                }
                                                 ui.separator();
                                                 if ui.button("Duplicate").clicked() {
                                                     action = ViewAction::Duplicate;
