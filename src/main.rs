@@ -50,11 +50,21 @@ impl Default for HomePage {
 
 impl App for HomePage {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        for (id, item) in self.items.iter().enumerate() {
-            if ui.button(&item.title).clicked() {
-                self.sub_windows.insert(id);
-            }
-        }
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::same(16))
+                    .fill(ui.visuals().panel_fill),
+            )
+            .show(ui, |ui| {
+                for (id, item) in self.items.iter().enumerate() {
+                    let btn = ui.button(&item.title);
+                    btn.context_menu(|ui| if ui.button("delete").clicked() {});
+                    if btn.clicked() {
+                        self.sub_windows.insert(id);
+                    }
+                }
+            });
 
         for id in &self.sub_windows {
             let title = self.items[*id].title.as_str();
@@ -63,8 +73,34 @@ impl App for HomePage {
                 egui::ViewportId::from_hash_of(title),
                 egui::ViewportBuilder::default(),
                 |child_ui, _viewport_class| {
-                    child_ui.heading(title);
-                    child_ui.label(content);
+                    egui::CentralPanel::default()
+                        .frame(
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin::same(16))
+                                .fill(child_ui.visuals().panel_fill),
+                        )
+                        .show(child_ui, |ui| {
+                            ui.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                                "{} - FloatDea",
+                                title
+                            )));
+
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin::same(12))
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(content).size(15.0),
+                                                )
+                                                .selectable(true)
+                                                .wrap(),
+                                            );
+                                        });
+                                });
+                        });
 
                     if child_ui.input(|input| input.viewport().close_requested()) {
                         return true;
