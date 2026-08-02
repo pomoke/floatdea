@@ -28,6 +28,8 @@ struct HomePage {
     items: Vec<Snippet>,
     views: Vec<View>,
     next_view_id: u64,
+    pending_delete: Option<usize>,
+    focus_request: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -64,6 +66,8 @@ impl Default for HomePage {
             ],
             views: Vec::new(),
             next_view_id: 0,
+            pending_delete: None,
+            focus_request: false,
         }
     }
 }
@@ -100,6 +104,7 @@ impl HomePage {
 impl App for HomePage {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut open_requests = Vec::new();
+        let mut delete_requests = Vec::new();
 
         let home_background = egui::CentralPanel::default()
             .frame(
@@ -116,8 +121,17 @@ impl App for HomePage {
                 );
 
                 for (id, item) in self.items.iter().enumerate() {
+                    if item.title.is_empty() {
+                        continue;
+                    }
+
                     let btn = ui.button(&item.title);
-                    btn.context_menu(|ui| if ui.button("delete").clicked() {});
+                    btn.context_menu(|ui| {
+                        if ui.button("delete").clicked() {
+                            delete_requests.push(id);
+                            ui.close();
+                        }
+                    });
                     if btn.clicked() {
                         open_requests.push(id);
                     }
@@ -135,6 +149,45 @@ impl App for HomePage {
                 ui.close();
             }
         });
+
+        if let Some(item_id) = delete_requests.into_iter().next() {
+            self.pending_delete = Some(item_id);
+        }
+
+        if let Some(item_id) = self.pending_delete {
+            let title = self.items[item_id].title.clone();
+            let mut confirmed = false;
+            let mut cancelled = false;
+
+            egui::Window::new(())
+                .id(egui::Id::new("delete-snippet-confirmation"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!("Delete \"{title}\"?"));
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                        let delete_button = egui::Button::new(
+                            egui::RichText::new("Delete").color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(179, 38, 30));
+                        if ui.add(delete_button).clicked() {
+                            confirmed = true;
+                        }
+                    });
+                });
+
+            if confirmed {
+                self.items[item_id].title.clear();
+                self.views.retain(|view| view.item_id != item_id);
+                self.pending_delete = None;
+            } else if cancelled {
+                self.pending_delete = None;
+            }
+        }
 
         for item_id in open_requests {
             self.open_view(item_id);
@@ -174,6 +227,23 @@ impl App for HomePage {
                                                     .and_then(|state| state.cursor.char_range());
                                             let secondary_pressed =
                                                 ui.input(|input| input.pointer.secondary_pressed());
+                                            let escape_pressed = view.editable
+                                                && ui.input(|input| {
+                                                    input.key_pressed(egui::Key::Escape)
+                                                });
+
+                                            if escape_pressed {
+                                                view.editable = false;
+                                                ui.memory_mut(|memory| {
+                                                    memory.surrender_focus(text_edit_id);
+                                                });
+                                                ui.input_mut(|input| {
+                                                    input.consume_key(
+                                                        input.modifiers,
+                                                        egui::Key::Escape,
+                                                    );
+                                                });
+                                            }
 
                                             let mut text_edit =
                                                 |text: &mut dyn egui::TextBuffer| {
@@ -267,6 +337,9 @@ impl App for HomePage {
                                                 if ui.button("Duplicate").clicked() {
                                                     action = ViewAction::Duplicate;
                                                     ui.close();
+                                                }
+                                                if ui.button("Focus").clicked() {
+                                                    self.focus_request = true;
                                                 }
                                             });
                                         });
