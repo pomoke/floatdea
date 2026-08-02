@@ -99,13 +99,13 @@ impl HomePage {
 
         unreachable!("the title counter cannot be exhausted")
     }
-}
 
-impl App for HomePage {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let mut open_requests = Vec::new();
-        let mut delete_requests = Vec::new();
-
+    fn render_home_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        open_requests: &mut Vec<usize>,
+        delete_requests: &mut Vec<usize>,
+    ) {
         let home_background = egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -149,11 +149,9 @@ impl App for HomePage {
                 ui.close();
             }
         });
+    }
 
-        if let Some(item_id) = delete_requests.into_iter().next() {
-            self.pending_delete = Some(item_id);
-        }
-
+    fn render_delete_dialog(&mut self, ui: &mut egui::Ui) {
         if let Some(item_id) = self.pending_delete {
             let title = self.items[item_id].title.clone();
             let mut confirmed = false;
@@ -188,6 +186,195 @@ impl App for HomePage {
                 self.pending_delete = None;
             }
         }
+    }
+
+    fn show_content_context_menu(
+        ui: &mut egui::Ui,
+        content: &str,
+        current_selection: Option<egui::text::CCursorRange>,
+        view: &mut View,
+        action: &mut ViewAction,
+        focus_request: &mut bool,
+    ) {
+        if let Some(selection) = current_selection {
+            let selected = content
+                .char_range(selection.as_sorted_char_range())
+                .to_owned();
+            if selected.is_empty() {
+                if ui.button("Copy All").clicked() {
+                    ui.copy_text(content.to_owned());
+                    ui.close();
+                }
+            } else if ui.button("Copy").clicked() {
+                ui.copy_text(selected);
+                ui.close();
+            }
+        } else if ui.button("Copy All").clicked() {
+            ui.copy_text(content.to_owned());
+            ui.close();
+        }
+
+        if ui
+            .button(if view.editable {
+                "Exit Edit"
+            } else {
+                "Edit..."
+            })
+            .clicked()
+        {
+            view.editable = !view.editable;
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Duplicate").clicked() {
+            *action = ViewAction::Duplicate;
+            ui.close();
+        }
+        if ui.button("Focus").clicked() {
+            *focus_request = true;
+        }
+    }
+
+    fn render_snippet_content(
+        ui: &mut egui::Ui,
+        view: &mut View,
+        content: &mut String,
+        focus_request: &mut bool,
+        action: &mut ViewAction,
+    ) {
+        let text_edit_id = ui.make_persistent_id(("snippet-content", view.id));
+        let saved_selection = egui::TextEdit::load_state(ui.ctx(), text_edit_id)
+            .and_then(|state| state.cursor.char_range());
+        let secondary_pressed = ui.input(|input| input.pointer.secondary_pressed());
+        let escape_pressed = view.editable
+            && ui.input(|input| input.key_pressed(egui::Key::Escape));
+
+        if escape_pressed {
+            view.editable = false;
+            ui.memory_mut(|memory| {
+                memory.surrender_focus(text_edit_id);
+            });
+            ui.input_mut(|input| {
+                input.consume_key(input.modifiers, egui::Key::Escape);
+            });
+        }
+
+        let mut text_edit = |text: &mut dyn egui::TextBuffer| {
+            egui::TextEdit::multiline(text)
+                .id(text_edit_id)
+                .font(egui::FontId::proportional(18.0))
+                .desired_width(f32::INFINITY)
+                .frame(egui::Frame::NONE)
+                .show(ui)
+        };
+
+        let mut output = if view.editable {
+            text_edit(content)
+        } else {
+            let mut read_only_content = content.as_str();
+            text_edit(&mut read_only_content)
+        };
+
+        let saved_selection = saved_selection.map(|mut range| {
+            range.primary = output.galley.clamp_cursor(&range.primary);
+            range.secondary = output.galley.clamp_cursor(&range.secondary);
+            range
+        });
+
+        if secondary_pressed && output.response.contains_pointer() {
+            output.state.cursor.set_char_range(saved_selection);
+            output.state.store(ui.ctx(), output.response.id);
+        }
+
+        let current_selection = if secondary_pressed && output.response.contains_pointer() {
+            saved_selection
+        } else {
+            output.cursor_range
+        };
+
+        if output.response.changed() {
+            ui.ctx().request_repaint();
+        }
+
+        if !view.editable && output.response.double_clicked() {
+            view.editable = true;
+            output.response.request_focus();
+            ui.ctx().request_repaint();
+        }
+
+        let content_ref = content.as_str();
+        output.response.context_menu(|ui| {
+            Self::show_content_context_menu(
+                ui,
+                content_ref,
+                current_selection,
+                view,
+                action,
+                focus_request,
+            );
+        });
+    }
+
+
+    fn render_snippet_viewport(
+        ui: &mut egui::Ui,
+        view: &mut View,
+        content: &mut String,
+        title: &str,
+        focus_request: &mut bool,
+    ) -> ViewAction {
+        ui.show_viewport_immediate(
+            egui::ViewportId::from_hash_of(("snippet-view", view.id)),
+            egui::ViewportBuilder::default()
+                .with_title(format!("{} - FloatDea", title))
+                .with_inner_size([480.0, 320.0]),
+            |child_ui, _viewport_class| {
+                let mut action = ViewAction::None;
+
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin::same(16))
+                            .fill(child_ui.visuals().panel_fill),
+                    )
+                    .show(child_ui, |ui| {
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin::same(12))
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        Self::render_snippet_content(
+                                            ui,
+                                            view,
+                                            content,
+                                            focus_request,
+                                            &mut action,
+                                        );
+                                    });
+                            });
+                    });
+
+                if child_ui.input(|input| input.viewport().close_requested()) {
+                    action = ViewAction::Close;
+                }
+                action
+            },
+        )
+    }
+}
+
+impl App for HomePage {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let mut open_requests = Vec::new();
+        let mut delete_requests = Vec::new();
+
+        self.render_home_panel(ui, &mut open_requests, &mut delete_requests);
+
+        if let Some(item_id) = delete_requests.into_iter().next() {
+            self.pending_delete = Some(item_id);
+        }
+        self.render_delete_dialog(ui);
 
         for item_id in open_requests {
             self.open_view(item_id);
@@ -199,164 +386,15 @@ impl App for HomePage {
             let item = &mut self.items[view.item_id];
             let title = item.title.as_str();
             let content = &mut item.content;
-            let action = ui.show_viewport_immediate(
-                egui::ViewportId::from_hash_of(("snippet-view", view.id)),
-                egui::ViewportBuilder::default()
-                    .with_title(format!("{} - FloatDea", title))
-                    .with_inner_size([480.0, 320.0]),
-                |child_ui, _viewport_class| {
-                    let mut action = ViewAction::None;
-
-                    egui::CentralPanel::default()
-                        .frame(
-                            egui::Frame::new()
-                                .inner_margin(egui::Margin::same(16))
-                                .fill(child_ui.visuals().panel_fill),
-                        )
-                        .show(child_ui, |ui| {
-                            egui::Frame::new()
-                                .inner_margin(egui::Margin::same(12))
-                                .show(ui, |ui| {
-                                    egui::ScrollArea::vertical()
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            let text_edit_id =
-                                                ui.make_persistent_id(("snippet-content", view.id));
-                                            let saved_selection =
-                                                egui::TextEdit::load_state(ui.ctx(), text_edit_id)
-                                                    .and_then(|state| state.cursor.char_range());
-                                            let secondary_pressed =
-                                                ui.input(|input| input.pointer.secondary_pressed());
-                                            let escape_pressed = view.editable
-                                                && ui.input(|input| {
-                                                    input.key_pressed(egui::Key::Escape)
-                                                });
-
-                                            if escape_pressed {
-                                                view.editable = false;
-                                                ui.memory_mut(|memory| {
-                                                    memory.surrender_focus(text_edit_id);
-                                                });
-                                                ui.input_mut(|input| {
-                                                    input.consume_key(
-                                                        input.modifiers,
-                                                        egui::Key::Escape,
-                                                    );
-                                                });
-                                            }
-
-                                            let mut text_edit =
-                                                |text: &mut dyn egui::TextBuffer| {
-                                                    egui::TextEdit::multiline(text)
-                                                        .id(text_edit_id)
-                                                        .font(egui::FontId::proportional(18.0))
-                                                        .desired_width(f32::INFINITY)
-                                                        .frame(egui::Frame::NONE)
-                                                        .show(ui)
-                                                };
-
-                                            let mut output = if view.editable {
-                                                text_edit(content)
-                                            } else {
-                                                let mut read_only_content = content.as_str();
-                                                text_edit(&mut read_only_content)
-                                            };
-
-                                            let saved_selection =
-                                                saved_selection.map(|mut range| {
-                                                    range.primary =
-                                                        output.galley.clamp_cursor(&range.primary);
-                                                    range.secondary = output
-                                                        .galley
-                                                        .clamp_cursor(&range.secondary);
-                                                    range
-                                                });
-
-                                            if secondary_pressed
-                                                && output.response.contains_pointer()
-                                            {
-                                                output.state.cursor.set_char_range(saved_selection);
-                                                output.state.store(ui.ctx(), output.response.id);
-                                            }
-
-                                            let current_selection = if secondary_pressed
-                                                && output.response.contains_pointer()
-                                            {
-                                                saved_selection
-                                            } else {
-                                                output.cursor_range
-                                            };
-
-                                            if output.response.changed() {
-                                                ui.ctx().request_repaint();
-                                            }
-
-                                            if !view.editable && output.response.double_clicked() {
-                                                view.editable = true;
-                                                output.response.request_focus();
-                                                ui.ctx().request_repaint();
-                                            }
-
-                                            output.response.context_menu(|ui| {
-                                                if let Some(selection) = current_selection {
-                                                    let selected = content
-                                                        .char_range(
-                                                            selection.as_sorted_char_range(),
-                                                        )
-                                                        .to_owned();
-                                                    if selected.is_empty() {
-                                                        if ui.button("Copy All").clicked() {
-                                                            ui.copy_text(content.to_owned());
-                                                            ui.close();
-                                                        }
-                                                    } else {
-                                                        if ui.button("Copy").clicked() {
-                                                            ui.copy_text(selected);
-                                                            ui.close();
-                                                        }
-                                                    }
-                                                } else {
-                                                    if ui.button("Copy All").clicked() {
-                                                        ui.copy_text(content.to_owned());
-                                                        ui.close();
-                                                    }
-                                                }
-
-                                                if ui
-                                                    .button(if view.editable {
-                                                        "Exit Edit"
-                                                    } else {
-                                                        "Edit..."
-                                                    })
-                                                    .clicked()
-                                                {
-                                                    view.editable = !view.editable;
-                                                    ui.close();
-                                                }
-                                                ui.separator();
-                                                if ui.button("Duplicate").clicked() {
-                                                    action = ViewAction::Duplicate;
-                                                    ui.close();
-                                                }
-                                                if ui.button("Focus").clicked() {
-                                                    self.focus_request = true;
-                                                }
-                                            });
-                                        });
-                                });
-                        });
-
-                    if child_ui.input(|input| input.viewport().close_requested()) {
-                        action = ViewAction::Close;
-                    }
-                    action
-                },
+            let action = Self::render_snippet_viewport(
+                ui,
+                view,
+                content,
+                title,
+                &mut self.focus_request,
             );
-
-            match action {
-                ViewAction::None => {}
-                ViewAction::Close => closed_views.push(view.id),
-                ViewAction::Duplicate => {}
+            if matches!(action, ViewAction::Close) {
+                closed_views.push(view.id);
             }
         }
 
