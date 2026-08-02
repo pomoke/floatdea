@@ -15,6 +15,8 @@ fn main() -> eframe::Result {
         "floatdea",
         options,
         Box::new(|cc| {
+            #[cfg(not(target_arch = "wasm32"))]
+            cc.egui_ctx.set_embed_viewports(false);
             egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::<HomePage>::default())
         }),
@@ -53,8 +55,12 @@ impl Default for HomePage {
                 },
                 Snippet {
                     title: "floatdea".to_owned(),
-                    content: "Welcome to FloatDea!".to_owned(),
+                    content: "Welcome to floatdea!".to_owned(),
                 },
+                Snippet {
+                    title: "help".to_owned(),
+                    content: "Right-click for relevent operations.\n\nDouble-click on read-only snippet to edit.".to_owned()
+                }
             ],
             views: Vec::new(),
             next_view_id: 0,
@@ -66,11 +72,28 @@ impl HomePage {
     fn open_view(&mut self, item_id: usize) {
         let id = self.next_view_id;
         self.next_view_id += 1;
+        let editable = self.items[item_id].content.is_empty();
         self.views.push(View {
             id,
             item_id,
-            editable: false,
+            editable,
         });
+    }
+
+    fn default_snippet_title(&self) -> String {
+        for number in 1_u64.. {
+            let candidate = if number == 1 {
+                "Untitled".to_owned()
+            } else {
+                format!("Untitled {number}")
+            };
+
+            if self.items.iter().all(|item| item.title != candidate) {
+                return candidate;
+            }
+        }
+
+        unreachable!("the title counter cannot be exhausted")
     }
 }
 
@@ -78,13 +101,20 @@ impl App for HomePage {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut open_requests = Vec::new();
 
-        egui::CentralPanel::default()
+        let home_background = egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .inner_margin(egui::Margin::same(16))
                     .fill(ui.visuals().panel_fill),
             )
             .show(ui, |ui| {
+                // Register the background first so buttons added afterwards stay on top.
+                let background_response = ui.interact(
+                    ui.max_rect(),
+                    ui.id().with("home-background-menu"),
+                    egui::Sense::click(),
+                );
+
                 for (id, item) in self.items.iter().enumerate() {
                     let btn = ui.button(&item.title);
                     btn.context_menu(|ui| if ui.button("delete").clicked() {});
@@ -92,7 +122,19 @@ impl App for HomePage {
                         open_requests.push(id);
                     }
                 }
-            });
+                background_response
+            })
+            .inner;
+
+        home_background.context_menu(|ui| {
+            if ui.button("New Snippet").clicked() {
+                self.items.push(Snippet {
+                    title: self.default_snippet_title(),
+                    content: String::new(),
+                });
+                ui.close();
+            }
+        });
 
         for item_id in open_requests {
             self.open_view(item_id);
@@ -176,6 +218,12 @@ impl App for HomePage {
                                             };
 
                                             if output.response.changed() {
+                                                ui.ctx().request_repaint();
+                                            }
+
+                                            if !view.editable && output.response.double_clicked() {
+                                                view.editable = true;
+                                                output.response.request_focus();
                                                 ui.ctx().request_repaint();
                                             }
 
