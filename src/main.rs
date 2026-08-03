@@ -33,9 +33,9 @@ struct HomePage {
     items: Vec<Snippet>,
     positions: Vec<[f32; 2]>,
     card_sizes: Vec<egui::Vec2>,
-    z_order: Vec<u32>,
     dragging: Option<usize>,
-    next_z: u32,
+    drag_start_pos: Option<[f32; 2]>,
+    drag_invalid: bool,
     views: Vec<View>,
     next_view_id: u64,
     pending_delete: Option<usize>,
@@ -78,9 +78,9 @@ impl Default for HomePage {
             ],
             positions: vec![[24.0, 24.0], [230.0, 40.0], [430.0, 90.0]],
             card_sizes: vec![egui::vec2(CARD_WIDTH, 25.0); 3],
-            z_order: vec![0, 1, 2],
             dragging: None,
-            next_z: 3,
+            drag_start_pos: None,
+            drag_invalid: false,
             views: Vec::new(),
             next_view_id: 0,
             pending_delete: None,
@@ -165,10 +165,7 @@ impl HomePage {
                         let mut drag_delta = egui::Vec2::ZERO;
                         let mut dragged_this_frame: Option<usize> = None;
 
-                        let mut order: Vec<usize> = (0..self.items.len()).collect();
-                        order.sort_by_key(|&i| self.z_order[i]);
-
-                        for i in order {
+                        for i in 0..self.items.len() {
                             if self.items[i].title.is_empty() {
                                 continue;
                             }
@@ -214,6 +211,8 @@ impl HomePage {
 
                             if response.drag_started() {
                                 self.dragging = Some(i);
+                                self.drag_start_pos = Some(self.positions[i]);
+                                self.drag_invalid = false;
                             }
                             if self.dragging == Some(i) && response.dragged() {
                                 drag_delta = ui.input(|input| input.pointer.delta());
@@ -232,12 +231,41 @@ impl HomePage {
                         if let Some(i) = dragged_this_frame {
                             self.positions[i][0] += drag_delta.x;
                             self.positions[i][1] += drag_delta.y;
-                            self.z_order[i] = self.next_z;
-                            self.next_z += 1;
+                            self.positions[i][0] = self.positions[i][0].max(0.);
+                            self.positions[i][1] = self.positions[i][1].max(0.);
+
+                            let pos_i = self.positions[i];
+                            let size_i = self.card_sizes[i];
+                            let rect_i = egui::Rect::from_min_size(
+                                egui::pos2(pos_i[0], pos_i[1]),
+                                size_i,
+                            );
+                            self.drag_invalid = (0..self.items.len()).any(|j| {
+                                if j == i || self.items[j].title.is_empty() {
+                                    return false;
+                                }
+                                let p = self.positions[j];
+                                let s = self.card_sizes[j];
+                                egui::Rect::from_min_size(egui::pos2(p[0], p[1]), s)
+                                    .intersects(rect_i)
+                            });
+                        }
+
+                        if self.dragging.is_some() && self.drag_invalid {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
                         }
 
                         if self.dragging.is_some() && !ui.input(|i| i.pointer.any_down()) {
+                            if self.drag_invalid {
+                                if let (Some(i), Some(start)) =
+                                    (self.dragging, self.drag_start_pos)
+                                {
+                                    self.positions[i] = start;
+                                }
+                            }
                             self.dragging = None;
+                            self.drag_start_pos = None;
+                            self.drag_invalid = false;
                         }
 
                         if !pointer_over_card {
@@ -249,8 +277,6 @@ impl HomePage {
                                     });
                                     self.positions.push(self.default_position());
                                     self.card_sizes.push(egui::vec2(CARD_WIDTH, 25.0));
-                                    self.z_order.push(self.next_z);
-                                    self.next_z += 1;
                                     ui.close();
                                 }
                             });
