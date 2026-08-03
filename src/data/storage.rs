@@ -98,10 +98,18 @@ impl SnippetStore {
 
 fn parse_file_stem(stem: &str) -> Option<(String, EntityId)> {
     let (title, id) = stem.rsplit_once("--")?;
-    if title.is_empty() || ulid::Ulid::from_string(id).is_err() {
+    if title.is_empty() || !is_supported_id(id) {
         return None;
     }
     Some((title.to_owned(), EntityId::from_string(id)))
+}
+
+fn is_supported_id(id: &str) -> bool {
+    let compact_id = id.len() == 20
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    compact_id || ulid::Ulid::from_string(id).is_ok()
 }
 
 #[cfg(test)]
@@ -216,5 +224,18 @@ mod tests {
         store.remove(&snippet).unwrap();
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn continues_to_load_legacy_ulid_filenames() {
+        let folder = TestFolder::new();
+        let store = SnippetStore::open(&folder.0).unwrap();
+        let legacy_id = ulid::Ulid::new().to_string();
+        fs::write(folder.0.join(format!("legacy--{legacy_id}.txt")), "content").unwrap();
+
+        let snippets = store.load_all().unwrap();
+
+        assert_eq!(snippets[0].id.as_str(), legacy_id);
+        assert_eq!(snippets[0].title, "legacy");
     }
 }

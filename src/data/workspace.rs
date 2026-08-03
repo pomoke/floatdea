@@ -72,12 +72,6 @@ impl Workspace {
             .expect("workspace root container must exist")
     }
 
-    pub fn root_mut(&mut self) -> &mut Container {
-        self.containers
-            .get_mut(&self.root)
-            .expect("workspace root container must exist")
-    }
-
     pub fn create_container(&mut self, title: impl Into<String>) -> ContainerId {
         let id = ContainerId::new();
         self.containers.insert(
@@ -127,6 +121,12 @@ impl Workspace {
     pub fn add_snippet_to_root(&mut self, entity: EntityId) -> ReferenceId {
         let root = self.root.clone();
         self.add_snippet_reference(&root, entity)
+            .expect("workspace root container must exist")
+    }
+
+    pub fn add_container_to_root(&mut self, container: ContainerId) -> ReferenceId {
+        let root = self.root.clone();
+        self.add_container_reference(&root, container)
             .expect("workspace root container must exist")
     }
 
@@ -355,6 +355,19 @@ mod tests {
             store.load_layout(&container).unwrap().items[&reference].position,
             [41.0, 73.0]
         );
+    }
+
+    #[test]
+    fn adds_container_reference_to_root() {
+        let mut workspace = Workspace::empty();
+        let container = workspace.create_container("Folder");
+        let reference = workspace.add_container_to_root(container.clone());
+
+        assert!(matches!(
+            &workspace.root().members[0].target,
+            ReferenceTarget::Container(id) if id == &container
+        ));
+        assert_eq!(workspace.root().members[0].id, reference);
     }
 
     #[test]

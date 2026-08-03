@@ -8,7 +8,8 @@ macro_rules! stable_id {
 
         impl $name {
             pub fn new() -> Self {
-                Self(ulid::Ulid::new().to_string())
+                let ulid = ulid::Ulid::new().to_string().to_ascii_lowercase();
+                Self(ulid[6..].to_owned())
             }
 
             pub fn as_str(&self) -> &str {
@@ -40,4 +41,24 @@ pub struct Snippet {
     pub id: EntityId,
     pub title: String,
     pub content: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_ids_are_short_lowercase_alphanumeric_strings() {
+        for id in [
+            EntityId::new().0,
+            ContainerId::new().0,
+            ReferenceId::new().0,
+        ] {
+            assert_eq!(id.len(), 20);
+            assert!(
+                id.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            );
+        }
+    }
 }
