@@ -1,14 +1,29 @@
+use std::path::PathBuf;
+
 use eframe::{App, egui};
 use egui::TextBuffer;
 
-use floatdea::data::Snippet;
+use floatdea::data::{storage::SnippetStore, Snippet};
 
 const CANVAS_MARGIN: f32 = 0.0;
 const CARD_WIDTH: f32 = 80.0;
 const CARD_PADDING_H: f32 = 8.0;
 const CARD_MARGIN_Y: f32 = 6.0;
 
+/// 默认工作空间目录：`$HOME/.local/floatdea/workspace`。
+fn default_workspace() -> PathBuf {
+    std::env::var("HOME")
+        .map(|home| PathBuf::from(home).join(".local/floatdea/workspace"))
+        .unwrap_or_else(|_| PathBuf::from(".floatdea/workspace"))
+}
+
 fn main() -> eframe::Result {
+    // 用法：floatdea [workspace_dir]
+    let workspace = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(default_workspace);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([640., 480.]),
         ..Default::default()
@@ -21,7 +36,7 @@ fn main() -> eframe::Result {
             #[cfg(not(target_arch = "wasm32"))]
             cc.egui_ctx.set_embed_viewports(false);
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::<HomePage>::default())
+            Ok(Box::new(HomePage::new(workspace)))
         }),
     )
 }
@@ -29,6 +44,7 @@ fn main() -> eframe::Result {
 #[derive(Clone, Debug)]
 struct HomePage {
     items: Vec<Snippet>,
+    store: SnippetStore,
     positions: Vec<[f32; 2]>,
     card_sizes: Vec<egui::Vec2>,
     dragging: Option<usize>,
@@ -57,25 +73,39 @@ enum ViewAction {
     Duplicate,
 }
 
-impl Default for HomePage {
-    fn default() -> Self {
+impl HomePage {
+    /// Load workspace. 
+    /// A default set of file will be put for an empty workspace.
+    fn new(workspace: impl Into<PathBuf>) -> Self {
+        let store = SnippetStore::open(workspace).expect("failed to open snippet store");
+        let mut items = store.load_all().unwrap_or_default();
+        if items.is_empty() {
+            for (title, content) in [
+                ("hello", "hello, world!"),
+                ("floatdea", "Welcome to floatdea!"),
+                (
+                    "help",
+                    "Right-click for relevant operations.\n\nDouble-click on a card to open it. Drag cards to move them.",
+                ),
+            ] {
+                let snippet = Snippet {
+                    title: title.to_owned(),
+                    content: content.to_owned(),
+                };
+                let _ = store.save(&snippet);
+                items.push(snippet);
+            }
+        }
+        let n = items.len();
+        let positions = (0..n)
+            .map(|i| [24.0 + (i % 16) as f32 * 200.0, 24.0 + (i / 16) as f32 * 130.0])
+            .collect();
+        let card_sizes = vec![egui::vec2(CARD_WIDTH, 25.0); n];
         HomePage {
-            items: vec![
-                Snippet {
-                    title: "hello".to_owned(),
-                    content: "hello, world!".to_owned(),
-                },
-                Snippet {
-                    title: "floatdea".to_owned(),
-                    content: "Welcome to floatdea!".to_owned(),
-                },
-                Snippet {
-                    title: "help".to_owned(),
-                    content: "Right-click for relevent operations.\n\nDouble-click on read-only snippet to edit.".to_owned()
-                }
-            ],
-            positions: vec![[24.0, 24.0], [230.0, 40.0], [430.0, 90.0]],
-            card_sizes: vec![egui::vec2(CARD_WIDTH, 25.0); 3],
+            items,
+            store,
+            positions,
+            card_sizes,
             dragging: None,
             drag_start_pos: None,
             drag_invalid: false,
@@ -87,9 +117,7 @@ impl Default for HomePage {
             last_time: 0.0,
         }
     }
-}
 
-impl HomePage {
     fn open_view(&mut self, item_id: usize) {
         let id = self.next_view_id;
         self.next_view_id += 1;
@@ -269,11 +297,15 @@ impl HomePage {
                         if !pointer_over_card {
                             canvas_response.context_menu(|ui| {
                                 if ui.button("New Snippet").clicked() {
-                                    self.items.push(Snippet {
-                                        title: self.default_snippet_title(),
+                                    let title = self.default_snippet_title();
+                                    let position = self.default_position();
+                                    let snippet = Snippet {
+                                        title,
                                         content: String::new(),
-                                    });
-                                    self.positions.push(self.default_position());
+                                    };
+                                    let _ = self.store.save(&snippet);
+                                    self.items.push(snippet);
+                                    self.positions.push(position);
                                     self.card_sizes.push(egui::vec2(CARD_WIDTH, 25.0));
                                     ui.close();
                                 }
@@ -395,6 +427,7 @@ impl HomePage {
                 });
 
             if confirmed {
+                let _ = self.store.remove(&title);
                 self.items[item_id].title.clear();
                 self.views.retain(|view| view.item_id != item_id);
                 self.pending_delete = None;
@@ -457,6 +490,8 @@ impl HomePage {
         content: &mut String,
         focus_request: &mut bool,
         action: &mut ViewAction,
+        store: &SnippetStore,
+        title: &str,
     ) {
         let text_edit_id = ui.make_persistent_id(("snippet-content", view.id));
         let saved_selection = egui::TextEdit::load_state(ui.ctx(), text_edit_id)
@@ -510,6 +545,10 @@ impl HomePage {
 
         if output.response.changed() {
             ui.ctx().request_repaint();
+            let _ = store.save(&Snippet {
+                title: title.to_owned(),
+                content: content.clone(),
+            });
         }
 
         if !view.editable && output.response.double_clicked() {
@@ -537,6 +576,7 @@ impl HomePage {
         content: &mut String,
         title: &str,
         focus_request: &mut bool,
+        store: &SnippetStore,
     ) -> ViewAction {
         ui.show_viewport_immediate(
             egui::ViewportId::from_hash_of(("snippet-view", view.id)),
@@ -565,6 +605,8 @@ impl HomePage {
                                             content,
                                             focus_request,
                                             &mut action,
+                                            store,
+                                            title,
                                         );
                                     });
                             });
@@ -601,8 +643,14 @@ impl App for HomePage {
             let item = &mut self.items[view.item_id];
             let title = item.title.as_str();
             let content = &mut item.content;
-            let action =
-                Self::render_snippet_viewport(ui, view, content, title, &mut self.focus_request);
+            let action = Self::render_snippet_viewport(
+                ui,
+                view,
+                content,
+                title,
+                &mut self.focus_request,
+                &self.store,
+            );
             if matches!(action, ViewAction::Close) {
                 closed_views.push(view.id);
             }
