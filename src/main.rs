@@ -3,14 +3,17 @@ use std::path::PathBuf;
 use eframe::{App, egui};
 use egui::TextBuffer;
 
-use floatdea::data::{storage::SnippetStore, Snippet};
+use floatdea::data::{
+    EntityId, ReferenceId, Snippet,
+    storage::SnippetStore,
+    workspace::{CardLayout, ContainerLayout, ReferenceTarget, Workspace, WorkspaceStore},
+};
 
 const CANVAS_MARGIN: f32 = 0.0;
 const CARD_WIDTH: f32 = 80.0;
 const CARD_PADDING_H: f32 = 8.0;
 const CARD_MARGIN_Y: f32 = 6.0;
 
-/// 默认工作空间目录：`$HOME/.local/floatdea/workspace`。
 fn default_workspace() -> PathBuf {
     std::env::var("HOME")
         .map(|home| PathBuf::from(home).join(".local/floatdea/workspace"))
@@ -18,7 +21,6 @@ fn default_workspace() -> PathBuf {
 }
 
 fn main() -> eframe::Result {
-    // 用法：floatdea [workspace_dir]
     let workspace = std::env::args()
         .nth(1)
         .map(PathBuf::from)
@@ -45,6 +47,10 @@ fn main() -> eframe::Result {
 struct HomePage {
     items: Vec<Snippet>,
     store: SnippetStore,
+    workspace: Workspace,
+    workspace_store: WorkspaceStore,
+    reference_ids: Vec<ReferenceId>,
+    layout: ContainerLayout,
     positions: Vec<[f32; 2]>,
     card_sizes: Vec<egui::Vec2>,
     dragging: Option<usize>,
@@ -74,10 +80,11 @@ enum ViewAction {
 }
 
 impl HomePage {
-    /// Load workspace. 
+    /// Load workspace.
     /// A default set of file will be put for an empty workspace.
     fn new(workspace: impl Into<PathBuf>) -> Self {
-        let store = SnippetStore::open(workspace).expect("failed to open snippet store");
+        let workspace_path = workspace.into();
+        let store = SnippetStore::open(&workspace_path).expect("failed to open snippet store");
         let mut items = store.load_all().unwrap_or_default();
         if items.is_empty() {
             for (title, content) in [
@@ -89,6 +96,7 @@ impl HomePage {
                 ),
             ] {
                 let snippet = Snippet {
+                    id: EntityId::new(),
                     title: title.to_owned(),
                     content: content.to_owned(),
                 };
@@ -96,14 +104,52 @@ impl HomePage {
                 items.push(snippet);
             }
         }
-        let n = items.len();
-        let positions = (0..n)
-            .map(|i| [24.0 + (i % 16) as f32 * 200.0, 24.0 + (i / 16) as f32 * 130.0])
+        let workspace_store =
+            WorkspaceStore::open(&workspace_path).expect("failed to open workspace metadata");
+        let workspace = workspace_store
+            .load_or_initialize(&items)
+            .expect("failed to load workspace metadata");
+        let layout = workspace_store
+            .load_layout(&workspace.root)
+            .expect("failed to load root layout");
+
+        let all_items = items;
+        let mut items = Vec::new();
+        let mut reference_ids = Vec::new();
+        for reference in &workspace.root().members {
+            let ReferenceTarget::Snippet(entity_id) = &reference.target else {
+                continue;
+            };
+            if let Some(snippet) = all_items.iter().find(|snippet| &snippet.id == entity_id) {
+                items.push(snippet.clone());
+                reference_ids.push(reference.id.clone());
+            }
+        }
+
+        let positions = reference_ids
+            .iter()
+            .enumerate()
+            .map(|(i, reference_id)| {
+                layout.items.get(reference_id).map_or_else(
+                    || {
+                        [
+                            24.0 + (i % 16) as f32 * 200.0,
+                            24.0 + (i / 16) as f32 * 130.0,
+                        ]
+                    },
+                    |item| item.position,
+                )
+            })
             .collect();
+        let n = items.len();
         let card_sizes = vec![egui::vec2(CARD_WIDTH, 25.0); n];
-        HomePage {
+        let mut page = HomePage {
             items,
             store,
+            workspace,
+            workspace_store,
+            reference_ids,
+            layout,
             positions,
             card_sizes,
             dragging: None,
@@ -115,7 +161,22 @@ impl HomePage {
             focus_request: false,
             fps: 0.0,
             last_time: 0.0,
+        };
+        page.save_root_layout();
+        page
+    }
+
+    fn save_root_layout(&mut self) {
+        for (reference_id, position) in self.reference_ids.iter().zip(&self.positions) {
+            self.layout.items.insert(
+                reference_id.clone(),
+                CardLayout {
+                    position: *position,
+                    color: None,
+                },
+            );
         }
+        let _ = self.workspace_store.save_layout(&self.layout);
     }
 
     fn open_view(&mut self, item_id: usize) {
@@ -158,7 +219,6 @@ impl HomePage {
                     .fill(ui.visuals().panel_fill),
             )
             .show(ui, |ui| {
-
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -181,7 +241,7 @@ impl HomePage {
 
                         painter.rect_filled(canvas_rect, 0.0, ui.visuals().panel_fill);
                         Self::paint_grid(
-                            &painter,
+                            painter,
                             canvas_rect,
                             ui.visuals().weak_text_color().gamma_multiply(0.12),
                         );
@@ -199,7 +259,7 @@ impl HomePage {
                             let pos = self.positions[i];
                             let title = self.items[i].title.as_str();
                             let galley = Self::layout_title(
-                                &painter,
+                                painter,
                                 title,
                                 CARD_WIDTH - 2.0 * CARD_PADDING_H,
                                 ui.visuals().text_color(),
@@ -212,10 +272,10 @@ impl HomePage {
                                 card_size,
                             );
 
-                            if let Some(p) = pointer_pos {
-                                if rect.contains(p) {
-                                    pointer_over_card = true;
-                                }
+                            if let Some(p) = pointer_pos
+                                && rect.contains(p)
+                            {
+                                pointer_over_card = true;
                             }
 
                             let response = ui.interact(
@@ -246,7 +306,7 @@ impl HomePage {
                             }
 
                             Self::paint_card(
-                                &painter,
+                                painter,
                                 rect,
                                 &galley,
                                 self.dragging == Some(i),
@@ -262,10 +322,8 @@ impl HomePage {
 
                             let pos_i = self.positions[i];
                             let size_i = self.card_sizes[i];
-                            let rect_i = egui::Rect::from_min_size(
-                                egui::pos2(pos_i[0], pos_i[1]),
-                                size_i,
-                            );
+                            let rect_i =
+                                egui::Rect::from_min_size(egui::pos2(pos_i[0], pos_i[1]), size_i);
                             self.drag_invalid = (0..self.items.len()).any(|j| {
                                 if j == i || self.items[j].title.is_empty() {
                                     return false;
@@ -282,16 +340,21 @@ impl HomePage {
                         }
 
                         if self.dragging.is_some() && !ui.input(|i| i.pointer.any_down()) {
+                            let mut layout_changed = false;
                             if self.drag_invalid {
-                                if let (Some(i), Some(start)) =
-                                    (self.dragging, self.drag_start_pos)
+                                if let (Some(i), Some(start)) = (self.dragging, self.drag_start_pos)
                                 {
                                     self.positions[i] = start;
                                 }
+                            } else {
+                                layout_changed = true;
                             }
                             self.dragging = None;
                             self.drag_start_pos = None;
                             self.drag_invalid = false;
+                            if layout_changed {
+                                self.save_root_layout();
+                            }
                         }
 
                         if !pointer_over_card {
@@ -300,13 +363,26 @@ impl HomePage {
                                     let title = self.default_snippet_title();
                                     let position = self.default_position();
                                     let snippet = Snippet {
+                                        id: EntityId::new(),
                                         title,
                                         content: String::new(),
                                     };
                                     let _ = self.store.save(&snippet);
+                                    let reference_id =
+                                        self.workspace.add_snippet_to_root(snippet.id.clone());
+                                    let _ = self.workspace_store.save(&self.workspace);
                                     self.items.push(snippet);
+                                    self.reference_ids.push(reference_id.clone());
                                     self.positions.push(position);
                                     self.card_sizes.push(egui::vec2(CARD_WIDTH, 25.0));
+                                    self.layout.items.insert(
+                                        reference_id,
+                                        CardLayout {
+                                            position,
+                                            color: None,
+                                        },
+                                    );
+                                    let _ = self.workspace_store.save_layout(&self.layout);
                                     ui.close();
                                 }
                             });
@@ -427,7 +503,13 @@ impl HomePage {
                 });
 
             if confirmed {
-                let _ = self.store.remove(&title);
+                let entity_id = self.items[item_id].id.clone();
+                let reference_id = self.reference_ids[item_id].clone();
+                let _ = self.store.remove(&self.items[item_id]);
+                self.workspace.remove_entity_references(&entity_id);
+                let _ = self.workspace_store.save(&self.workspace);
+                self.layout.items.remove(&reference_id);
+                let _ = self.workspace_store.save_layout(&self.layout);
                 self.items[item_id].title.clear();
                 self.views.retain(|view| view.item_id != item_id);
                 self.pending_delete = None;
@@ -491,8 +573,9 @@ impl HomePage {
         focus_request: &mut bool,
         action: &mut ViewAction,
         store: &SnippetStore,
-        title: &str,
+        snippet_key: (&EntityId, &str),
     ) {
+        let (entity_id, title) = snippet_key;
         let text_edit_id = ui.make_persistent_id(("snippet-content", view.id));
         let saved_selection = egui::TextEdit::load_state(ui.ctx(), text_edit_id)
             .and_then(|state| state.cursor.char_range());
@@ -546,6 +629,7 @@ impl HomePage {
         if output.response.changed() {
             ui.ctx().request_repaint();
             let _ = store.save(&Snippet {
+                id: entity_id.clone(),
                 title: title.to_owned(),
                 content: content.clone(),
             });
@@ -577,6 +661,7 @@ impl HomePage {
         title: &str,
         focus_request: &mut bool,
         store: &SnippetStore,
+        entity_id: &EntityId,
     ) -> ViewAction {
         ui.show_viewport_immediate(
             egui::ViewportId::from_hash_of(("snippet-view", view.id)),
@@ -606,7 +691,7 @@ impl HomePage {
                                             focus_request,
                                             &mut action,
                                             store,
-                                            title,
+                                            (entity_id, title),
                                         );
                                     });
                             });
@@ -642,6 +727,7 @@ impl App for HomePage {
         for view in &mut self.views {
             let item = &mut self.items[view.item_id];
             let title = item.title.as_str();
+            let entity_id = &item.id;
             let content = &mut item.content;
             let action = Self::render_snippet_viewport(
                 ui,
@@ -650,6 +736,7 @@ impl App for HomePage {
                 title,
                 &mut self.focus_request,
                 &self.store,
+                entity_id,
             );
             if matches!(action, ViewAction::Close) {
                 closed_views.push(view.id);
@@ -678,5 +765,48 @@ impl App for HomePage {
             .show(ui.ctx(), |ui| {
                 ui.label(format!("{:.1} fps", fps));
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+
+    struct TestFolder(PathBuf);
+
+    impl TestFolder {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            Self(
+                std::env::temp_dir()
+                    .join(format!("floatdea-home-page-{}-{nonce}", std::process::id())),
+            )
+        }
+    }
+
+    impl Drop for TestFolder {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn restores_root_card_positions() {
+        let folder = TestFolder::new();
+        let mut first_session = HomePage::new(&folder.0);
+        first_session.positions[0] = [137.0, 281.0];
+        first_session.save_root_layout();
+
+        let second_session = HomePage::new(&folder.0);
+
+        assert_eq!(second_session.positions[0], [137.0, 281.0]);
     }
 }
