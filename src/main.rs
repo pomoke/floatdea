@@ -1,9 +1,7 @@
-mod data;
-
 use eframe::{App, egui};
 use egui::TextBuffer;
 
-use crate::data::Snippet;
+use floatdea::data::Snippet;
 
 const CANVAS_MARGIN: f32 = 0.0;
 const CARD_WIDTH: f32 = 80.0;
