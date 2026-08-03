@@ -2,5 +2,6 @@
 
 mod model;
 pub mod storage;
+pub mod workspace;
 
-pub use model::Snippet;
+pub use model::{ContainerId, EntityId, ReferenceId, Snippet};

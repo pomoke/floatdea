@@ -1,6 +1,6 @@
 use std::{ffi::OsStr, fs, io, path::PathBuf};
 
-use super::Snippet;
+use super::{EntityId, Snippet};
 
 const FILE_EXTENSION: &str = "txt";
 
@@ -28,12 +28,23 @@ impl SnippetStore {
                 continue;
             }
 
-            let path = entry.path();
-            let Some(title) = path.file_stem().and_then(OsStr::to_str) else {
+            let mut path = entry.path();
+            let Some(stem) = path.file_stem().and_then(OsStr::to_str).map(str::to_owned) else {
                 continue;
             };
+            let (title, id) = match parse_file_stem(&stem) {
+                Some(parts) => parts,
+                None => {
+                    let id = EntityId::new();
+                    let new_path = self.path_for(&stem, &id)?;
+                    fs::rename(&path, &new_path)?;
+                    path = new_path;
+                    (stem, id)
+                }
+            };
             snippets.push(Snippet {
-                title: title.to_owned(),
+                id,
+                title,
                 content: fs::read_to_string(path)?,
             });
         }
@@ -42,25 +53,19 @@ impl SnippetStore {
         Ok(snippets)
     }
 
-    pub fn load(&self, title: &str) -> io::Result<Snippet> {
-        Ok(Snippet {
-            title: title.to_owned(),
-            content: fs::read_to_string(self.path_for(title)?)?,
-        })
-    }
-
     /// Creates the snippet file or replaces its content if it already exists.
-    /// 
+    ///
     /// No atomic guarantee provided.
     pub fn save(&self, snippet: &Snippet) -> io::Result<()> {
-        fs::write(self.path_for(&snippet.title)?, &snippet.content)
+        let path = self.path_for(&snippet.title, &snippet.id)?;
+        fs::write(path, &snippet.content)
     }
 
-    pub fn remove(&self, title: &str) -> io::Result<()> {
-        fs::remove_file(self.path_for(title)?)
+    pub fn remove(&self, snippet: &Snippet) -> io::Result<()> {
+        fs::remove_file(self.path_for(&snippet.title, &snippet.id)?)
     }
 
-    fn path_for(&self, title: &str) -> io::Result<PathBuf> {
+    fn path_for(&self, title: &str, id: &EntityId) -> io::Result<PathBuf> {
         if title.is_empty()
             || title == "."
             || title == ".."
@@ -73,9 +78,30 @@ impl SnippetStore {
                 "snippet title cannot be empty or contain path separators",
             ));
         }
+        if id.as_str().is_empty()
+            || id.as_str().contains('/')
+            || id.as_str().contains('\\')
+            || id.as_str().contains('\0')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snippet id cannot be empty or contain path separators",
+            ));
+        }
 
-        Ok(self.folder.join(title).with_extension(FILE_EXTENSION))
+        Ok(self
+            .folder
+            .join(format!("{title}--{}", id.as_str()))
+            .with_extension(FILE_EXTENSION))
     }
+}
+
+fn parse_file_stem(stem: &str) -> Option<(String, EntityId)> {
+    let (title, id) = stem.rsplit_once("--")?;
+    if title.is_empty() || ulid::Ulid::from_string(id).is_err() {
+        return None;
+    }
+    Some((title.to_owned(), EntityId::from_string(id)))
 }
 
 #[cfg(test)]
@@ -113,6 +139,7 @@ mod tests {
         let folder = TestFolder::new();
         let store = SnippetStore::open(&folder.0).unwrap();
         let snippet = Snippet {
+            id: EntityId::new(),
             title: "hello".to_owned(),
             content: "hello, world!".to_owned(),
         };
@@ -120,10 +147,11 @@ mod tests {
         store.save(&snippet).unwrap();
 
         assert_eq!(
-            fs::read_to_string(folder.0.join("hello.txt")).unwrap(),
+            fs::read_to_string(folder.0.join(format!("hello--{}.txt", snippet.id.as_str())))
+                .unwrap(),
             snippet.content
         );
-        assert_eq!(store.load("hello").unwrap(), snippet);
+        assert_eq!(store.load_all().unwrap(), vec![snippet]);
     }
 
     #[test]
@@ -140,10 +168,12 @@ mod tests {
             snippets,
             vec![
                 Snippet {
+                    id: snippets[0].id.clone(),
                     title: "a".to_owned(),
                     content: "first".to_owned(),
                 },
                 Snippet {
+                    id: snippets[1].id.clone(),
                     title: "z".to_owned(),
                     content: "last".to_owned(),
                 },
@@ -155,9 +185,14 @@ mod tests {
     fn rejects_titles_that_can_escape_the_folder() {
         let folder = TestFolder::new();
         let store = SnippetStore::open(&folder.0).unwrap();
+        let snippet = Snippet {
+            id: EntityId::new(),
+            title: "../outside".to_owned(),
+            content: String::new(),
+        };
 
         assert_eq!(
-            store.load("../outside").unwrap_err().kind(),
+            store.save(&snippet).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
     }
@@ -168,13 +203,18 @@ mod tests {
         let store = SnippetStore::open(&folder.0).unwrap();
         store
             .save(&Snippet {
+                id: EntityId::new(),
                 title: "temporary".to_owned(),
                 content: String::new(),
             })
             .unwrap();
 
-        store.remove("temporary").unwrap();
+        let snippet = store.load_all().unwrap().remove(0);
+        let path = folder
+            .0
+            .join(format!("temporary--{}.txt", snippet.id.as_str()));
+        store.remove(&snippet).unwrap();
 
-        assert!(!folder.0.join("temporary.txt").exists());
+        assert!(!path.exists());
     }
 }
