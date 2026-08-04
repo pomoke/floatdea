@@ -2,9 +2,10 @@ use std::{ffi::OsStr, fs, io, path::PathBuf};
 
 use super::{EntityId, Snippet};
 
-const FILE_EXTENSION: &str = "txt";
+const FILE_EXTENSION: &str = "md";
+const LEGACY_FILE_EXTENSION: &str = "txt";
 
-/// Stores each snippet as an ordinary UTF-8 text file in one folder.
+/// Stores each snippet as an ordinary UTF-8 Markdown file in one folder.
 #[derive(Clone, Debug)]
 pub struct SnippetStore {
     folder: PathBuf,
@@ -22,13 +23,17 @@ impl SnippetStore {
 
         for entry in fs::read_dir(&self.folder)? {
             let entry = entry?;
-            if !entry.file_type()?.is_file()
-                || entry.path().extension() != Some(OsStr::new(FILE_EXTENSION))
-            {
+            if !entry.file_type()?.is_file() {
                 continue;
             }
 
             let mut path = entry.path();
+            let extension = path.extension();
+            if extension != Some(OsStr::new(FILE_EXTENSION))
+                && extension != Some(OsStr::new(LEGACY_FILE_EXTENSION))
+            {
+                continue;
+            }
             let Some(stem) = path.file_stem().and_then(OsStr::to_str).map(str::to_owned) else {
                 continue;
             };
@@ -42,6 +47,15 @@ impl SnippetStore {
                     (stem, id)
                 }
             };
+            let markdown_path = self.path_for(&title, &id)?;
+            if path != markdown_path {
+                if markdown_path.exists() {
+                    // Prefer an existing Markdown file over its legacy text-file copy.
+                    continue;
+                }
+                fs::rename(&path, &markdown_path)?;
+                path = markdown_path;
+            }
             snippets.push(Snippet {
                 id,
                 title,
@@ -156,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn saves_and_loads_plain_text_files() {
+    fn saves_and_loads_markdown_files() {
         let folder = TestFolder::new();
         let store = SnippetStore::open(&folder.0).unwrap();
         let snippet = Snippet {
@@ -168,7 +182,7 @@ mod tests {
         store.save(&snippet).unwrap();
 
         assert_eq!(
-            fs::read_to_string(folder.0.join(format!("hello--{}.txt", snippet.id.as_str())))
+            fs::read_to_string(folder.0.join(format!("hello--{}.md", snippet.id.as_str())))
                 .unwrap(),
             snippet.content
         );
@@ -176,11 +190,11 @@ mod tests {
     }
 
     #[test]
-    fn loads_only_text_files_in_title_order() {
+    fn loads_only_markdown_files_in_title_order() {
         let folder = TestFolder::new();
         let store = SnippetStore::open(&folder.0).unwrap();
-        fs::write(folder.0.join("z.txt"), "last").unwrap();
-        fs::write(folder.0.join("a.txt"), "first").unwrap();
+        fs::write(folder.0.join("z.md"), "last").unwrap();
+        fs::write(folder.0.join("a.md"), "first").unwrap();
         fs::write(folder.0.join("ignored.json"), "{}").unwrap();
 
         let snippets = store.load_all().unwrap();
@@ -233,7 +247,7 @@ mod tests {
         let snippet = store.load_all().unwrap().remove(0);
         let path = folder
             .0
-            .join(format!("temporary--{}.txt", snippet.id.as_str()));
+            .join(format!("temporary--{}.md", snippet.id.as_str()));
         store.remove(&snippet).unwrap();
 
         assert!(!path.exists());
@@ -244,7 +258,7 @@ mod tests {
         let folder = TestFolder::new();
         let store = SnippetStore::open(&folder.0).unwrap();
         let legacy_id = ulid::Ulid::new().to_string();
-        fs::write(folder.0.join(format!("legacy--{legacy_id}.txt")), "content").unwrap();
+        fs::write(folder.0.join(format!("legacy--{legacy_id}.md")), "content").unwrap();
 
         let snippets = store.load_all().unwrap();
 
@@ -262,16 +276,10 @@ mod tests {
             content: "body".to_owned(),
         };
         store.save(&snippet).unwrap();
-        let old_path = folder
-            .0
-            .join(format!("old--{}.txt", snippet.id.as_str()));
-        let new_path = folder
-            .0
-            .join(format!("new--{}.txt", snippet.id.as_str()));
+        let old_path = folder.0.join(format!("old--{}.md", snippet.id.as_str()));
+        let new_path = folder.0.join(format!("new--{}.md", snippet.id.as_str()));
 
-        store
-            .rename(&snippet.id, "old", "new")
-            .unwrap();
+        store.rename(&snippet.id, "old", "new").unwrap();
 
         assert!(!old_path.exists(), "old file should be gone after rename");
         assert!(new_path.exists(), "new file should exist after rename");
@@ -285,5 +293,23 @@ mod tests {
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded[0].title, "new");
         assert_eq!(reloaded[0].content, "body");
+    }
+
+    #[test]
+    fn migrates_legacy_text_files_to_markdown() {
+        let folder = TestFolder::new();
+        let store = SnippetStore::open(&folder.0).unwrap();
+        let id = EntityId::new();
+        let text_path = folder.0.join(format!("legacy--{}.txt", id.as_str()));
+        let markdown_path = folder.0.join(format!("legacy--{}.md", id.as_str()));
+        fs::write(&text_path, "# Legacy note").unwrap();
+
+        let snippets = store.load_all().unwrap();
+
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].id, id);
+        assert_eq!(snippets[0].content, "# Legacy note");
+        assert!(!text_path.exists());
+        assert!(markdown_path.exists());
     }
 }

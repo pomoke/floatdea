@@ -35,7 +35,7 @@ impl EntityId {
     }
 }
 
-/// A plain-text note with an identity that does not change when its title changes.
+/// A Markdown note with an identity that does not change when its title changes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snippet {
     pub id: EntityId,
