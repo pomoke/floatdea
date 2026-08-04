@@ -12,7 +12,7 @@ mod canvas;
 mod snippet;
 
 const CANVAS_MARGIN: f32 = 0.0;
-const CARD_WIDTH: f32 = 80.0;
+const CARD_WIDTH: f32 = 150.0;
 const CARD_PADDING_H: f32 = 8.0;
 const CARD_MARGIN_Y: f32 = 6.0;
 
@@ -26,6 +26,7 @@ pub(crate) struct HomePage {
     views: Vec<View>,
     next_view_id: u64,
     pending_delete: Option<EntityId>,
+    rename_dialog: RenameDialogState,
 }
 
 #[derive(Debug)]
@@ -33,6 +34,30 @@ struct View {
     id: u64,
     entity_id: EntityId,
     editable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum RenameTarget {
+    Snippet { id: EntityId, origin: egui::ViewportId },
+    Folder { id: ContainerId, origin: egui::ViewportId },
+}
+
+impl RenameTarget {
+    fn origin(&self) -> egui::ViewportId {
+        match self {
+            RenameTarget::Snippet { origin, .. } | RenameTarget::Folder { origin, .. } => *origin,
+        }
+    }
+}
+
+/// State of the single in-flight rename dialog. The dialog is rendered inside
+/// the viewport stored in [`RenameTarget::origin`] so that it appears in the
+/// window that initiated the rename.
+#[derive(Default)]
+struct RenameDialogState {
+    pending: Option<RenameTarget>,
+    buffer: String,
+    focus_requested: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -76,6 +101,10 @@ enum CanvasCommand {
         target: ContainerId,
     },
     CloseFolder(ContainerId),
+    RenameSnippet(EntityId),
+    RenameFolder(ContainerId),
+    /// Internal: apply the rename confirmed in a viewport's dialog.
+    ApplyRename(RenameTarget),
 }
 
 impl ContainerCanvas {
@@ -167,6 +196,7 @@ impl HomePage {
             views: Vec::new(),
             next_view_id: 0,
             pending_delete: None,
+            rename_dialog: RenameDialogState::default(),
         }
     }
 
@@ -222,14 +252,45 @@ impl HomePage {
         });
     }
 
-    fn process_canvas_commands(&mut self, commands: Vec<CanvasCommand>) {
+    fn process_canvas_commands(&mut self, commands: Vec<CanvasCommand>, origin: egui::ViewportId) {
         for command in commands {
             match command {
                 CanvasCommand::OpenSnippet(id) => self.open_view(id),
                 CanvasCommand::DeleteSnippet(id) => self.pending_delete = Some(id),
                 CanvasCommand::OpenFolder(id) => self.open_folder(&id),
                 CanvasCommand::CloseFolder(id) => {
+                    self.clear_rename_for_viewport(egui::ViewportId::from_hash_of((
+                        "folder-view",
+                        id.as_str(),
+                    )));
                     self.folder_views.remove(&id);
+                }
+                CanvasCommand::RenameSnippet(id) => {
+                    if let Some(snippet) = self.all_snippets.get(&id) {
+                        self.rename_dialog.buffer = snippet.title.clone();
+                        self.rename_dialog.pending = Some(RenameTarget::Snippet { id, origin });
+                        self.rename_dialog.focus_requested = false;
+                    }
+                }
+                CanvasCommand::RenameFolder(id) => {
+                    if let Some(container) = self.workspace.containers.get(&id) {
+                        self.rename_dialog.buffer = container.title.clone();
+                        self.rename_dialog.pending = Some(RenameTarget::Folder { id, origin });
+                        self.rename_dialog.focus_requested = false;
+                    }
+                }
+                CanvasCommand::ApplyRename(target) => {
+                    if self.rename_dialog.pending.as_ref() != Some(&target) {
+                        continue;
+                    }
+                    let new_title = self.rename_dialog.buffer.trim().to_owned();
+                    let ok = match &target {
+                        RenameTarget::Snippet { id, .. } => self.rename_snippet(id, new_title),
+                        RenameTarget::Folder { id, .. } => self.rename_folder(id, new_title),
+                    };
+                    if ok {
+                        self.rename_dialog.pending = None;
+                    }
                 }
                 CanvasCommand::RemoveFolder {
                     owner,
@@ -244,9 +305,24 @@ impl HomePage {
                     } else if let Some(canvas) = self.folder_views.get_mut(&owner) {
                         canvas.remove_reference(&reference, &self.workspace_store);
                     }
+                    self.clear_rename_for_viewport(egui::ViewportId::from_hash_of((
+                        "folder-view",
+                        target.as_str(),
+                    )));
                     self.folder_views.remove(&target);
                 }
             }
+        }
+    }
+
+    fn clear_rename_for_viewport(&mut self, viewport_id: egui::ViewportId) {
+        if self
+            .rename_dialog
+            .pending
+            .as_ref()
+            .is_some_and(|target| target.origin() == viewport_id)
+        {
+            self.rename_dialog.pending = None;
         }
     }
 }
@@ -260,9 +336,11 @@ fn default_card_position(index: usize) -> [f32; 2] {
 
 impl App for HomePage {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let root_viewport = ui.ctx().viewport_id();
         let root_commands = self.render_home_panel(ui);
-        self.process_canvas_commands(root_commands);
+        self.process_canvas_commands(root_commands, root_viewport);
         self.render_delete_dialog(ui);
+        self.render_rename_dialog(ui);
 
         let mut closed_views = Vec::new();
         for view in &mut self.views {
@@ -278,7 +356,7 @@ impl App for HomePage {
         }
         self.views.retain(|view| !closed_views.contains(&view.id));
 
-        let mut commands = Vec::new();
+        let mut commands_by_viewport: Vec<(egui::ViewportId, Vec<CanvasCommand>)> = Vec::new();
         for (container_id, canvas) in &mut self.folder_views {
             let title = self
                 .workspace
@@ -286,7 +364,8 @@ impl App for HomePage {
                 .get(container_id)
                 .map(|container| container.title.clone())
                 .unwrap_or_default();
-            commands.extend(Self::render_folder_viewport(
+            let viewport_id = egui::ViewportId::from_hash_of(("folder-view", container_id.as_str()));
+            let commands = Self::render_folder_viewport(
                 ui,
                 canvas,
                 &title,
@@ -294,9 +373,13 @@ impl App for HomePage {
                 &self.workspace_store,
                 &self.store,
                 &mut self.all_snippets,
-            ));
+                &mut self.rename_dialog,
+            );
+            commands_by_viewport.push((viewport_id, commands));
         }
-        self.process_canvas_commands(commands);
+        for (viewport_id, commands) in commands_by_viewport {
+            self.process_canvas_commands(commands, viewport_id);
+        }
     }
 }
 

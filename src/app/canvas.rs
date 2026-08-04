@@ -7,6 +7,18 @@ struct CanvasData<'a> {
     snippet_store: &'a SnippetStore,
 }
 
+/// Outcome of rendering the rename dialog for a specific viewport.
+enum RenameDialogResult {
+    /// No dialog is pending, or it belongs to another viewport.
+    None,
+    /// The dialog is open and awaiting input.
+    Open,
+    /// The user confirmed the new title.
+    Confirmed(RenameTarget),
+    /// The user cancelled.
+    Cancelled,
+}
+
 impl ContainerCanvas {
     fn default_position(&self, data: &CanvasData<'_>) -> [f32; 2] {
         for index in 0..640 {
@@ -114,6 +126,127 @@ impl HomePage {
         }
     }
 
+    pub(super) fn render_rename_dialog(&mut self, ui: &mut egui::Ui) {
+        match Self::rename_dialog_ui(ui, &mut self.rename_dialog) {
+            RenameDialogResult::Confirmed(target) => {
+                let new_title = self.rename_dialog.buffer.trim().to_owned();
+                let ok = match &target {
+                    RenameTarget::Snippet { id, .. } => self.rename_snippet(id, new_title),
+                    RenameTarget::Folder { id, .. } => self.rename_folder(id, new_title),
+                };
+                if ok {
+                    self.rename_dialog.pending = None;
+                }
+            }
+            RenameDialogResult::Cancelled => {
+                self.rename_dialog.pending = None;
+            }
+            RenameDialogResult::None | RenameDialogResult::Open => {}
+        }
+    }
+
+    /// Renders the rename dialog only if it belongs to `ui`'s viewport, so it
+    /// appears in the window that initiated the rename.
+    fn rename_dialog_ui(
+        ui: &mut egui::Ui,
+        state: &mut RenameDialogState,
+    ) -> RenameDialogResult {
+        let Some(target) = state.pending.clone() else {
+            return RenameDialogResult::None;
+        };
+        if ui.ctx().viewport_id() != target.origin() {
+            return RenameDialogResult::None;
+        }
+        // Scope the dialog and its text-edit state to the target object so that
+        // switching between objects does not carry over cursor/IME state.
+        let target_key = match &target {
+            RenameTarget::Snippet { id, .. } => format!("snippet:{}", id.as_str()),
+            RenameTarget::Folder { id, .. } => format!("folder:{}", id.as_str()),
+        };
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        egui::Window::new("Rename")
+            .id(egui::Id::new(("rename-dialog", target_key.clone())))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut state.buffer)
+                        .id(egui::Id::new(("rename-dialog-input", target_key.clone())))
+                        .hint_text("Title"),
+                );
+                // Only request focus once when the dialog opens. Requesting it
+                // every frame breaks IME.
+                if !state.focus_requested {
+                    response.request_focus();
+                    state.focus_requested = true;
+                }
+                if response.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                {
+                    confirmed = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                    if ui.button("OK").clicked() {
+                        confirmed = true;
+                    }
+                });
+            });
+
+        if confirmed {
+            RenameDialogResult::Confirmed(target)
+        } else if cancelled {
+            RenameDialogResult::Cancelled
+        } else {
+            RenameDialogResult::Open
+        }
+    }
+
+    pub(super) fn rename_snippet(&mut self, id: &EntityId, new_title: String) -> bool {
+        if new_title.is_empty()
+            || self
+                .all_snippets
+                .values()
+                .any(|snippet| snippet.id != *id && snippet.title == new_title)
+        {
+            return false;
+        }
+        let Some(snippet) = self.all_snippets.get(id) else {
+            return false;
+        };
+        let old_title = snippet.title.clone();
+        if self.store.rename(id, &old_title, &new_title).is_err() {
+            return false;
+        }
+        if let Some(snippet) = self.all_snippets.get_mut(id) {
+            snippet.title = new_title;
+        }
+        true
+    }
+
+    pub(super) fn rename_folder(&mut self, id: &ContainerId, new_title: String) -> bool {
+        if new_title.is_empty()
+            || self
+                .workspace
+                .containers
+                .values()
+                .any(|container| container.id != *id && container.title == new_title)
+        {
+            return false;
+        }
+        let Some(container) = self.workspace.containers.get_mut(id) else {
+            return false;
+        };
+        container.title = new_title;
+        let _ = self.workspace_store.save(&self.workspace);
+        true
+    }
+
     pub(super) fn open_folder(&mut self, container_id: &ContainerId) {
         if self.folder_views.contains_key(container_id) {
             return;
@@ -127,6 +260,7 @@ impl HomePage {
         self.folder_views.insert(container_id.clone(), canvas);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_folder_viewport(
         ui: &mut egui::Ui,
         canvas: &mut ContainerCanvas,
@@ -135,6 +269,7 @@ impl HomePage {
         workspace_store: &WorkspaceStore,
         snippet_store: &SnippetStore,
         snippets: &mut BTreeMap<EntityId, Snippet>,
+        rename_dialog: &mut RenameDialogState,
     ) -> Vec<CanvasCommand> {
         let container_id = canvas.container_id.clone();
         ui.show_viewport_immediate(
@@ -152,6 +287,17 @@ impl HomePage {
                 let mut commands = Self::render_canvas_panel(child_ui, canvas, false, &mut data);
                 if child_ui.input(|input| input.viewport().close_requested()) {
                     commands.push(CanvasCommand::CloseFolder(container_id.clone()));
+                }
+                // Render the rename dialog inside this viewport so that it
+                // appears in the folder window that initiated the rename.
+                match Self::rename_dialog_ui(child_ui, rename_dialog) {
+                    RenameDialogResult::Confirmed(target) => {
+                        commands.push(CanvasCommand::ApplyRename(target));
+                    }
+                    RenameDialogResult::Cancelled => {
+                        rename_dialog.pending = None;
+                    }
+                    RenameDialogResult::None | RenameDialogResult::Open => {}
                 }
                 commands
             },
@@ -253,13 +399,21 @@ impl HomePage {
             let reference_id = canvas.items[index].reference_id.clone();
 
             response.context_menu(|ui| match &target {
-                ReferenceTarget::Snippet(entity_id) if is_root => {
-                    if ui.button("delete").clicked() {
+                ReferenceTarget::Snippet(entity_id) => {
+                    if ui.button("Rename…").clicked() {
+                        commands.push(CanvasCommand::RenameSnippet(entity_id.clone()));
+                        ui.close();
+                    }
+                    if is_root && ui.button("delete").clicked() {
                         commands.push(CanvasCommand::DeleteSnippet(entity_id.clone()));
                         ui.close();
                     }
                 }
                 ReferenceTarget::Container(container_id) => {
+                    if ui.button("Rename…").clicked() {
+                        commands.push(CanvasCommand::RenameFolder(container_id.clone()));
+                        ui.close();
+                    }
                     if ui.button("delete").clicked() {
                         commands.push(CanvasCommand::RemoveFolder {
                             owner: canvas.container_id.clone(),
@@ -269,7 +423,6 @@ impl HomePage {
                         ui.close();
                     }
                 }
-                ReferenceTarget::Snippet(_) => {}
             });
 
             if response.clicked() {

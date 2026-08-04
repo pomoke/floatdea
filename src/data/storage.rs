@@ -65,6 +65,19 @@ impl SnippetStore {
         fs::remove_file(self.path_for(&snippet.title, &snippet.id)?)
     }
 
+    /// Renames a snippet file atomically. The snippet's identity (`id`) is
+    /// unchanged; only the title-derived filename moves from `old_title` to
+    /// `new_title`. Use this instead of [`save`](Self::save) to avoid leaving
+    /// the old file behind.
+    pub fn rename(&self, id: &EntityId, old_title: &str, new_title: &str) -> io::Result<()> {
+        let from = self.path_for(old_title, id)?;
+        let to = self.path_for(new_title, id)?;
+        if from == to {
+            return Ok(());
+        }
+        fs::rename(from, to)
+    }
+
     fn path_for(&self, title: &str, id: &EntityId) -> io::Result<PathBuf> {
         if title.is_empty()
             || title == "."
@@ -237,5 +250,40 @@ mod tests {
 
         assert_eq!(snippets[0].id.as_str(), legacy_id);
         assert_eq!(snippets[0].title, "legacy");
+    }
+
+    #[test]
+    fn rename_moves_the_file_without_leaving_the_old_one() {
+        let folder = TestFolder::new();
+        let store = SnippetStore::open(&folder.0).unwrap();
+        let snippet = Snippet {
+            id: EntityId::new(),
+            title: "old".to_owned(),
+            content: "body".to_owned(),
+        };
+        store.save(&snippet).unwrap();
+        let old_path = folder
+            .0
+            .join(format!("old--{}.txt", snippet.id.as_str()));
+        let new_path = folder
+            .0
+            .join(format!("new--{}.txt", snippet.id.as_str()));
+
+        store
+            .rename(&snippet.id, "old", "new")
+            .unwrap();
+
+        assert!(!old_path.exists(), "old file should be gone after rename");
+        assert!(new_path.exists(), "new file should exist after rename");
+        assert_eq!(
+            fs::read_to_string(&new_path).unwrap(),
+            "body",
+            "content must be preserved across rename"
+        );
+
+        let reloaded = store.load_all().unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].title, "new");
+        assert_eq!(reloaded[0].content, "body");
     }
 }
