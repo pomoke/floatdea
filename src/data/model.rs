@@ -28,6 +28,7 @@ macro_rules! stable_id {
 stable_id!(EntityId);
 stable_id!(ContainerId);
 stable_id!(ReferenceId);
+stable_id!(TextId);
 
 impl EntityId {
     pub(crate) fn from_string(value: &str) -> Self {
@@ -53,6 +54,7 @@ mod tests {
             EntityId::new().0,
             ContainerId::new().0,
             ReferenceId::new().0,
+            TextId::new().0,
         ] {
             assert_eq!(id.len(), 20);
             assert!(

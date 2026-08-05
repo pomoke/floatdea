@@ -4,8 +4,8 @@ use eframe::{egui, App};
 
 use floatdea::data::{
     storage::SnippetStore,
-    workspace::{CardLayout, ContainerLayout, ReferenceTarget, Workspace, WorkspaceStore},
-    ContainerId, EntityId, ReferenceId, Snippet,
+    workspace::{CanvasText, CardLayout, ContainerLayout, ReferenceTarget, Workspace, WorkspaceStore},
+    ContainerId, EntityId, ReferenceId, Snippet, TextId,
 };
 
 mod canvas;
@@ -125,8 +125,19 @@ struct DragState {
 struct ContainerCanvas {
     container_id: ContainerId,
     items: Vec<CanvasItem>,
+    /// Canvas-local text annotations. Texts are not references: they cannot
+    /// be linked, pasted, or moved across container boundaries.
+    texts: Vec<CanvasText>,
     layout: ContainerLayout,
     dragging: Option<DragState>,
+    /// Transient: index of the text being dragged, its start position, and
+    /// whether the current position overlaps another element.
+    dragging_text: Option<(usize, [f32; 2], bool)>,
+    /// Transient: the text currently being edited in place, if any.
+    editing_text: Option<TextId>,
+    /// Transient: focus is requested only on the first frame of editing, so
+    /// that IME input is not broken by repeated focus requests.
+    edit_focus_requested: bool,
 }
 
 #[derive(Debug)]
@@ -163,6 +174,7 @@ impl ContainerCanvas {
                 },
             );
         }
+        self.layout.texts = self.texts.clone();
         let _ = store.save_layout(&self.layout);
     }
 
@@ -313,8 +325,12 @@ impl HomePage {
         ContainerCanvas {
             container_id,
             items,
+            texts: layout.texts.clone(),
             layout,
             dragging: None,
+            dragging_text: None,
+            editing_text: None,
+            edit_focus_requested: false,
         }
     }
 
@@ -500,7 +516,12 @@ impl HomePage {
             }
         };
         let position = self.canvas_for(container).map(|canvas| {
-            canvas::default_position_for(&canvas.items, &self.all_snippets, &self.workspace)
+            canvas::default_position_for(
+                &canvas.items,
+                &self.all_snippets,
+                &self.workspace,
+                &canvas::approx_text_rects(&canvas.texts),
+            )
         });
         let target_canvas = if container == &self.root.container_id {
             Some(&mut self.root)
@@ -975,5 +996,57 @@ mod tests {
 
         assert!(!page.workspace.containers.contains_key(&folder_id));
         assert!(!page.folder_views.contains_key(&folder_id));
+    }
+
+    #[test]
+    fn create_text_enters_edit_and_persists_across_sessions() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        {
+            let mut data = canvas::CanvasData::new(
+                &mut page.all_snippets,
+                &mut page.workspace,
+                &page.workspace_store,
+                &page.store,
+                &mut page.clipboard,
+            );
+            canvas::create_text(&mut page.root, &mut data, [24.0, 36.0]);
+
+            assert_eq!(page.root.texts.len(), 1);
+            let text_id = page.root.texts[0].id.clone();
+            assert_eq!(page.root.editing_text, Some(text_id));
+        }
+        drop(page);
+
+        let reloaded = HomePage::new(&folder.0);
+        assert_eq!(reloaded.root.texts.len(), 1);
+        assert_eq!(reloaded.root.texts[0].position, [24.0, 36.0]);
+        assert!(reloaded.root.texts[0].text.is_empty());
+    }
+
+    #[test]
+    fn delete_text_removes_it_and_clears_edit_state() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        {
+            let mut data = canvas::CanvasData::new(
+                &mut page.all_snippets,
+                &mut page.workspace,
+                &page.workspace_store,
+                &page.store,
+                &mut page.clipboard,
+            );
+            canvas::create_text(&mut page.root, &mut data, [24.0, 24.0]);
+            let text_id = page.root.texts[0].id.clone();
+
+            canvas::delete_text(&mut page.root, &mut data, &text_id);
+
+            assert!(page.root.texts.is_empty());
+            assert!(page.root.editing_text.is_none());
+        }
+        drop(page);
+
+        let reloaded = HomePage::new(&folder.0);
+        assert!(reloaded.root.texts.is_empty());
     }
 }

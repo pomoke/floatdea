@@ -1,11 +1,29 @@
 use super::*;
 
-struct CanvasData<'a> {
+pub(super) struct CanvasData<'a> {
     snippets: &'a mut BTreeMap<EntityId, Snippet>,
     workspace: &'a mut Workspace,
     workspace_store: &'a WorkspaceStore,
     snippet_store: &'a SnippetStore,
     clipboard: &'a mut Option<ClipboardEntry>,
+}
+
+impl<'a> CanvasData<'a> {
+    pub(super) fn new(
+        snippets: &'a mut BTreeMap<EntityId, Snippet>,
+        workspace: &'a mut Workspace,
+        workspace_store: &'a WorkspaceStore,
+        snippet_store: &'a SnippetStore,
+        clipboard: &'a mut Option<ClipboardEntry>,
+    ) -> Self {
+        Self {
+            snippets,
+            workspace,
+            workspace_store,
+            snippet_store,
+            clipboard,
+        }
+    }
 }
 
 /// Outcome of rendering the rename dialog for a specific viewport.
@@ -22,37 +40,25 @@ enum RenameDialogResult {
 
 impl ContainerCanvas {
     fn default_position(&self, data: &CanvasData<'_>) -> [f32; 2] {
-        default_position_for(&self.items, data.snippets, data.workspace)
+        default_position_for(
+            &self.items,
+            data.snippets,
+            data.workspace,
+            &approx_text_rects(&self.texts),
+        )
     }
 
-    fn intersects(
-        &self,
-        index: usize,
-        rect: egui::Rect,
-        snippets: &BTreeMap<EntityId, Snippet>,
-        workspace: &Workspace,
-    ) -> bool {
-        self.items.iter().enumerate().any(|(other_index, item)| {
-            other_index != index
-                && item_label(item, snippets, workspace).is_some()
-                && egui::Rect::from_min_size(
-                    egui::pos2(item.position[0], item.position[1]),
-                    item.size,
-                )
-                .intersects(rect)
-        })
-    }
 }
 
 impl HomePage {
     pub(super) fn render_home_panel(&mut self, ui: &mut egui::Ui) -> Vec<CanvasCommand> {
-        let mut data = CanvasData {
-            snippets: &mut self.all_snippets,
-            workspace: &mut self.workspace,
-            workspace_store: &self.workspace_store,
-            snippet_store: &self.store,
-            clipboard: &mut self.clipboard,
-        };
+        let mut data = CanvasData::new(
+            &mut self.all_snippets,
+            &mut self.workspace,
+            &self.workspace_store,
+            &self.store,
+            &mut self.clipboard,
+        );
         Self::render_canvas_panel(ui, &mut self.root, &mut data)
     }
 
@@ -257,13 +263,8 @@ impl HomePage {
                 .with_title(format!("{title} - FloatDea"))
                 .with_inner_size([640.0, 480.0]),
             |child_ui, _| {
-                let mut data = CanvasData {
-                    snippets,
-                    workspace,
-                    workspace_store,
-                    snippet_store,
-                    clipboard,
-                };
+                let mut data =
+                    CanvasData::new(snippets, workspace, workspace_store, snippet_store, clipboard);
                 let mut commands = Self::render_canvas_panel(child_ui, canvas, &mut data);
                 if child_ui.input(|input| input.viewport().close_requested()) {
                     commands.push(CanvasCommand::CloseFolder(container_id.clone()));
@@ -314,6 +315,27 @@ impl HomePage {
         commands: &mut Vec<CanvasCommand>,
     ) {
         let available = ui.available_size();
+        // Layout texts once per frame: the canvas-local rect is used for the
+        // extent and overlap detection, the galley is reused for painting.
+        let text_layouts: Vec<TextLayout> = {
+            let painter = ui.painter();
+            let text_color = ui.visuals().text_color();
+            canvas
+                .texts
+                .iter()
+                .map(|text_item| {
+                    let galley = layout_text(painter, &text_item.text, TEXT_NO_WRAP, text_color);
+                    let size = text_box_size(&text_item.text, &galley);
+                    TextLayout {
+                        rect: egui::Rect::from_min_size(
+                            egui::pos2(text_item.position[0], text_item.position[1]),
+                            size,
+                        ),
+                        galley,
+                    }
+                })
+                .collect()
+        };
         let extent = canvas
             .items
             .iter()
@@ -323,6 +345,11 @@ impl HomePage {
                 extent.y = extent.y.max(item.position[1] + item.size.y);
                 extent
             });
+        let extent = text_layouts.iter().fold(extent, |mut extent, layout| {
+            extent.x = extent.x.max(layout.rect.max.x);
+            extent.y = extent.y.max(layout.rect.max.y);
+            extent
+        });
         let canvas_size = available.max(extent + egui::vec2(CANVAS_MARGIN, CANVAS_MARGIN));
         let (canvas_rect, canvas_response) =
             ui.allocate_exact_size(canvas_size, egui::Sense::click());
@@ -338,6 +365,12 @@ impl HomePage {
         let pointer_pos = ui.input(|input| input.pointer.interact_pos());
         let mut pointer_over_card = false;
         let mut dragged = None;
+        // Capture the right-click position before the context menu opens: once
+        // the menu is shown, the pointer moves onto the menu items.
+        let mut menu_anchor = None;
+        if canvas_response.secondary_clicked() {
+            menu_anchor = pointer_pos;
+        }
 
         for index in 0..canvas.items.len() {
             let Some((title, is_folder)) =
@@ -460,7 +493,15 @@ impl HomePage {
                 egui::pos2(item.position[0], item.position[1]),
                 item.size,
             );
-            let invalid = canvas.intersects(index, rect, data.snippets, data.workspace);
+            let invalid = overlaps(
+                canvas,
+                Some(index),
+                None,
+                rect,
+                data.snippets,
+                data.workspace,
+                &text_layouts,
+            );
             if let Some(drag) = &mut canvas.dragging {
                 drag.invalid = invalid;
             }
@@ -478,7 +519,10 @@ impl HomePage {
             }
         }
 
-        if !pointer_over_card {
+        let pointer_over_text =
+            render_canvas_texts(ui, canvas, data, canvas_rect, &text_layouts, pointer_pos);
+
+        if !pointer_over_card && !pointer_over_text {
             canvas_response.context_menu(|ui| {
                 if let Some(entry) = data.clipboard.as_ref() {
                     let valid = clipboard_valid_for(
@@ -527,6 +571,18 @@ impl HomePage {
                     create_folder(canvas, data);
                     ui.close();
                 }
+                if ui.button("New Text").clicked() {
+                    let position = menu_anchor
+                        .map(|pos| {
+                            [
+                                (pos.x - canvas_rect.min.x).max(0.0),
+                                (pos.y - canvas_rect.min.y).max(0.0),
+                            ]
+                        })
+                        .unwrap_or_else(|| default_text_position(canvas));
+                    create_text(canvas, data, position);
+                    ui.close();
+                }
                 if ui.button("Organize").clicked() {
                     canvas.organize(data.workspace_store, available.y);
                     ui.close();
@@ -534,6 +590,133 @@ impl HomePage {
             });
         }
     }
+}
+
+/// Renders the canvas texts (interaction, drag, context menu, editing) on top
+/// of the cards. Returns whether the pointer is over any text.
+fn render_canvas_texts(
+    ui: &mut egui::Ui,
+    canvas: &mut ContainerCanvas,
+    data: &mut CanvasData<'_>,
+    canvas_rect: egui::Rect,
+    text_layouts: &[TextLayout],
+    pointer_pos: Option<egui::Pos2>,
+) -> bool {
+    let mut pointer_over_text = false;
+
+    for (index, layout) in text_layouts.iter().enumerate() {
+        let rect = layout.rect.translate(canvas_rect.min.to_vec2());
+        let text_id = canvas.texts[index].id.clone();
+        pointer_over_text |= pointer_pos.is_some_and(|position| rect.contains(position));
+
+        let response = ui.interact(
+            rect,
+            egui::Id::new(("canvas-text", canvas.container_id.as_str(), text_id.as_str())),
+            egui::Sense::click_and_drag(),
+        );
+
+        if response.double_clicked() {
+            canvas.editing_text = Some(text_id.clone());
+            canvas.edit_focus_requested = false;
+        }
+        if response.drag_started() {
+            canvas.dragging_text = Some((index, canvas.texts[index].position, false));
+        }
+        if canvas.dragging_text.is_some_and(|drag| drag.0 == index) && response.dragged() {
+            let delta = ui.input(|input| input.pointer.delta());
+            canvas.texts[index].position[0] =
+                (canvas.texts[index].position[0] + delta.x).max(0.0);
+            canvas.texts[index].position[1] =
+                (canvas.texts[index].position[1] + delta.y).max(0.0);
+            let drag_rect = egui::Rect::from_min_size(
+                egui::pos2(canvas.texts[index].position[0], canvas.texts[index].position[1]),
+                layout.rect.size(),
+            );
+            let invalid = overlaps(
+                canvas,
+                None,
+                Some(index),
+                drag_rect,
+                data.snippets,
+                data.workspace,
+                text_layouts,
+            );
+            if let Some(drag) = &mut canvas.dragging_text {
+                drag.2 = invalid;
+            }
+        }
+        if canvas.dragging_text.is_some_and(|drag| drag.2) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+        }
+
+        response.context_menu(|ui| {
+            if ui.button("Edit").clicked() {
+                canvas.editing_text = Some(text_id.clone());
+                canvas.edit_focus_requested = false;
+                ui.close();
+            }
+            if ui.button("Copy").clicked() {
+                ui.ctx().copy_text(canvas.texts[index].text.clone());
+                ui.close();
+            }
+            if ui.button("Delete Text").clicked() {
+                delete_text(canvas, data, &text_id);
+                ui.close();
+            }
+        });
+
+        // Shared background: display and edit look identical.
+        {
+            let painter = ui.painter();
+            paint_text_bg(painter, rect, ui.visuals());
+        }
+
+        if canvas.editing_text.as_ref() == Some(&text_id) {
+            let escaped = ui.input(|input| input.key_pressed(egui::Key::Escape));
+            let clicked_outside = ui.input(|input| input.pointer.any_pressed())
+                && ui
+                    .input(|input| input.pointer.interact_pos())
+                    .is_some_and(|position| !rect.contains(position));
+            if escaped || clicked_outside {
+                canvas.editing_text = None;
+                canvas.save_layout(data.workspace_store);
+            } else {
+                let container_id = canvas.container_id.clone();
+                let edit_rect = rect.shrink2(egui::vec2(TEXT_PADDING_H, TEXT_PADDING_V));
+                let desired_rows = (canvas.texts[index].text.lines().count() + 1).clamp(1, 8);
+                let text_edit = ui.put(
+                    edit_rect,
+                    egui::TextEdit::multiline(&mut canvas.texts[index].text)
+                        .id(egui::Id::new((
+                            "canvas-text-edit",
+                            container_id.as_str(),
+                            text_id.as_str(),
+                        )))
+                        .desired_width(edit_rect.width())
+                        .desired_rows(desired_rows)
+                        .font(egui::FontId::proportional(15.0))
+                        .frame(egui::Frame::NONE),
+                );
+                if !canvas.edit_focus_requested {
+                    text_edit.request_focus();
+                    canvas.edit_focus_requested = true;
+                }
+            }
+        } else {
+            let painter = ui.painter();
+            paint_text_galley(painter, rect, &layout.galley, ui.visuals());
+        }
+    }
+
+    if canvas.dragging_text.is_some() && !ui.input(|input| input.pointer.any_down()) {
+        let drag = canvas.dragging_text.take().expect("drag state disappeared");
+        if drag.2 {
+            canvas.texts[drag.0].position = drag.1;
+        }
+        canvas.save_layout(data.workspace_store);
+    }
+
+    pointer_over_text
 }
 
 fn item_label(
@@ -638,6 +821,7 @@ pub(super) fn default_position_for(
     items: &[CanvasItem],
     snippets: &BTreeMap<EntityId, Snippet>,
     workspace: &Workspace,
+    text_rects: &[egui::Rect],
 ) -> [f32; 2] {
     for index in 0..640 {
         let position = default_card_position(index);
@@ -652,7 +836,7 @@ pub(super) fn default_position_for(
                     item.size,
                 )
                 .intersects(candidate)
-        });
+        }) || text_rects.iter().any(|text_rect| text_rect.intersects(candidate));
         if !occupied {
             return position;
         }
@@ -786,4 +970,177 @@ fn paint_card(
         galley.clone(),
         visuals.text_color(),
     );
+}
+
+const TEXT_PADDING_H: f32 = 8.0;
+const TEXT_PADDING_V: f32 = 6.0;
+/// No line-width cap: the box widens to fit its content (only the scroll area
+/// bounds it).
+const TEXT_NO_WRAP: f32 = 10_000.0;
+/// Small floor so an empty or one-character annotation stays visible and
+/// clickable; the box otherwise shrinks to hug its content.
+const TEXT_MIN_WIDTH: f32 = 60.0;
+const TEXT_MIN_HEIGHT: f32 = 28.0;
+/// Fixed guess used only for placement avoidance, not a wrap limit.
+const TEXT_APPROX_WIDTH: f32 = 180.0;
+
+/// Precomputed layout for one canvas text: its canvas-local rect and the
+/// galley reused for painting.
+struct TextLayout {
+    rect: egui::Rect,
+    galley: std::sync::Arc<egui::Galley>,
+}
+
+/// Box size for a text galley: hugs the content (no wrap limit), with a small
+/// floor so an empty or one-character annotation stays visible and clickable.
+fn text_box_size(text: &str, galley: &std::sync::Arc<egui::Galley>) -> egui::Vec2 {
+    if text.is_empty() {
+        return egui::vec2(TEXT_MIN_WIDTH, TEXT_MIN_HEIGHT);
+    }
+    egui::vec2(
+        (galley.size().x + 2.0 * TEXT_PADDING_H).max(TEXT_MIN_WIDTH),
+        (galley.size().y + 2.0 * TEXT_PADDING_V).max(TEXT_MIN_HEIGHT),
+    )
+}
+
+fn layout_text(
+    painter: &egui::Painter,
+    text: &str,
+    max_width: f32,
+    color: egui::Color32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(15.0),
+            color,
+            ..Default::default()
+        },
+    );
+    job.wrap.max_width = max_width.max(10.0);
+    painter.layout_job(job)
+}
+
+/// Paints the teal rounded background shared by display and edit modes.
+fn paint_text_bg(painter: &egui::Painter, rect: egui::Rect, visuals: &egui::Visuals) {
+    let bg = if visuals.dark_mode {
+        egui::Color32::from_rgba_unmultiplied(0, 92, 92, 220)
+    } else {
+        egui::Color32::from_rgb(214, 244, 242)
+    };
+    painter.rect_filled(rect, 3.0, bg);
+}
+
+/// Paints the annotation text on top of the teal background.
+fn paint_text_galley(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    galley: &std::sync::Arc<egui::Galley>,
+    visuals: &egui::Visuals,
+) {
+    let text_color = if visuals.dark_mode {
+        egui::Color32::from_gray(230)
+    } else {
+        egui::Color32::from_gray(30)
+    };
+    painter.with_clip_rect(rect).galley(
+        rect.min + egui::vec2(TEXT_PADDING_H, TEXT_PADDING_V),
+        galley.clone(),
+        text_color,
+    );
+}
+
+pub(super) fn create_text(
+    canvas: &mut ContainerCanvas,
+    data: &mut CanvasData<'_>,
+    position: [f32; 2],
+) {
+    let id = TextId::new();
+    canvas.texts.push(CanvasText {
+        id: id.clone(),
+        position,
+        text: String::new(),
+        color: None,
+    });
+    // Start editing the new text immediately so the user can type right away.
+    canvas.editing_text = Some(id);
+    canvas.edit_focus_requested = false;
+    canvas.save_layout(data.workspace_store);
+}
+
+pub(super) fn delete_text(
+    canvas: &mut ContainerCanvas,
+    data: &mut CanvasData<'_>,
+    text_id: &TextId,
+) {
+    canvas.texts.retain(|text| &text.id != text_id);
+    if canvas.editing_text.as_ref() == Some(text_id) {
+        canvas.editing_text = None;
+    }
+    canvas.save_layout(data.workspace_store);
+}
+
+fn card_rect(item: &CanvasItem) -> egui::Rect {
+    egui::Rect::from_min_size(egui::pos2(item.position[0], item.position[1]), item.size)
+}
+
+/// Whether `rect` overlaps any card or any text, excluding the dragged element
+/// itself (`card_index` / `text_index`).
+fn overlaps(
+    canvas: &ContainerCanvas,
+    card_index: Option<usize>,
+    text_index: Option<usize>,
+    rect: egui::Rect,
+    snippets: &BTreeMap<EntityId, Snippet>,
+    workspace: &Workspace,
+    text_layouts: &[TextLayout],
+) -> bool {
+    let card_overlap = canvas.items.iter().enumerate().any(|(index, item)| {
+        Some(index) != card_index
+            && item_label(item, snippets, workspace).is_some()
+            && card_rect(item).intersects(rect)
+    });
+    let text_overlap = text_layouts
+        .iter()
+        .enumerate()
+        .any(|(index, layout)| Some(index) != text_index && layout.rect.intersects(rect));
+    card_overlap || text_overlap
+}
+
+/// Approximate text rects (fixed size, no text layout needed). Used to keep
+/// newly placed cards and fallback text positions clear of existing texts.
+pub(super) fn approx_text_rects(texts: &[CanvasText]) -> Vec<egui::Rect> {
+    texts
+        .iter()
+        .map(|text| {
+            egui::Rect::from_min_size(
+                egui::pos2(text.position[0], text.position[1]),
+                egui::vec2(TEXT_APPROX_WIDTH, TEXT_MIN_HEIGHT),
+            )
+        })
+        .collect()
+}
+
+fn default_text_position(canvas: &ContainerCanvas) -> [f32; 2] {
+    let text_rects = approx_text_rects(&canvas.texts);
+    for index in 0..640 {
+        let position = default_card_position(index);
+        let candidate = egui::Rect::from_min_size(
+            egui::pos2(position[0], position[1]),
+            egui::vec2(TEXT_APPROX_WIDTH, TEXT_MIN_HEIGHT),
+        );
+        let occupied = canvas.items.iter().any(|item| {
+            egui::Rect::from_min_size(
+                egui::pos2(item.position[0], item.position[1]),
+                item.size,
+            )
+            .intersects(candidate)
+        }) || text_rects.iter().any(|rect| rect.intersects(candidate));
+        if !occupied {
+            return position;
+        }
+    }
+    [24.0, 24.0]
 }

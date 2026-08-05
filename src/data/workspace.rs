@@ -6,7 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use super::{ContainerId, EntityId, ReferenceId, Snippet};
+use super::{ContainerId, EntityId, ReferenceId, Snippet, TextId};
 
 const WORKSPACE_VERSION: u32 = 1;
 const LAYOUT_VERSION: u32 = 1;
@@ -193,12 +193,27 @@ pub struct CardLayout {
     pub color: Option<[u8; 4]>,
 }
 
+/// A canvas-local text annotation. Texts are not part of the entity-reference
+/// graph: they cannot be referenced, linked, or moved across container
+/// boundaries. Persisted with the per-container `ContainerLayout`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CanvasText {
+    pub id: TextId,
+    pub position: [f32; 2],
+    #[serde(default)]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 4]>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ContainerLayout {
     pub version: u32,
     pub container: ContainerId,
     #[serde(default)]
     pub items: BTreeMap<ReferenceId, CardLayout>,
+    #[serde(default)]
+    pub texts: Vec<CanvasText>,
 }
 
 impl ContainerLayout {
@@ -207,6 +222,7 @@ impl ContainerLayout {
             version: LAYOUT_VERSION,
             container,
             items: BTreeMap::new(),
+            texts: Vec::new(),
         }
     }
 }
@@ -355,6 +371,48 @@ mod tests {
             store.load_layout(&container).unwrap().items[&reference].position,
             [41.0, 73.0]
         );
+    }
+
+    #[test]
+    fn persists_canvas_texts_in_container_layout() {
+        let folder = TestFolder::new();
+        let store = WorkspaceStore::open(&folder.0).unwrap();
+        let container = ContainerId::new();
+        let mut layout = ContainerLayout::empty(container.clone());
+        layout.texts.push(CanvasText {
+            id: TextId::new(),
+            position: [12.0, 34.0],
+            text: "plain text".to_owned(),
+            color: None,
+        });
+
+        store.save_layout(&layout).unwrap();
+
+        let loaded = store.load_layout(&container).unwrap();
+        assert_eq!(loaded.texts.len(), 1);
+        assert_eq!(loaded.texts[0].position, [12.0, 34.0]);
+        assert_eq!(loaded.texts[0].text, "plain text");
+    }
+
+    #[test]
+    fn loads_legacy_layout_without_texts() {
+        let folder = TestFolder::new();
+        let store = WorkspaceStore::open(&folder.0).unwrap();
+        let container = ContainerId::new();
+        let path = store.layout_path(&container);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{{\"version\":1,\"container\":\"{}\",\"items\":{{}}}}",
+                container.as_str()
+            ),
+        )
+        .unwrap();
+
+        let loaded = store.load_layout(&container).unwrap();
+
+        assert!(loaded.texts.is_empty());
     }
 
     #[test]
