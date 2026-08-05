@@ -124,6 +124,8 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             #[cfg(not(target_arch = "wasm32"))]
             cc.egui_ctx.set_embed_viewports(false);
+            // Default to light theme (egui otherwise follows the OS preference).
+            cc.egui_ctx.set_theme(egui::Theme::Light);
             install_system_fonts(&cc.egui_ctx);
             egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(HomePage::new(workspace)))
