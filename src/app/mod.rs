@@ -27,6 +27,8 @@ pub(crate) struct HomePage {
     next_view_id: u64,
     pending_delete: Option<EntityId>,
     rename_dialog: RenameDialogState,
+    clipboard: Option<ClipboardEntry>,
+    paste_feedback: Option<String>,
 }
 
 #[derive(Debug)]
@@ -58,6 +60,25 @@ struct RenameDialogState {
     pending: Option<RenameTarget>,
     buffer: String,
     focus_requested: bool,
+}
+
+/// Semantics chosen when a card's reference is picked up via its context menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipboardSemantics {
+    /// Create a new reference in the target container; the source stays.
+    Link,
+    /// Move the reference; it is removed from the source container.
+    Move,
+}
+
+/// A reference picked from a card context menu (`Link` / `Move`), ready to be
+/// pasted into any open canvas via its `Paste` context-menu entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClipboardEntry {
+    source_container: ContainerId,
+    reference_id: ReferenceId,
+    target: ReferenceTarget,
+    semantics: ClipboardSemantics,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -105,6 +126,11 @@ enum CanvasCommand {
     RenameFolder(ContainerId),
     /// Internal: apply the rename confirmed in a viewport's dialog.
     ApplyRename(RenameTarget),
+    /// Paste the clipboard reference into the given container.
+    PasteClipboard {
+        container: ContainerId,
+        entry: ClipboardEntry,
+    },
 }
 
 impl ContainerCanvas {
@@ -197,6 +223,8 @@ impl HomePage {
             next_view_id: 0,
             pending_delete: None,
             rename_dialog: RenameDialogState::default(),
+            clipboard: None,
+            paste_feedback: None,
         }
     }
 
@@ -239,6 +267,9 @@ impl HomePage {
     }
 
     fn open_view(&mut self, entity_id: EntityId) {
+        // Opening a snippet is a navigation action; drop any pending clipboard
+        // reference so a stale paste cannot leak into another window.
+        self.clipboard = None;
         let id = self.next_view_id;
         self.next_view_id += 1;
         let editable = self
@@ -311,6 +342,15 @@ impl HomePage {
                     )));
                     self.folder_views.remove(&target);
                 }
+                CanvasCommand::PasteClipboard { container, entry } => {
+                    if self.paste_clipboard(&container, &entry) {
+                        // The clipboard is single-use: clear it after a
+                        // successful paste (Link or Move).
+                        self.clipboard = None;
+                    } else {
+                        self.paste_feedback = Some("Paste rejected".to_owned());
+                    }
+                }
             }
         }
     }
@@ -323,6 +363,129 @@ impl HomePage {
             .is_some_and(|target| target.origin() == viewport_id)
         {
             self.rename_dialog.pending = None;
+        }
+    }
+fn canvas_for(&self, container: &ContainerId) -> Option<&ContainerCanvas> {
+    if container == &self.root.container_id {
+        Some(&self.root)
+    } else {
+        self.folder_views.get(container)
+    }
+}
+
+
+    /// Applies a clipboard paste into `container`. Returns `false` when the
+    /// operation is not allowed (self-reference, moving within the same
+    /// container, or a stale target); the menu disables `Paste` in those cases.
+    fn paste_clipboard(&mut self, container: &ContainerId, entry: &ClipboardEntry) -> bool {
+        if !canvas::clipboard_valid_for(entry, container, &self.all_snippets, &self.workspace) {
+            return false;
+        }
+        let new_reference_id = match &entry.target {
+            ReferenceTarget::Snippet(entity_id) => {
+                let Ok(id) = self.workspace.add_snippet_reference(container, entity_id.clone())
+                else {
+                    return false;
+                };
+                id
+            }
+            ReferenceTarget::Container(target_id) => {
+                let Ok(id) = self.workspace.add_container_reference(container, target_id.clone())
+                else {
+                    return false;
+                };
+                id
+            }
+        };
+        let position = self
+            .canvas_for(container)
+            .map(|canvas| {
+                canvas::default_position_for(&canvas.items, &self.all_snippets, &self.workspace)
+            });
+        let target_canvas = if container == &self.root.container_id {
+            Some(&mut self.root)
+        } else {
+            self.folder_views.get_mut(container)
+        };
+        if let Some(canvas) = target_canvas {
+            let position = position.unwrap_or_else(|| default_card_position(canvas.items.len()));
+            canvas.items.push(CanvasItem {
+                reference_id: new_reference_id.clone(),
+                target: entry.target.clone(),
+                position,
+                size: egui::vec2(CARD_WIDTH, 25.0),
+            });
+            canvas.layout.items.insert(
+                new_reference_id,
+                CardLayout {
+                    position,
+                    color: None,
+                },
+            );
+            canvas.save_layout(&self.workspace_store);
+        }
+        if matches!(entry.semantics, ClipboardSemantics::Move) {
+            let _ = self
+                .workspace
+                .remove_reference(&entry.source_container, &entry.reference_id);
+            let source_canvas = if entry.source_container == self.root.container_id {
+                Some(&mut self.root)
+            } else {
+                self.folder_views.get_mut(&entry.source_container)
+            };
+            if let Some(canvas) = source_canvas {
+                canvas.items.retain(|item| item.reference_id != entry.reference_id);
+                canvas.layout.items.remove(&entry.reference_id);
+                canvas.save_layout(&self.workspace_store);
+            }
+        }
+        let _ = self.workspace_store.save(&self.workspace);
+        true
+    }
+
+    /// Renders the cross-window clipboard status in the root viewport.
+    fn render_clipboard_status(&mut self, ui: &mut egui::Ui) {
+        let Some(entry) = self.clipboard.clone() else {
+            self.paste_feedback = None;
+            return;
+        };
+        let title = match &entry.target {
+            ReferenceTarget::Snippet(id) => self
+                .all_snippets
+                .get(id)
+                .map(|snippet| snippet.title.clone())
+                .unwrap_or_else(|| "?".to_owned()),
+            ReferenceTarget::Container(id) => self
+                .workspace
+                .containers
+                .get(id)
+                .map(|container| container.title.clone())
+                .unwrap_or_else(|| "?".to_owned()),
+        };
+        let verb = match entry.semantics {
+            ClipboardSemantics::Link => "Link",
+            ClipboardSemantics::Move => "Move",
+        };
+        let feedback = self.paste_feedback.take();
+        let mut text = format!("Clipboard: {title} ({verb})");
+        if let Some(feedback) = &feedback {
+            text.push_str(&format!("  |  {feedback}"));
+        }
+        let mut clear_clipboard = false;
+        egui::Window::new("clipboard-status")
+            .id(egui::Id::new("clipboard-status-window"))
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .show(ui.ctx(), |ui| {
+                ui.label(text);
+                if ui.button("Clear clipboard").clicked() {
+                    clear_clipboard = true;
+                }
+            });
+        if clear_clipboard {
+            self.clipboard = None;
         }
     }
 }
@@ -341,6 +504,7 @@ impl App for HomePage {
         self.process_canvas_commands(root_commands, root_viewport);
         self.render_delete_dialog(ui);
         self.render_rename_dialog(ui);
+        self.render_clipboard_status(ui);
 
         let mut closed_views = Vec::new();
         for view in &mut self.views {
@@ -374,6 +538,7 @@ impl App for HomePage {
                 &self.store,
                 &mut self.all_snippets,
                 &mut self.rename_dialog,
+                &mut self.clipboard,
             );
             commands_by_viewport.push((viewport_id, commands));
         }
@@ -454,5 +619,125 @@ mod tests {
         assert!(second_session.root.items.iter().any(|item| {
             matches!(item.target, ReferenceTarget::Container(_)) && item.position == [320.0, 144.0]
         }));
+    }
+
+    fn clip_root_first_entry(page: &HomePage, semantics: ClipboardSemantics) -> ClipboardEntry {
+        ClipboardEntry {
+            source_container: page.root.container_id.clone(),
+            reference_id: page.root.items[0].reference_id.clone(),
+            target: page.root.items[0].target.clone(),
+            semantics,
+        }
+    }
+
+    #[test]
+    fn pastes_link_reference_into_folder() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let _ = page.workspace.add_container_to_root(folder_id.clone());
+        page.open_folder(&folder_id);
+
+        let entry = clip_root_first_entry(&page, ClipboardSemantics::Link);
+        let root_count = page.root.items.len();
+        assert!(page.paste_clipboard(&folder_id, &entry));
+        assert_eq!(page.root.items.len(), root_count, "link keeps the source card");
+        let folder_canvas = page.folder_views.get(&folder_id).expect("folder view open");
+        assert_eq!(folder_canvas.items.len(), 1);
+        assert_eq!(folder_canvas.items[0].target, entry.target);
+        assert_eq!(page.workspace.containers[&folder_id].members.len(), 1);
+    }
+
+    #[test]
+    fn pastes_move_reference_into_folder() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let _ = page.workspace.add_container_to_root(folder_id.clone());
+        page.open_folder(&folder_id);
+
+        let entry = clip_root_first_entry(&page, ClipboardSemantics::Move);
+        let root_count = page.root.items.len();
+        assert!(page.paste_clipboard(&folder_id, &entry));
+        assert_eq!(page.root.items.len(), root_count - 1, "move removes the source card");
+        assert_eq!(page.workspace.containers[&folder_id].members.len(), 1);
+        // The entity itself is untouched; only the reference moved.
+        assert!(page.all_snippets.contains_key(match &entry.target {
+            ReferenceTarget::Snippet(id) => id,
+            ReferenceTarget::Container(_) => panic!("root cards are snippets"),
+        }));
+    }
+
+    #[test]
+    fn pasted_reference_survives_restart() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let _ = page.workspace.add_container_to_root(folder_id.clone());
+        let entry = clip_root_first_entry(&page, ClipboardSemantics::Link);
+        assert!(page.paste_clipboard(&folder_id, &entry));
+        drop(page);
+
+        let reloaded = HomePage::new(&folder.0);
+        assert_eq!(reloaded.workspace.containers[&folder_id].members.len(), 1);
+    }
+
+    #[test]
+    fn rejects_self_reference_paste() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let reference_id = page.workspace.add_container_to_root(folder_id.clone());
+        let entry = ClipboardEntry {
+            source_container: page.root.container_id.clone(),
+            reference_id,
+            target: ReferenceTarget::Container(folder_id.clone()),
+            semantics: ClipboardSemantics::Link,
+        };
+        assert!(!page.paste_clipboard(&folder_id, &entry));
+    }
+
+    #[test]
+    fn rejects_move_into_same_container() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let entry = clip_root_first_entry(&page, ClipboardSemantics::Move);
+        let root_count = page.root.items.len();
+        let root_id = page.root.container_id.clone();
+        assert!(!page.paste_clipboard(&root_id, &entry));
+        assert_eq!(page.root.items.len(), root_count);
+    }
+
+    #[test]
+    fn link_paste_command_clears_clipboard() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let _ = page.workspace.add_container_to_root(folder_id.clone());
+        page.open_folder(&folder_id);
+        let entry = clip_root_first_entry(&page, ClipboardSemantics::Link);
+        page.clipboard = Some(entry.clone());
+        page.process_canvas_commands(
+            vec![CanvasCommand::PasteClipboard {
+                container: folder_id,
+                entry,
+            }],
+            egui::ViewportId::ROOT,
+        );
+        assert!(page.clipboard.is_none());
+    }
+
+    #[test]
+    fn opening_snippet_clears_clipboard() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let entry = clip_root_first_entry(&page, ClipboardSemantics::Link);
+        page.clipboard = Some(entry);
+        let snippet_id = match &page.root.items[0].target {
+            ReferenceTarget::Snippet(id) => id.clone(),
+            ReferenceTarget::Container(_) => panic!("root cards are snippets"),
+        };
+        page.open_view(snippet_id);
+        assert!(page.clipboard.is_none());
     }
 }

@@ -5,6 +5,7 @@ struct CanvasData<'a> {
     workspace: &'a mut Workspace,
     workspace_store: &'a WorkspaceStore,
     snippet_store: &'a SnippetStore,
+    clipboard: &'a mut Option<ClipboardEntry>,
 }
 
 /// Outcome of rendering the rename dialog for a specific viewport.
@@ -21,25 +22,7 @@ enum RenameDialogResult {
 
 impl ContainerCanvas {
     fn default_position(&self, data: &CanvasData<'_>) -> [f32; 2] {
-        for index in 0..640 {
-            let position = default_card_position(index);
-            let candidate = egui::Rect::from_min_size(
-                egui::pos2(position[0], position[1]),
-                egui::vec2(CARD_WIDTH, 40.0),
-            );
-            let occupied = self.items.iter().any(|item| {
-                item_label(item, data.snippets, data.workspace).is_some()
-                    && egui::Rect::from_min_size(
-                        egui::pos2(item.position[0], item.position[1]),
-                        item.size,
-                    )
-                    .intersects(candidate)
-            });
-            if !occupied {
-                return position;
-            }
-        }
-        [24.0, 24.0]
+        default_position_for(&self.items, data.snippets, data.workspace)
     }
 
     fn intersects(
@@ -68,6 +51,7 @@ impl HomePage {
             workspace: &mut self.workspace,
             workspace_store: &self.workspace_store,
             snippet_store: &self.store,
+            clipboard: &mut self.clipboard,
         };
         Self::render_canvas_panel(ui, &mut self.root, true, &mut data)
     }
@@ -270,6 +254,7 @@ impl HomePage {
         snippet_store: &SnippetStore,
         snippets: &mut BTreeMap<EntityId, Snippet>,
         rename_dialog: &mut RenameDialogState,
+        clipboard: &mut Option<ClipboardEntry>,
     ) -> Vec<CanvasCommand> {
         let container_id = canvas.container_id.clone();
         ui.show_viewport_immediate(
@@ -283,6 +268,7 @@ impl HomePage {
                     workspace,
                     workspace_store,
                     snippet_store,
+                    clipboard,
                 };
                 let mut commands = Self::render_canvas_panel(child_ui, canvas, false, &mut data);
                 if child_ui.input(|input| input.viewport().close_requested()) {
@@ -398,29 +384,50 @@ impl HomePage {
             let target = canvas.items[index].target.clone();
             let reference_id = canvas.items[index].reference_id.clone();
 
-            response.context_menu(|ui| match &target {
-                ReferenceTarget::Snippet(entity_id) => {
-                    if ui.button("Rename…").clicked() {
-                        commands.push(CanvasCommand::RenameSnippet(entity_id.clone()));
-                        ui.close();
-                    }
-                    if is_root && ui.button("delete").clicked() {
-                        commands.push(CanvasCommand::DeleteSnippet(entity_id.clone()));
-                        ui.close();
-                    }
+            response.context_menu(|ui| {
+                if ui.button("Link").clicked() {
+                    *data.clipboard = Some(ClipboardEntry {
+                        source_container: canvas.container_id.clone(),
+                        reference_id: reference_id.clone(),
+                        target: target.clone(),
+                        semantics: ClipboardSemantics::Link,
+                    });
+                    ui.close();
                 }
-                ReferenceTarget::Container(container_id) => {
-                    if ui.button("Rename…").clicked() {
-                        commands.push(CanvasCommand::RenameFolder(container_id.clone()));
-                        ui.close();
+                if ui.button("Move").clicked() {
+                    *data.clipboard = Some(ClipboardEntry {
+                        source_container: canvas.container_id.clone(),
+                        reference_id: reference_id.clone(),
+                        target: target.clone(),
+                        semantics: ClipboardSemantics::Move,
+                    });
+                    ui.close();
+                }
+                ui.separator();
+                match &target {
+                    ReferenceTarget::Snippet(entity_id) => {
+                        if ui.button("Rename…").clicked() {
+                            commands.push(CanvasCommand::RenameSnippet(entity_id.clone()));
+                            ui.close();
+                        }
+                        if is_root && ui.button("delete").clicked() {
+                            commands.push(CanvasCommand::DeleteSnippet(entity_id.clone()));
+                            ui.close();
+                        }
                     }
-                    if ui.button("delete").clicked() {
-                        commands.push(CanvasCommand::RemoveFolder {
-                            owner: canvas.container_id.clone(),
-                            reference: reference_id.clone(),
-                            target: container_id.clone(),
-                        });
-                        ui.close();
+                    ReferenceTarget::Container(container_id) => {
+                        if ui.button("Rename…").clicked() {
+                            commands.push(CanvasCommand::RenameFolder(container_id.clone()));
+                            ui.close();
+                        }
+                        if ui.button("delete").clicked() {
+                            commands.push(CanvasCommand::RemoveFolder {
+                                owner: canvas.container_id.clone(),
+                                reference: reference_id.clone(),
+                                target: container_id.clone(),
+                            });
+                            ui.close();
+                        }
                     }
                 }
             });
@@ -480,6 +487,45 @@ impl HomePage {
 
         if !pointer_over_card {
             canvas_response.context_menu(|ui| {
+                if let Some(entry) = data.clipboard.as_ref() {
+                    let valid = clipboard_valid_for(
+                        entry,
+                        &canvas.container_id,
+                        data.snippets,
+                        data.workspace,
+                    );
+                    let label = match &entry.target {
+                        ReferenceTarget::Snippet(id) => data
+                            .snippets
+                            .get(id)
+                            .map(|snippet| snippet.title.as_str())
+                            .unwrap_or("?"),
+                        ReferenceTarget::Container(id) => data
+                            .workspace
+                            .containers
+                            .get(id)
+                            .map(|container| container.title.as_str())
+                            .unwrap_or("?"),
+                    };
+                    let verb = match entry.semantics {
+                        ClipboardSemantics::Link => "Paste (Link)",
+                        ClipboardSemantics::Move => "Paste (Move)",
+                    };
+                    let button = egui::Button::new(format!("{verb}: {label}"));
+                    let clicked = if valid {
+                        ui.add(button).clicked()
+                    } else {
+                        ui.add_enabled(false, button).clicked()
+                    };
+                    if clicked {
+                        commands.push(CanvasCommand::PasteClipboard {
+                            container: canvas.container_id.clone(),
+                            entry: entry.clone(),
+                        });
+                        ui.close();
+                    }
+                    ui.separator();
+                }
                 if ui.button("New Snippet").clicked() {
                     create_snippet(canvas, data);
                     ui.close();
@@ -586,6 +632,54 @@ fn create_folder(canvas: &mut ContainerCanvas, data: &mut CanvasData<'_>) {
         },
     );
     let _ = data.workspace_store.save_layout(&canvas.layout);
+}
+
+/// Finds the first free default grid slot for a new card, skipping positions
+/// already occupied by visible items. Shared between the canvas and the
+/// clipboard paste path.
+pub(super) fn default_position_for(
+    items: &[CanvasItem],
+    snippets: &BTreeMap<EntityId, Snippet>,
+    workspace: &Workspace,
+) -> [f32; 2] {
+    for index in 0..640 {
+        let position = default_card_position(index);
+        let candidate = egui::Rect::from_min_size(
+            egui::pos2(position[0], position[1]),
+            egui::vec2(CARD_WIDTH, 40.0),
+        );
+        let occupied = items.iter().any(|item| {
+            item_label(item, snippets, workspace).is_some()
+                && egui::Rect::from_min_size(
+                    egui::pos2(item.position[0], item.position[1]),
+                    item.size,
+                )
+                .intersects(candidate)
+        });
+        if !occupied {
+            return position;
+        }
+    }
+    [24.0, 24.0]
+}
+
+/// Whether pasting `entry` into `container` is currently allowed. The `Paste`
+/// menu button is disabled when this is `false`.
+pub(super) fn clipboard_valid_for(
+    entry: &ClipboardEntry,
+    container: &ContainerId,
+    snippets: &BTreeMap<EntityId, Snippet>,
+    workspace: &Workspace,
+) -> bool {
+    if matches!(entry.semantics, ClipboardSemantics::Move) && &entry.source_container == container {
+        return false;
+    }
+    match &entry.target {
+        ReferenceTarget::Snippet(entity_id) => snippets.contains_key(entity_id),
+        ReferenceTarget::Container(target_id) => {
+            workspace.containers.contains_key(target_id) && target_id != container
+        }
+    }
 }
 
 fn paint_grid(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
