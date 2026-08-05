@@ -131,10 +131,7 @@ impl HomePage {
 
     /// Renders the rename dialog only if it belongs to `ui`'s viewport, so it
     /// appears in the window that initiated the rename.
-    fn rename_dialog_ui(
-        ui: &mut egui::Ui,
-        state: &mut RenameDialogState,
-    ) -> RenameDialogResult {
+    fn rename_dialog_ui(ui: &mut egui::Ui, state: &mut RenameDialogState) -> RenameDialogResult {
         let Some(target) = state.pending.clone() else {
             return RenameDialogResult::None;
         };
@@ -167,9 +164,7 @@ impl HomePage {
                     response.request_focus();
                     state.focus_requested = true;
                 }
-                if response.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                {
+                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                     confirmed = true;
                 }
                 ui.horizontal(|ui| {

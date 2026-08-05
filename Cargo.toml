@@ -4,13 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.35.0"
-egui = "0.35.0"
+eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "wayland", "wgpu", "x11"] }
+egui = { version = "0.35.0", default-features = false }
 egui_extras = "0.35.0"
+epaint_default_fonts = "0.35.0"
 env_logger = "0.11.11"
 log = "0.4.33"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+system-fonts = "0.1.2"
 ulid = "1.2"
 
 [profile.optimized]
@@ -18,6 +20,7 @@ inherits = "release"
 lto = true
 incremental = false
 codegen-units = 1
+debug = false
 
 [profile.release]
 debug = "full"

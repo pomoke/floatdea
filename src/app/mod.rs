@@ -1,11 +1,11 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use eframe::{App, egui};
+use eframe::{egui, App};
 
 use floatdea::data::{
-    ContainerId, EntityId, ReferenceId, Snippet,
     storage::SnippetStore,
     workspace::{CardLayout, ContainerLayout, ReferenceTarget, Workspace, WorkspaceStore},
+    ContainerId, EntityId, ReferenceId, Snippet,
 };
 
 mod canvas;
@@ -40,8 +40,14 @@ struct View {
 
 #[derive(Debug, Clone, PartialEq)]
 enum RenameTarget {
-    Snippet { id: EntityId, origin: egui::ViewportId },
-    Folder { id: ContainerId, origin: egui::ViewportId },
+    Snippet {
+        id: EntityId,
+        origin: egui::ViewportId,
+    },
+    Folder {
+        id: ContainerId,
+        origin: egui::ViewportId,
+    },
 }
 
 impl RenameTarget {
@@ -417,25 +423,27 @@ impl HomePage {
         }
         let new_reference_id = match &entry.target {
             ReferenceTarget::Snippet(entity_id) => {
-                let Ok(id) = self.workspace.add_snippet_reference(container, entity_id.clone())
+                let Ok(id) = self
+                    .workspace
+                    .add_snippet_reference(container, entity_id.clone())
                 else {
                     return false;
                 };
                 id
             }
             ReferenceTarget::Container(target_id) => {
-                let Ok(id) = self.workspace.add_container_reference(container, target_id.clone())
+                let Ok(id) = self
+                    .workspace
+                    .add_container_reference(container, target_id.clone())
                 else {
                     return false;
                 };
                 id
             }
         };
-        let position = self
-            .canvas_for(container)
-            .map(|canvas| {
-                canvas::default_position_for(&canvas.items, &self.all_snippets, &self.workspace)
-            });
+        let position = self.canvas_for(container).map(|canvas| {
+            canvas::default_position_for(&canvas.items, &self.all_snippets, &self.workspace)
+        });
         let target_canvas = if container == &self.root.container_id {
             Some(&mut self.root)
         } else {
@@ -468,7 +476,9 @@ impl HomePage {
                 self.folder_views.get_mut(&entry.source_container)
             };
             if let Some(canvas) = source_canvas {
-                canvas.items.retain(|item| item.reference_id != entry.reference_id);
+                canvas
+                    .items
+                    .retain(|item| item.reference_id != entry.reference_id);
                 canvas.layout.items.remove(&entry.reference_id);
                 canvas.save_layout(&self.workspace_store);
             }
@@ -562,7 +572,8 @@ impl App for HomePage {
                 .get(container_id)
                 .map(|container| container.title.clone())
                 .unwrap_or_default();
-            let viewport_id = egui::ViewportId::from_hash_of(("folder-view", container_id.as_str()));
+            let viewport_id =
+                egui::ViewportId::from_hash_of(("folder-view", container_id.as_str()));
             let commands = Self::render_folder_viewport(
                 ui,
                 canvas,
@@ -675,7 +686,11 @@ mod tests {
         let entry = clip_root_first_entry(&page, ClipboardSemantics::Link);
         let root_count = page.root.items.len();
         assert!(page.paste_clipboard(&folder_id, &entry));
-        assert_eq!(page.root.items.len(), root_count, "link keeps the source card");
+        assert_eq!(
+            page.root.items.len(),
+            root_count,
+            "link keeps the source card"
+        );
         let folder_canvas = page.folder_views.get(&folder_id).expect("folder view open");
         assert_eq!(folder_canvas.items.len(), 1);
         assert_eq!(folder_canvas.items[0].target, entry.target);
@@ -693,7 +708,11 @@ mod tests {
         let entry = clip_root_first_entry(&page, ClipboardSemantics::Move);
         let root_count = page.root.items.len();
         assert!(page.paste_clipboard(&folder_id, &entry));
-        assert_eq!(page.root.items.len(), root_count - 1, "move removes the source card");
+        assert_eq!(
+            page.root.items.len(),
+            root_count - 1,
+            "move removes the source card"
+        );
         assert_eq!(page.workspace.containers[&folder_id].members.len(), 1);
         // The entity itself is untouched; only the reference moved.
         assert!(page.all_snippets.contains_key(match &entry.target {
@@ -806,7 +825,10 @@ mod tests {
             let row = index % rows_per_column;
             assert_eq!(
                 item.position,
-                [MARGIN + column as f32 * STEP_X, MARGIN + row as f32 * step_y]
+                [
+                    MARGIN + column as f32 * STEP_X,
+                    MARGIN + row as f32 * step_y
+                ]
             );
         }
         // The first column never exceeds the viewport height.
@@ -822,7 +844,10 @@ mod tests {
             let row = index % rows_per_column;
             assert_eq!(
                 item.position,
-                [MARGIN + column as f32 * STEP_X, MARGIN + row as f32 * step_y]
+                [
+                    MARGIN + column as f32 * STEP_X,
+                    MARGIN + row as f32 * step_y
+                ]
             );
         }
     }
