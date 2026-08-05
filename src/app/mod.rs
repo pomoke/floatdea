@@ -25,10 +25,9 @@ pub(crate) struct HomePage {
     folder_views: BTreeMap<ContainerId, ContainerCanvas>,
     views: Vec<View>,
     next_view_id: u64,
-    pending_delete: Option<EntityId>,
+    pending_delete: Option<PendingDelete>,
     rename_dialog: RenameDialogState,
     clipboard: Option<ClipboardEntry>,
-    paste_feedback: Option<String>,
 }
 
 #[derive(Debug)]
@@ -85,6 +84,19 @@ struct ClipboardEntry {
     reference_id: ReferenceId,
     target: ReferenceTarget,
     semantics: ClipboardSemantics,
+    /// The viewport where the reference was picked up; the clipboard status
+    /// indicator is shown in this window.
+    origin: egui::ViewportId,
+}
+
+/// A pending "delete last reference" confirmation. Deleting the final link to
+/// a snippet or folder permanently removes the underlying entity/container, so
+/// a confirmation dialog is shown first.
+#[derive(Clone, Debug)]
+struct PendingDelete {
+    owner: ContainerId,
+    reference: ReferenceId,
+    target: ReferenceTarget,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -120,12 +132,13 @@ struct ContainerCanvas {
 #[derive(Debug)]
 enum CanvasCommand {
     OpenSnippet(EntityId),
-    DeleteSnippet(EntityId),
     OpenFolder(ContainerId),
-    RemoveFolder {
+    /// Remove a reference from `owner`. If it is the last link to its target,
+    /// a confirmation dialog is shown before the entity/container is deleted.
+    DeleteReference {
         owner: ContainerId,
         reference: ReferenceId,
-        target: ContainerId,
+        target: ReferenceTarget,
     },
     CloseFolder(ContainerId),
     RenameSnippet(EntityId),
@@ -264,7 +277,6 @@ impl HomePage {
             pending_delete: None,
             rename_dialog: RenameDialogState::default(),
             clipboard: None,
-            paste_feedback: None,
         }
     }
 
@@ -327,8 +339,22 @@ impl HomePage {
         for command in commands {
             match command {
                 CanvasCommand::OpenSnippet(id) => self.open_view(id),
-                CanvasCommand::DeleteSnippet(id) => self.pending_delete = Some(id),
                 CanvasCommand::OpenFolder(id) => self.open_folder(&id),
+                CanvasCommand::DeleteReference {
+                    owner,
+                    reference,
+                    target,
+                } => {
+                    if reference_count(&self.workspace, &target) == 1 {
+                        self.pending_delete = Some(PendingDelete {
+                            owner,
+                            reference,
+                            target,
+                        });
+                    } else {
+                        self.remove_reference_only(&owner, &reference);
+                    }
+                }
                 CanvasCommand::CloseFolder(id) => {
                     self.clear_rename_for_viewport(egui::ViewportId::from_hash_of((
                         "folder-view",
@@ -363,32 +389,11 @@ impl HomePage {
                         self.rename_dialog.pending = None;
                     }
                 }
-                CanvasCommand::RemoveFolder {
-                    owner,
-                    reference,
-                    target,
-                } => {
-                    let _ = self.workspace.remove_reference(&owner, &reference);
-                    let _ = self.workspace_store.save(&self.workspace);
-                    if owner == self.root.container_id {
-                        self.root
-                            .remove_reference(&reference, &self.workspace_store);
-                    } else if let Some(canvas) = self.folder_views.get_mut(&owner) {
-                        canvas.remove_reference(&reference, &self.workspace_store);
-                    }
-                    self.clear_rename_for_viewport(egui::ViewportId::from_hash_of((
-                        "folder-view",
-                        target.as_str(),
-                    )));
-                    self.folder_views.remove(&target);
-                }
                 CanvasCommand::PasteClipboard { container, entry } => {
                     if self.paste_clipboard(&container, &entry) {
                         // The clipboard is single-use: clear it after a
                         // successful paste (Link or Move).
                         self.clipboard = None;
-                    } else {
-                        self.paste_feedback = Some("Paste rejected".to_owned());
                     }
                 }
             }
@@ -404,6 +409,59 @@ impl HomePage {
         {
             self.rename_dialog.pending = None;
         }
+    }
+
+    /// Removes a single reference from `owner` without touching the underlying
+    /// entity/container (used when the deleted link is not the last one).
+    fn remove_reference_only(&mut self, owner: &ContainerId, reference: &ReferenceId) {
+        let _ = self.workspace.remove_reference(owner, reference);
+        let _ = self.workspace_store.save(&self.workspace);
+        if owner == &self.root.container_id {
+            self.root.remove_reference(reference, &self.workspace_store);
+        } else if let Some(canvas) = self.folder_views.get_mut(owner) {
+            canvas.remove_reference(reference, &self.workspace_store);
+        }
+    }
+
+    /// Confirms a "delete last reference" action: removes the link and deletes
+    /// the underlying snippet file or folder container permanently.
+    fn confirm_delete(&mut self, pending: PendingDelete) {
+        match &pending.target {
+            ReferenceTarget::Snippet(entity_id) => {
+                let entity_id = entity_id.clone();
+                if let Some(snippet) = self.all_snippets.get(&entity_id) {
+                    let _ = self.store.remove(snippet);
+                }
+                self.workspace.remove_entity_references(&entity_id);
+                let _ = self.workspace_store.save(&self.workspace);
+                self.root.remove_entity(&entity_id, &self.workspace_store);
+                for canvas in self.folder_views.values_mut() {
+                    canvas.remove_entity(&entity_id, &self.workspace_store);
+                }
+                self.all_snippets.remove(&entity_id);
+                self.views.retain(|view| view.entity_id != entity_id);
+            }
+            ReferenceTarget::Container(container_id) => {
+                let container_id = container_id.clone();
+                let _ = self
+                    .workspace
+                    .remove_reference(&pending.owner, &pending.reference);
+                self.workspace.containers.remove(&container_id);
+                let _ = self.workspace_store.save(&self.workspace);
+                if pending.owner == self.root.container_id {
+                    self.root
+                        .remove_reference(&pending.reference, &self.workspace_store);
+                } else if let Some(canvas) = self.folder_views.get_mut(&pending.owner) {
+                    canvas.remove_reference(&pending.reference, &self.workspace_store);
+                }
+                self.clear_rename_for_viewport(egui::ViewportId::from_hash_of((
+                    "folder-view",
+                    container_id.as_str(),
+                )));
+                self.folder_views.remove(&container_id);
+            }
+        }
+        self.pending_delete = None;
     }
 
     fn canvas_for(&self, container: &ContainerId) -> Option<&ContainerCanvas> {
@@ -487,51 +545,17 @@ impl HomePage {
         true
     }
 
-    /// Renders the cross-window clipboard status in the root viewport.
-    fn render_clipboard_status(&mut self, ui: &mut egui::Ui) {
-        let Some(entry) = self.clipboard.clone() else {
-            self.paste_feedback = None;
-            return;
-        };
-        let title = match &entry.target {
-            ReferenceTarget::Snippet(id) => self
-                .all_snippets
-                .get(id)
-                .map(|snippet| snippet.title.clone())
-                .unwrap_or_else(|| "?".to_owned()),
-            ReferenceTarget::Container(id) => self
-                .workspace
-                .containers
-                .get(id)
-                .map(|container| container.title.clone())
-                .unwrap_or_else(|| "?".to_owned()),
-        };
-        let verb = match entry.semantics {
-            ClipboardSemantics::Link => "Link",
-            ClipboardSemantics::Move => "Move",
-        };
-        let feedback = self.paste_feedback.take();
-        let mut text = format!("Clipboard: {title} ({verb})");
-        if let Some(feedback) = &feedback {
-            text.push_str(&format!("  |  {feedback}"));
-        }
-        let mut clear_clipboard = false;
-        egui::Window::new("clipboard-status")
-            .id(egui::Id::new("clipboard-status-window"))
-            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
-            .collapsible(false)
-            .resizable(false)
-            .title_bar(false)
-            .show(ui.ctx(), |ui| {
-                ui.label(text);
-                if ui.button("Clear clipboard").clicked() {
-                    clear_clipboard = true;
-                }
-            });
-        if clear_clipboard {
-            self.clipboard = None;
-        }
-    }
+}
+
+/// Counts how many references across the whole workspace point at `target`.
+/// A count of `1` means the link is the last one to that snippet/folder.
+fn reference_count(workspace: &Workspace, target: &ReferenceTarget) -> usize {
+    workspace
+        .containers
+        .values()
+        .flat_map(|container| &container.members)
+        .filter(|reference| &reference.target == target)
+        .count()
 }
 
 fn default_card_position(index: usize) -> [f32; 2] {
@@ -548,7 +572,6 @@ impl App for HomePage {
         self.process_canvas_commands(root_commands, root_viewport);
         self.render_delete_dialog(ui);
         self.render_rename_dialog(ui);
-        self.render_clipboard_status(ui);
 
         let mut closed_views = Vec::new();
         for view in &mut self.views {
@@ -672,6 +695,7 @@ mod tests {
             reference_id: page.root.items[0].reference_id.clone(),
             target: page.root.items[0].target.clone(),
             semantics,
+            origin: egui::ViewportId::ROOT,
         }
     }
 
@@ -746,6 +770,7 @@ mod tests {
             reference_id,
             target: ReferenceTarget::Container(folder_id.clone()),
             semantics: ClipboardSemantics::Link,
+            origin: egui::ViewportId::ROOT,
         };
         assert!(!page.paste_clipboard(&folder_id, &entry));
     }
@@ -850,5 +875,105 @@ mod tests {
                 ]
             );
         }
+    }
+
+    fn root_first_snippet(page: &HomePage) -> (EntityId, ReferenceId) {
+        let entity_id = match &page.root.items[0].target {
+            ReferenceTarget::Snippet(id) => id.clone(),
+            ReferenceTarget::Container(_) => panic!("root cards are snippets"),
+        };
+        (entity_id, page.root.items[0].reference_id.clone())
+    }
+
+    #[test]
+    fn delete_reference_when_not_last_link_removes_only_the_link() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let _ = page.workspace.add_container_to_root(folder_id.clone());
+        page.open_folder(&folder_id);
+
+        // Give the folder a second link to the same snippet so it is not the last one.
+        let (entity_id, root_ref) = root_first_snippet(&page);
+        let folder_ref = page
+            .workspace
+            .add_snippet_reference(&folder_id, entity_id.clone())
+            .unwrap();
+        page.workspace_store.save(&page.workspace).unwrap();
+        page.folder_views
+            .get_mut(&folder_id)
+            .unwrap()
+            .items
+            .push(CanvasItem {
+                reference_id: folder_ref,
+                target: ReferenceTarget::Snippet(entity_id.clone()),
+                position: [24.0, 24.0],
+                size: egui::vec2(CARD_WIDTH, 25.0),
+            });
+
+        let root_count = page.root.items.len();
+        page.process_canvas_commands(
+            vec![CanvasCommand::DeleteReference {
+                owner: page.root.container_id.clone(),
+                reference: root_ref,
+                target: ReferenceTarget::Snippet(entity_id.clone()),
+            }],
+            egui::ViewportId::ROOT,
+        );
+
+        // Not the last link → no confirmation dialog, entity untouched.
+        assert!(page.pending_delete.is_none());
+        assert_eq!(page.root.items.len(), root_count - 1);
+        assert!(page.folder_views[&folder_id]
+            .items
+            .iter()
+            .any(|item| item.target == ReferenceTarget::Snippet(entity_id.clone())));
+        assert!(page.all_snippets.contains_key(&entity_id));
+    }
+
+    #[test]
+    fn delete_reference_when_last_link_asks_then_confirm_removes_entity() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let (entity_id, root_ref) = root_first_snippet(&page);
+        let root_count = page.root.items.len();
+
+        page.process_canvas_commands(
+            vec![CanvasCommand::DeleteReference {
+                owner: page.root.container_id.clone(),
+                reference: root_ref,
+                target: ReferenceTarget::Snippet(entity_id.clone()),
+            }],
+            egui::ViewportId::ROOT,
+        );
+
+        // Last link → confirmation dialog pending; nothing removed yet.
+        assert!(page.pending_delete.is_some());
+        assert_eq!(page.root.items.len(), root_count);
+        assert!(page.all_snippets.contains_key(&entity_id));
+
+        page.confirm_delete(page.pending_delete.clone().unwrap());
+        assert!(page.pending_delete.is_none());
+        assert!(!page.all_snippets.contains_key(&entity_id));
+        assert_eq!(page.root.items.len(), root_count - 1);
+    }
+
+    #[test]
+    fn confirm_delete_last_folder_link_removes_container_and_window() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let reference_id = page.workspace.add_container_to_root(folder_id.clone());
+        page.open_folder(&folder_id);
+        assert!(page.folder_views.contains_key(&folder_id));
+
+        page.confirm_delete(PendingDelete {
+            owner: page.root.container_id.clone(),
+            reference: reference_id,
+            target: ReferenceTarget::Container(folder_id.clone()),
+        });
+
+        assert!(!page.workspace.containers.contains_key(&folder_id));
+        assert!(!page.folder_views.contains_key(&folder_id));
     }
 }

@@ -53,37 +53,47 @@ impl HomePage {
             snippet_store: &self.store,
             clipboard: &mut self.clipboard,
         };
-        Self::render_canvas_panel(ui, &mut self.root, true, &mut data)
+        Self::render_canvas_panel(ui, &mut self.root, &mut data)
     }
 
     pub(super) fn render_delete_dialog(&mut self, ui: &mut egui::Ui) {
-        let Some(entity_id) = self.pending_delete.clone() else {
+        let Some(pending) = self.pending_delete.clone() else {
             return;
         };
-        let Some(title) = self
-            .all_snippets
-            .get(&entity_id)
-            .map(|snippet| snippet.title.clone())
-        else {
-            self.pending_delete = None;
-            return;
+        let (title, kind) = match &pending.target {
+            ReferenceTarget::Snippet(id) => match self.all_snippets.get(id) {
+                Some(snippet) => (snippet.title.clone(), "snippet"),
+                None => {
+                    self.pending_delete = None;
+                    return;
+                }
+            },
+            ReferenceTarget::Container(id) => match self.workspace.containers.get(id) {
+                Some(container) => (container.title.clone(), "folder"),
+                None => {
+                    self.pending_delete = None;
+                    return;
+                }
+            },
         };
         let mut confirmed = false;
         let mut cancelled = false;
 
         egui::Window::new(())
-            .id(egui::Id::new("delete-snippet-confirmation"))
+            .id(egui::Id::new("delete-confirmation"))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
             .show(ui.ctx(), |ui| {
-                ui.label(format!("Delete \"{title}\"?"));
+                ui.label(format!(
+                    "Remove \"{title}\"?\nThis is the last reference, so the {kind} will be removed permanently."
+                ));
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
                         cancelled = true;
                     }
                     let delete_button = egui::Button::new(
-                        egui::RichText::new("Delete").color(egui::Color32::WHITE),
+                        egui::RichText::new("Remove").color(egui::Color32::WHITE),
                     )
                     .fill(egui::Color32::from_rgb(179, 38, 30));
                     if ui.add(delete_button).clicked() {
@@ -93,18 +103,7 @@ impl HomePage {
             });
 
         if confirmed {
-            if let Some(snippet) = self.all_snippets.get(&entity_id) {
-                let _ = self.store.remove(snippet);
-            }
-            self.workspace.remove_entity_references(&entity_id);
-            let _ = self.workspace_store.save(&self.workspace);
-            self.root.remove_entity(&entity_id, &self.workspace_store);
-            for canvas in self.folder_views.values_mut() {
-                canvas.remove_entity(&entity_id, &self.workspace_store);
-            }
-            self.all_snippets.remove(&entity_id);
-            self.views.retain(|view| view.entity_id != entity_id);
-            self.pending_delete = None;
+            self.confirm_delete(pending);
         } else if cancelled {
             self.pending_delete = None;
         }
@@ -265,7 +264,7 @@ impl HomePage {
                     snippet_store,
                     clipboard,
                 };
-                let mut commands = Self::render_canvas_panel(child_ui, canvas, false, &mut data);
+                let mut commands = Self::render_canvas_panel(child_ui, canvas, &mut data);
                 if child_ui.input(|input| input.viewport().close_requested()) {
                     commands.push(CanvasCommand::CloseFolder(container_id.clone()));
                 }
@@ -288,7 +287,6 @@ impl HomePage {
     fn render_canvas_panel(
         ui: &mut egui::Ui,
         canvas: &mut ContainerCanvas,
-        is_root: bool,
         data: &mut CanvasData<'_>,
     ) -> Vec<CanvasCommand> {
         let mut commands = Vec::new();
@@ -302,16 +300,16 @@ impl HomePage {
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        Self::render_container_canvas(ui, canvas, is_root, data, &mut commands);
+                        Self::render_container_canvas(ui, canvas, data, &mut commands);
                     });
             });
+        render_clipboard_status(ui, data);
         commands
     }
 
     fn render_container_canvas(
         ui: &mut egui::Ui,
         canvas: &mut ContainerCanvas,
-        is_root: bool,
         data: &mut CanvasData<'_>,
         commands: &mut Vec<CanvasCommand>,
     ) {
@@ -380,12 +378,14 @@ impl HomePage {
             let reference_id = canvas.items[index].reference_id.clone();
 
             response.context_menu(|ui| {
+                let origin = ui.ctx().viewport_id();
                 if ui.button("Link").clicked() {
                     *data.clipboard = Some(ClipboardEntry {
                         source_container: canvas.container_id.clone(),
                         reference_id: reference_id.clone(),
                         target: target.clone(),
                         semantics: ClipboardSemantics::Link,
+                        origin,
                     });
                     ui.close();
                 }
@@ -395,35 +395,33 @@ impl HomePage {
                         reference_id: reference_id.clone(),
                         target: target.clone(),
                         semantics: ClipboardSemantics::Move,
+                        origin,
                     });
                     ui.close();
                 }
                 ui.separator();
                 match &target {
                     ReferenceTarget::Snippet(entity_id) => {
-                        if ui.button("Rename…").clicked() {
+                        if ui.button("Rename").clicked() {
                             commands.push(CanvasCommand::RenameSnippet(entity_id.clone()));
-                            ui.close();
-                        }
-                        if is_root && ui.button("delete").clicked() {
-                            commands.push(CanvasCommand::DeleteSnippet(entity_id.clone()));
                             ui.close();
                         }
                     }
                     ReferenceTarget::Container(container_id) => {
-                        if ui.button("Rename…").clicked() {
+                        if ui.button("Rename").clicked() {
                             commands.push(CanvasCommand::RenameFolder(container_id.clone()));
                             ui.close();
                         }
-                        if ui.button("delete").clicked() {
-                            commands.push(CanvasCommand::RemoveFolder {
-                                owner: canvas.container_id.clone(),
-                                reference: reference_id.clone(),
-                                target: container_id.clone(),
-                            });
-                            ui.close();
-                        }
                     }
+                }
+                let last_link = reference_count(data.workspace, &target) == 1;
+                if ui.button(if last_link { "Delete" } else { "Unlink" }).clicked() {
+                    commands.push(CanvasCommand::DeleteReference {
+                        owner: canvas.container_id.clone(),
+                        reference: reference_id.clone(),
+                        target: target.clone(),
+                    });
+                    ui.close();
                 }
             });
 
@@ -678,6 +676,51 @@ pub(super) fn clipboard_valid_for(
         ReferenceTarget::Container(target_id) => {
             workspace.containers.contains_key(target_id) && target_id != container
         }
+    }
+}
+
+/// Renders the clipboard status indicator in the viewport that originated the
+/// current clipboard entry (the window where `Link`/`Move` was chosen).
+fn render_clipboard_status(ui: &mut egui::Ui, data: &mut CanvasData<'_>) {
+    let Some(entry) = data.clipboard.clone() else {
+        return;
+    };
+    if entry.origin != ui.ctx().viewport_id() {
+        return;
+    }
+    let title = match &entry.target {
+        ReferenceTarget::Snippet(id) => data
+            .snippets
+            .get(id)
+            .map(|snippet| snippet.title.clone())
+            .unwrap_or_else(|| "?".to_owned()),
+        ReferenceTarget::Container(id) => data
+            .workspace
+            .containers
+            .get(id)
+            .map(|container| container.title.clone())
+            .unwrap_or_else(|| "?".to_owned()),
+    };
+    let verb = match entry.semantics {
+        ClipboardSemantics::Link => "Link",
+        ClipboardSemantics::Move => "Move",
+    };
+    let text = format!("Clipboard: {title} ({verb}) — right-click a canvas → Paste");
+    let mut clear_clipboard = false;
+    egui::Window::new("clipboard-status")
+        .id(egui::Id::new("clipboard-status-window"))
+        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
+        .collapsible(false)
+        .resizable(false)
+        .title_bar(false)
+        .show(ui.ctx(), |ui| {
+            ui.label(text);
+            if ui.button("Clear clipboard").clicked() {
+                clear_clipboard = true;
+            }
+        });
+    if clear_clipboard {
+        *data.clipboard = None;
     }
 }
 
