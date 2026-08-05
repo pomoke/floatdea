@@ -534,6 +534,10 @@ impl HomePage {
                     create_folder(canvas, data);
                     ui.close();
                 }
+                if ui.button("Organize").clicked() {
+                    canvas.organize(data.workspace_store, available.y);
+                    ui.close();
+                }
             });
         }
     }

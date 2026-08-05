@@ -147,6 +147,40 @@ impl ContainerCanvas {
         let _ = store.save_layout(&self.layout);
     }
 
+    /// Repositions every card into an organized column-major grid: cards fill
+    /// the first column top-to-bottom, then wrap to the next column. The number
+    /// of rows per column is chosen so a column fits within `viewport_height`
+    /// (the visible canvas height); when there are more cards than that, the
+    /// layout overflows horizontally into the scroll area.
+    fn organize(&mut self, store: &WorkspaceStore, viewport_height: f32) {
+        const MARGIN: f32 = 24.0;
+        const STEP_X: f32 = CARD_WIDTH + 24.0;
+        const GAP_Y: f32 = 12.0;
+        const MIN_CARD_HEIGHT: f32 = 25.0;
+
+        let max_height = self
+            .items
+            .iter()
+            .map(|item| item.size.y)
+            .fold(MIN_CARD_HEIGHT, f32::max)
+            .max(MIN_CARD_HEIGHT);
+        let step_y = max_height + GAP_Y;
+        let rows_per_column = if viewport_height <= MARGIN {
+            1
+        } else {
+            (((viewport_height - MARGIN) / step_y).floor() as usize).max(1)
+        };
+        for (index, item) in self.items.iter_mut().enumerate() {
+            let column = index / rows_per_column;
+            let row = index % rows_per_column;
+            item.position = [
+                MARGIN + column as f32 * STEP_X,
+                MARGIN + row as f32 * step_y,
+            ];
+        }
+        self.save_layout(store);
+    }
+
     fn remove_reference(&mut self, reference_id: &ReferenceId, store: &WorkspaceStore) {
         self.items.retain(|item| &item.reference_id != reference_id);
         self.layout.items.remove(reference_id);
@@ -365,14 +399,14 @@ impl HomePage {
             self.rename_dialog.pending = None;
         }
     }
-fn canvas_for(&self, container: &ContainerId) -> Option<&ContainerCanvas> {
-    if container == &self.root.container_id {
-        Some(&self.root)
-    } else {
-        self.folder_views.get(container)
-    }
-}
 
+    fn canvas_for(&self, container: &ContainerId) -> Option<&ContainerCanvas> {
+        if container == &self.root.container_id {
+            Some(&self.root)
+        } else {
+            self.folder_views.get(container)
+        }
+    }
 
     /// Applies a clipboard paste into `container`. Returns `false` when the
     /// operation is not allowed (self-reference, moving within the same
@@ -739,5 +773,57 @@ mod tests {
         };
         page.open_view(snippet_id);
         assert!(page.clipboard.is_none());
+    }
+
+    #[test]
+    fn organize_arranges_cards_column_major_within_viewport() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        // Scatter the cards off-grid.
+        for (index, item) in page.root.items.iter_mut().enumerate() {
+            item.position = [1000.0 + index as f32, 1000.0];
+        }
+        let viewport_height = 480.0;
+        page.root.organize(&page.workspace_store, viewport_height);
+
+        // Mirror the layout math used by `organize` to derive the expected grid.
+        const MARGIN: f32 = 24.0;
+        const STEP_X: f32 = CARD_WIDTH + 24.0;
+        const GAP_Y: f32 = 12.0;
+        const MIN_CARD_HEIGHT: f32 = 25.0;
+        let max_height = page
+            .root
+            .items
+            .iter()
+            .map(|item| item.size.y)
+            .fold(MIN_CARD_HEIGHT, f32::max)
+            .max(MIN_CARD_HEIGHT);
+        let step_y = max_height + GAP_Y;
+        let rows_per_column = (((viewport_height - MARGIN) / step_y).floor() as usize).max(1);
+
+        for (index, item) in page.root.items.iter().enumerate() {
+            let column = index / rows_per_column;
+            let row = index % rows_per_column;
+            assert_eq!(
+                item.position,
+                [MARGIN + column as f32 * STEP_X, MARGIN + row as f32 * step_y]
+            );
+        }
+        // The first column never exceeds the viewport height.
+        let first_column_bottom = MARGIN
+            + (page.root.items.len().min(rows_per_column).saturating_sub(1)) as f32 * step_y
+            + max_height;
+        assert!(first_column_bottom <= viewport_height);
+
+        // The grid layout is persisted across sessions.
+        let reloaded = HomePage::new(&folder.0);
+        for (index, item) in reloaded.root.items.iter().enumerate() {
+            let column = index / rows_per_column;
+            let row = index % rows_per_column;
+            assert_eq!(
+                item.position,
+                [MARGIN + column as f32 * STEP_X, MARGIN + row as f32 * step_y]
+            );
+        }
     }
 }
