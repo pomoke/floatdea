@@ -38,6 +38,19 @@ enum RenameDialogResult {
     Cancelled,
 }
 
+/// Outcome of rendering the delete confirmation dialog for a specific
+/// viewport.
+enum DeleteDialogResult {
+    /// No dialog is pending, or it belongs to another viewport.
+    None,
+    /// The dialog is open and awaiting input.
+    Open,
+    /// The user confirmed the deletion.
+    Confirmed(PendingDelete),
+    /// The user cancelled.
+    Cancelled,
+}
+
 impl ContainerCanvas {
     fn default_position(&self, data: &CanvasData<'_>) -> [f32; 2] {
         default_position_for(
@@ -63,22 +76,45 @@ impl HomePage {
     }
 
     pub(super) fn render_delete_dialog(&mut self, ui: &mut egui::Ui) {
-        let Some(pending) = self.pending_delete.clone() else {
-            return;
+        match Self::delete_dialog_ui(
+            ui,
+            &mut self.pending_delete,
+            &self.all_snippets,
+            &self.workspace,
+        ) {
+            DeleteDialogResult::Confirmed(pending) => self.confirm_delete(pending),
+            DeleteDialogResult::Cancelled => self.pending_delete = None,
+            DeleteDialogResult::None | DeleteDialogResult::Open => {}
+        }
+    }
+
+    /// Renders the delete confirmation dialog only if it belongs to `ui`'s
+    /// viewport, so it appears in the window that initiated the delete.
+    fn delete_dialog_ui(
+        ui: &mut egui::Ui,
+        pending: &mut Option<PendingDelete>,
+        snippets: &BTreeMap<EntityId, Snippet>,
+        workspace: &Workspace,
+    ) -> DeleteDialogResult {
+        let Some(target) = pending.clone() else {
+            return DeleteDialogResult::None;
         };
-        let (title, kind) = match &pending.target {
-            ReferenceTarget::Snippet(id) => match self.all_snippets.get(id) {
+        if ui.ctx().viewport_id() != target.origin {
+            return DeleteDialogResult::None;
+        }
+        let (title, kind) = match &target.target {
+            ReferenceTarget::Snippet(id) => match snippets.get(id) {
                 Some(snippet) => (snippet.title.clone(), "snippet"),
                 None => {
-                    self.pending_delete = None;
-                    return;
+                    *pending = None;
+                    return DeleteDialogResult::None;
                 }
             },
-            ReferenceTarget::Container(id) => match self.workspace.containers.get(id) {
+            ReferenceTarget::Container(id) => match workspace.containers.get(id) {
                 Some(container) => (container.title.clone(), "folder"),
                 None => {
-                    self.pending_delete = None;
-                    return;
+                    *pending = None;
+                    return DeleteDialogResult::None;
                 }
             },
         };
@@ -86,7 +122,7 @@ impl HomePage {
         let mut cancelled = false;
 
         egui::Window::new(())
-            .id(egui::Id::new("delete-confirmation"))
+            .id(egui::Id::new(("delete-confirmation", target.origin)))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
@@ -109,9 +145,11 @@ impl HomePage {
             });
 
         if confirmed {
-            self.confirm_delete(pending);
+            DeleteDialogResult::Confirmed(target)
         } else if cancelled {
-            self.pending_delete = None;
+            DeleteDialogResult::Cancelled
+        } else {
+            DeleteDialogResult::Open
         }
     }
 
@@ -254,6 +292,7 @@ impl HomePage {
         snippet_store: &SnippetStore,
         snippets: &mut BTreeMap<EntityId, Snippet>,
         rename_dialog: &mut RenameDialogState,
+        pending_delete: &mut Option<PendingDelete>,
         clipboard: &mut Option<ClipboardEntry>,
     ) -> Vec<CanvasCommand> {
         let container_id = canvas.container_id.clone();
@@ -279,6 +318,17 @@ impl HomePage {
                         rename_dialog.pending = None;
                     }
                     RenameDialogResult::None | RenameDialogResult::Open => {}
+                }
+                // Render the delete confirmation inside this viewport so that
+                // it appears in the folder window that initiated the delete.
+                match Self::delete_dialog_ui(child_ui, pending_delete, snippets, workspace) {
+                    DeleteDialogResult::Confirmed(target) => {
+                        commands.push(CanvasCommand::ConfirmDelete(target));
+                    }
+                    DeleteDialogResult::Cancelled => {
+                        *pending_delete = None;
+                    }
+                    DeleteDialogResult::None | DeleteDialogResult::Open => {}
                 }
                 commands
             },

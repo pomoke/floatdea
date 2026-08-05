@@ -92,11 +92,14 @@ struct ClipboardEntry {
 /// A pending "delete last reference" confirmation. Deleting the final link to
 /// a snippet or folder permanently removes the underlying entity/container, so
 /// a confirmation dialog is shown first.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct PendingDelete {
     owner: ContainerId,
     reference: ReferenceId,
     target: ReferenceTarget,
+    /// The viewport that initiated the delete; the confirmation dialog is
+    /// shown in this window.
+    origin: egui::ViewportId,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -156,6 +159,8 @@ enum CanvasCommand {
     RenameFolder(ContainerId),
     /// Internal: apply the rename confirmed in a viewport's dialog.
     ApplyRename(RenameTarget),
+    /// Internal: apply the delete confirmed in a viewport's dialog.
+    ConfirmDelete(PendingDelete),
     /// Paste the clipboard reference into the given container.
     PasteClipboard {
         container: ContainerId,
@@ -366,16 +371,23 @@ impl HomePage {
                             owner,
                             reference,
                             target,
+                            origin,
                         });
                     } else {
                         self.remove_reference_only(&owner, &reference);
                     }
                 }
                 CanvasCommand::CloseFolder(id) => {
-                    self.clear_rename_for_viewport(egui::ViewportId::from_hash_of((
-                        "folder-view",
-                        id.as_str(),
-                    )));
+                    let viewport =
+                        egui::ViewportId::from_hash_of(("folder-view", id.as_str()));
+                    self.clear_rename_for_viewport(viewport);
+                    if self
+                        .pending_delete
+                        .as_ref()
+                        .is_some_and(|pending| pending.origin == viewport)
+                    {
+                        self.pending_delete = None;
+                    }
                     self.folder_views.remove(&id);
                 }
                 CanvasCommand::RenameSnippet(id) => {
@@ -403,6 +415,11 @@ impl HomePage {
                     };
                     if ok {
                         self.rename_dialog.pending = None;
+                    }
+                }
+                CanvasCommand::ConfirmDelete(pending) => {
+                    if self.pending_delete.as_ref() == Some(&pending) {
+                        self.confirm_delete(pending);
                     }
                 }
                 CanvasCommand::PasteClipboard { container, entry } => {
@@ -627,6 +644,7 @@ impl App for HomePage {
                 &self.store,
                 &mut self.all_snippets,
                 &mut self.rename_dialog,
+                &mut self.pending_delete,
                 &mut self.clipboard,
             );
             commands_by_viewport.push((viewport_id, commands));
@@ -992,6 +1010,7 @@ mod tests {
             owner: page.root.container_id.clone(),
             reference: reference_id,
             target: ReferenceTarget::Container(folder_id.clone()),
+            origin: egui::ViewportId::ROOT,
         });
 
         assert!(!page.workspace.containers.contains_key(&folder_id));
