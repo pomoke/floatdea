@@ -230,12 +230,8 @@ impl HomePage {
     }
 
     pub(super) fn rename_snippet(&mut self, id: &EntityId, new_title: String) -> bool {
-        if new_title.is_empty()
-            || self
-                .all_snippets
-                .values()
-                .any(|snippet| snippet.id != *id && snippet.title == new_title)
-        {
+        // Identity is the ulid, so duplicate titles are allowed.
+        if new_title.is_empty() {
             return false;
         }
         let Some(snippet) = self.all_snippets.get(id) else {
@@ -252,13 +248,8 @@ impl HomePage {
     }
 
     pub(super) fn rename_folder(&mut self, id: &ContainerId, new_title: String) -> bool {
-        if new_title.is_empty()
-            || self
-                .workspace
-                .containers
-                .values()
-                .any(|container| container.id != *id && container.title == new_title)
-        {
+        // Identity is the ulid, so duplicate titles are allowed.
+        if new_title.is_empty() {
             return false;
         }
         let Some(container) = self.workspace.containers.get_mut(id) else {
@@ -415,11 +406,16 @@ impl HomePage {
         let pointer_pos = ui.input(|input| input.pointer.interact_pos());
         let mut pointer_over_card = false;
         let mut dragged = None;
-        // Capture the right-click position before the context menu opens: once
-        // the menu is shown, the pointer moves onto the menu items.
-        let mut menu_anchor = None;
+        // Remember the right-click position on the canvas so new snippets,
+        // folders, and texts can be created there. The field persists across
+        // frames while the context menu stays open.
         if canvas_response.secondary_clicked() {
-            menu_anchor = pointer_pos;
+            canvas.menu_anchor = pointer_pos.map(|pos| {
+                [
+                    (pos.x - canvas_rect.min.x).max(0.0),
+                    (pos.y - canvas_rect.min.y).max(0.0),
+                ]
+            });
         }
 
         for index in 0..canvas.items.len() {
@@ -614,23 +610,22 @@ impl HomePage {
                     ui.separator();
                 }
                 if ui.button("New Snippet").clicked() {
-                    create_snippet(canvas, data);
+                    let anchor = canvas.menu_anchor;
+                    create_snippet(canvas, data, anchor);
                     ui.close();
                 }
                 if ui.button("New Folder").clicked() {
-                    create_folder(canvas, data);
+                    let anchor = canvas.menu_anchor;
+                    create_folder(canvas, data, anchor);
                     ui.close();
                 }
                 if ui.button("New Text").clicked() {
-                    let position = menu_anchor
-                        .map(|pos| {
-                            [
-                                (pos.x - canvas_rect.min.x).max(0.0),
-                                (pos.y - canvas_rect.min.y).max(0.0),
-                            ]
-                        })
-                        .unwrap_or_else(|| default_text_position(canvas));
-                    create_text(canvas, data, position);
+                    let anchor = canvas.menu_anchor;
+                    create_text(
+                        canvas,
+                        data,
+                        anchor.unwrap_or_else(|| default_text_position(canvas)),
+                    );
                     ui.close();
                 }
                 if ui.button("Organize").clicked() {
@@ -781,27 +776,14 @@ fn item_label(
     (!title.is_empty()).then(|| (title.clone(), is_folder))
 }
 
-fn unique_title(base: &str, mut exists: impl FnMut(&str) -> bool) -> String {
-    for number in 1_u64.. {
-        let candidate = if number == 1 {
-            base.to_owned()
-        } else {
-            format!("{base} {number}")
-        };
-        if !exists(&candidate) {
-            return candidate;
-        }
-    }
-    unreachable!("the title counter cannot be exhausted")
-}
-
-fn create_snippet(canvas: &mut ContainerCanvas, data: &mut CanvasData<'_>) {
-    let title = unique_title("Untitled", |candidate| {
-        data.snippets
-            .values()
-            .any(|snippet| snippet.title == candidate)
-    });
-    let position = canvas.default_position(data);
+fn create_snippet(
+    canvas: &mut ContainerCanvas,
+    data: &mut CanvasData<'_>,
+    position: Option<[f32; 2]>,
+) {
+    // Duplicate titles are fine; identity is the ulid.
+    let title = "Untitled".to_owned();
+    let position = position.unwrap_or_else(|| canvas.default_position(data));
     let snippet = Snippet {
         id: EntityId::new(),
         title,
@@ -832,14 +814,14 @@ fn create_snippet(canvas: &mut ContainerCanvas, data: &mut CanvasData<'_>) {
     data.snippets.insert(snippet.id.clone(), snippet);
 }
 
-fn create_folder(canvas: &mut ContainerCanvas, data: &mut CanvasData<'_>) {
-    let title = unique_title("New Folder", |candidate| {
-        data.workspace
-            .containers
-            .values()
-            .any(|container| container.title == candidate)
-    });
-    let position = canvas.default_position(data);
+fn create_folder(
+    canvas: &mut ContainerCanvas,
+    data: &mut CanvasData<'_>,
+    position: Option<[f32; 2]>,
+) {
+    // Duplicate titles are fine; identity is the ulid.
+    let title = "New Folder".to_owned();
+    let position = position.unwrap_or_else(|| canvas.default_position(data));
     let container_id = data.workspace.create_container(title);
     let Ok(reference_id) = data
         .workspace

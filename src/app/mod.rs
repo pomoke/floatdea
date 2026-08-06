@@ -141,6 +141,10 @@ struct ContainerCanvas {
     /// Transient: focus is requested only on the first frame of editing, so
     /// that IME input is not broken by repeated focus requests.
     edit_focus_requested: bool,
+    /// Transient: canvas-local position of the right-click that opened the
+    /// empty-canvas context menu; new items are created here. Stored so the
+    /// position survives while the menu stays open across frames.
+    menu_anchor: Option<[f32; 2]>,
 }
 
 #[derive(Debug)]
@@ -336,6 +340,7 @@ impl HomePage {
             dragging_text: None,
             editing_text: None,
             edit_focus_requested: false,
+            menu_anchor: None,
         }
     }
 
