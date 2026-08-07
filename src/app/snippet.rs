@@ -42,7 +42,7 @@ impl HomePage {
         snippet: &mut Snippet,
         store: &SnippetStore,
         pane_rect: egui::Rect,
-        snippet_index: &[(EntityId, String)],
+        snippet_index: &[(EntityId, String, String)],
         clipboard: &Option<ClipboardEntry>,
     ) {
         // Global per-view id: independent of the parent `Ui` (columns created
@@ -127,13 +127,14 @@ impl HomePage {
                     cursor,
                     filter: String::new(),
                     focus_requested: false,
+                    embed: false,
                 });
                 ui.close();
             }
             // Paste a clipboard reference (Link/Move from a card's menu).
             if let Some(entry) = clipboard.as_ref()
                 && let ReferenceTarget::Snippet(target_id) = &entry.target
-                && let Some((_, title)) = snippet_index.iter().find(|(id, _)| id == target_id)
+                && let Some((_, title, _)) = snippet_index.iter().find(|(id, _, _)| id == target_id)
             {
                 let button = format!("Paste Link: {title}");
                 if ui.button(button).clicked() {
@@ -161,17 +162,17 @@ impl HomePage {
         }
     }
 
-    /// Renders the CommonMark preview. Local `.md` links are hooked so a click
-    /// returns the target [`EntityId`] to open; links that point at a
-    /// non-existent snippet are flagged with a warning banner. A right-click
-    /// anywhere in the visible pane (content or the empty area below it) opens
-    /// the view-mode menu ([`View::mode_menu`]).
+    /// Renders the CommonMark preview. `![alt]({id}.md)` embeds render the
+    /// target's whole document inline (non-recursively); local `.md` links are
+    /// hooked so a click opens the target, with a transient error for broken
+    /// ones. A right-click anywhere in the visible pane (content or the empty
+    /// area below it) opens the view-mode menu ([`View::mode_menu`]).
     fn render_markdown_preview(
         ui: &mut egui::Ui,
         view: &mut View,
         snippet: &mut Snippet,
         pane_rect: egui::Rect,
-        snippet_index: &[(EntityId, String)],
+        snippet_index: &[(EntityId, String, String)],
     ) -> Option<EntityId> {
         // Only internal references (no URL scheme) are hooked so a click can be
         // intercepted; scheme'd URLs remain normal hyperlinks.
@@ -186,14 +187,24 @@ impl HomePage {
         }
 
         let mut open_snippet = None;
+        let segments = split_embeds(&snippet.content);
         ui.scope(|ui| {
             // Slightly larger body text for readability; headings derive from it.
             ui.style_mut().text_styles.insert(
                 egui::TextStyle::Body,
                 egui::FontId::proportional(16.0),
             );
-            let output = egui_commonmark::CommonMarkViewer::new()
-                .show(ui, &mut view.markdown_cache, &snippet.content);
+            for segment in &segments {
+                match segment {
+                    PreviewSegment::Text(text) => {
+                        let _ = egui_commonmark::CommonMarkViewer::new()
+                            .show(ui, &mut view.markdown_cache, text);
+                    }
+                    PreviewSegment::Embed { dest, .. } => {
+                        Self::render_embed_card(ui, view, dest, snippet_index);
+                    }
+                }
+            }
             // A clicked internal link resolves to an existing snippet id;
             // missing or malformed targets raise a transient error instead.
             if let Some(url) = internal_links
@@ -206,7 +217,6 @@ impl HomePage {
                     open_snippet = Some(id);
                 }
             }
-            let _ = output;
         });
 
         // Right-click anywhere in the visible preview pane (content or the
@@ -222,6 +232,40 @@ impl HomePage {
         }
 
         open_snippet
+    }
+
+    /// Renders one inline embed as a framed card: the target's **whole
+    /// document**, rendered once and non-recursively (nested `![` degrades to
+    /// plain links). No header is shown.
+    fn render_embed_card(
+        ui: &mut egui::Ui,
+        view: &mut View,
+        dest: &str,
+        snippet_index: &[(EntityId, String, String)],
+    ) {
+        let Some(id) = parse_snippet_link(dest) else {
+            ui.colored_label(ui.visuals().warn_fg_color, format!("invalid embed: {dest}"));
+            return;
+        };
+        let Some((_, _, content)) =
+            snippet_index.iter().find(|(existing, _, _)| existing == &id)
+        else {
+            ui.colored_label(ui.visuals().warn_fg_color, format!("missing page: {dest}"));
+            return;
+        };
+        egui::Frame::new()
+            .inner_margin(egui::Margin::same(8))
+            .stroke(egui::Stroke::new(
+                1.0,
+                ui.visuals().widgets.noninteractive.bg_stroke.color,
+            ))
+            .corner_radius(egui::CornerRadius::same(4))
+            .show(ui, |ui| {
+                // Non-recursive: embed markers inside the target become links.
+                let _ = egui_commonmark::CommonMarkViewer::new()
+                    .show(ui, &mut view.markdown_cache, &neutralize_embeds(content));
+            });
+        ui.add_space(8.0);
     }
 
     /// Renders the right-click view-mode menu as a manual `egui::Area` popup
@@ -262,7 +306,7 @@ impl HomePage {
         view: &mut View,
         snippet: &mut Snippet,
         store: &SnippetStore,
-        snippet_index: &[(EntityId, String)],
+        snippet_index: &[(EntityId, String, String)],
     ) {
         let Some(mut picker) = view.link_picker.take() else {
             return;
@@ -286,6 +330,7 @@ impl HomePage {
                     filter.request_focus();
                     picker.focus_requested = true;
                 }
+                ui.checkbox(&mut picker.embed, "Embed whole document");
                 ui.separator();
                 // The list scrolls and fits the viewport instead of growing
                 // the window without bounds.
@@ -298,7 +343,7 @@ impl HomePage {
                     .show(ui, |ui| {
                         let filter = picker.filter.as_str();
                         let mut shown = 0;
-                        for (id, title) in snippet_index {
+                        for (id, title, _) in snippet_index {
                             if !filter.is_empty() && !title.contains(filter) {
                                 continue;
                             }
@@ -330,10 +375,14 @@ impl HomePage {
         if let Some(target_id) = selected {
             let title = snippet_index
                 .iter()
-                .find(|(id, _)| id == &target_id)
-                .map(|(_, title)| title.clone())
+                .find(|(id, _, _)| id == &target_id)
+                .map(|(_, title, _)| title.clone())
                 .unwrap_or_default();
-            insert_markdown_link(&mut snippet.content, picker.cursor, &title, &target_id);
+            if picker.embed {
+                insert_embed_markdown(&mut snippet.content, picker.cursor, &title, &target_id);
+            } else {
+                insert_markdown_link(&mut snippet.content, picker.cursor, &title, &target_id);
+            }
             let _ = store.save(snippet);
             return;
         }
@@ -346,7 +395,7 @@ impl HomePage {
         view: &mut View,
         snippet: &mut Snippet,
         store: &SnippetStore,
-        snippet_index: &[(EntityId, String)],
+        snippet_index: &[(EntityId, String, String)],
         clipboard: &Option<ClipboardEntry>,
     ) -> ViewAction {
         ui.show_viewport_immediate(
@@ -422,7 +471,8 @@ impl HomePage {
                         .input(|input| input.pointer.interact_pos())
                         .is_some_and(|pos| panel.response.rect.contains(pos))
                 {
-                    if let Some((_, title)) = snippet_index.iter().find(|(id, _)| id == target_id)
+                    if let Some((_, title, _)) =
+                        snippet_index.iter().find(|(id, _, _)| id == target_id)
                     {
                         let cursor = egui::TextEdit::load_state(
                             ctx,
@@ -474,8 +524,73 @@ impl HomePage {
     }
 }
 
+/// One piece of a preview: plain markdown text, or an inline embed marker
+/// (`![alt](dest)`) that renders the target's whole document inline.
+#[derive(Debug, PartialEq)]
+enum PreviewSegment {
+    Text(String),
+    Embed { alt: String, dest: String },
+}
+
+/// Splits `content` at inline **document** embeds: `![alt](dest)` where `dest`
+/// is a local `*.md` reference. Images and external URLs (`.png`, `http://`,
+/// …) stay in the text segment and are left to CommonMark rendering — the
+/// syntax is shared with future real image embeds, disambiguated by extension.
+/// Code blocks are not handled specially yet.
+fn split_embeds(content: &str) -> Vec<PreviewSegment> {
+    let mut segments = Vec::new();
+    let bytes = content.as_bytes();
+    let mut text_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'!' && bytes.get(i + 1) == Some(&b'[') {
+            let alt_start = i + 2;
+            let mut close = alt_start;
+            while close < bytes.len() && bytes[close] != b']' {
+                close += 1;
+            }
+            if close < bytes.len() && bytes.get(close + 1) == Some(&b'(') {
+                let mut end = close + 2;
+                while end < bytes.len() && bytes[end] != b')' {
+                    end += 1;
+                }
+                if end < bytes.len() {
+                    let dest = &content[close + 2..end];
+                    let is_document_embed = dest.ends_with(".md")
+                        && !dest.contains("://")
+                        && !dest.starts_with("data:");
+                    if is_document_embed {
+                        if text_start < i {
+                            segments.push(PreviewSegment::Text(content[text_start..i].to_owned()));
+                        }
+                        segments.push(PreviewSegment::Embed {
+                            alt: content[alt_start..close].to_owned(),
+                            dest: dest.to_owned(),
+                        });
+                        i = end + 1;
+                        text_start = i;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    if text_start < content.len() {
+        segments.push(PreviewSegment::Text(content[text_start..].to_owned()));
+    }
+    segments
+}
+
+/// Replaces inline-embed markers with plain links (`![` → `[`), used when
+/// rendering an embedded document non-recursively.
+fn neutralize_embeds(text: &str) -> String {
+    text.replace("![", "[")
+}
+
 /// Collects the destinations of inline markdown links (`[text](dest)`) that
-/// point at local snippet files (`*.md`). Reference definitions
+/// point at local snippet files (`*.md`). Embed markers (`![alt](dest)`) are
+/// excluded — they are handled by [`split_embeds`]. Reference definitions
 /// (`[id]: url`) are not handled yet.
 fn collect_local_links(text: &str) -> Vec<String> {
     let mut links = Vec::new();
@@ -483,26 +598,34 @@ fn collect_local_links(text: &str) -> Vec<String> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b']' && bytes.get(i + 1) == Some(&b'(') {
-            let mut end = i + 2;
-            let mut depth = 1usize;
-            while end < bytes.len() && depth > 0 {
-                match bytes[end] {
-                    b'(' => depth += 1,
-                    b')' => depth -= 1,
-                    _ => {}
-                }
-                end += 1;
+            // `![alt](dest)` is an embed, not a link.
+            let mut open = i;
+            while open > 0 && bytes[open] != b'[' {
+                open -= 1;
             }
-            if depth == 0 {
-                let destination = &text[i + 2..end - 1];
-                if destination.ends_with(".md") {
-                    links.push(destination.to_owned());
+            let is_embed = open > 0 && bytes[open - 1] == b'!';
+            if !is_embed {
+                let mut end = i + 2;
+                let mut depth = 1usize;
+                while end < bytes.len() && depth > 0 {
+                    match bytes[end] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    end += 1;
                 }
+                if depth == 0 {
+                    let destination = &text[i + 2..end - 1];
+                    if destination.ends_with(".md") {
+                        links.push(destination.to_owned());
+                    }
+                }
+                i = end;
+                continue;
             }
-            i = end;
-        } else {
-            i += 1;
         }
+        i += 1;
     }
     links
 }
@@ -525,16 +648,24 @@ fn insert_markdown_link(content: &mut String, cursor: usize, title: &str, id: &E
     content.insert_text(&link, egui::text::CharIndex(index));
 }
 
+/// Inserts an inline embed `![title]({id}.md)` (renders the target's whole
+/// document) into `content` at `cursor`.
+fn insert_embed_markdown(content: &mut String, cursor: usize, title: &str, id: &EntityId) {
+    let link = format!("![{title}]({}.md)", id.as_str());
+    let index = cursor.min(content.chars().count());
+    content.insert_text(&link, egui::text::CharIndex(index));
+}
+
 /// Whether a `.md` link destination is an internal reference (no URL scheme)
 /// that does not resolve to an existing snippet — either the parsed id is
 /// missing, or the target is not a valid snippet reference at all (e.g.
 /// `foo.md`). Scheme'd URLs are external and left to the browser.
-fn is_broken_internal_link(url: &str, snippet_index: &[(EntityId, String)]) -> bool {
+fn is_broken_internal_link(url: &str, snippet_index: &[(EntityId, String, String)]) -> bool {
     if url.contains("://") || url.starts_with("data:") {
         return false;
     }
     !parse_snippet_link(url)
-        .is_some_and(|id| snippet_index.iter().any(|(existing, _)| existing == &id))
+        .is_some_and(|id| snippet_index.iter().any(|(existing, _, _)| existing == &id))
 }
 
 #[cfg(test)]
@@ -543,8 +674,47 @@ mod tests {
 
     #[test]
     fn collects_local_markdown_links() {
-        let text = "see [a](hello--abc.md) and [b](https://example.com/x) and ![img](p.png)";
+        let text = "see [a](hello--abc.md) and [b](https://example.com/x) \
+                    and ![img](p.png) and ![emb](0123456789abcdef0123.md)";
+        // Links only: embeds (`![...]`) are excluded.
         assert_eq!(collect_local_links(text), vec!["hello--abc.md"]);
+    }
+
+    #[test]
+    fn splits_embeds_and_text() {
+        let content = "intro\n\n![Title](0123456789abcdef0123.md)\n\noutro";
+        assert_eq!(
+            split_embeds(content),
+            vec![
+                PreviewSegment::Text("intro\n\n".to_owned()),
+                PreviewSegment::Embed {
+                    alt: "Title".to_owned(),
+                    dest: "0123456789abcdef0123.md".to_owned(),
+                },
+                PreviewSegment::Text("\n\noutro".to_owned()),
+            ]
+        );
+        // No embeds → a single text segment.
+        assert_eq!(
+            split_embeds("plain text"),
+            vec![PreviewSegment::Text("plain text".to_owned())]
+        );
+        // Images and external URLs share `![...]` syntax but are NOT document
+        // embeds: they stay in the text segment (future real image embeds).
+        assert_eq!(
+            split_embeds("a ![img](p.png) ![ext](https://x.example/a.md) b"),
+            vec![PreviewSegment::Text(
+                "a ![img](p.png) ![ext](https://x.example/a.md) b".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn neutralizes_embeds_to_links() {
+        assert_eq!(
+            neutralize_embeds("![a](x.md) and ![b](y.md)"),
+            "[a](x.md) and [b](y.md)"
+        );
     }
 
     #[test]
@@ -565,7 +735,11 @@ mod tests {
 
     #[test]
     fn flags_links_to_missing_snippets() {
-        let index = vec![(EntityId::from_string("0123456789abcdef0123"), "Exists".to_owned())];
+        let index = vec![(
+            EntityId::from_string("0123456789abcdef0123"),
+            "Exists".to_owned(),
+            String::new(),
+        )];
         let cases = [
             ("0123456789abcdef0123.md", false, "existing"),
             ("aaaaaaaaaaaaaaaaaaaa.md", true, "missing id"),

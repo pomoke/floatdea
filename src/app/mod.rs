@@ -61,6 +61,8 @@ struct LinkPicker {
     filter: String,
     /// Focus the filter field only once when the picker opens (IME-safe).
     focus_requested: bool,
+    /// Insert an inline embed (`![title]({id}.md)`) instead of a plain link.
+    embed: bool,
 }
 
 #[derive(Debug)]
@@ -885,10 +887,13 @@ impl App for HomePage {
         // Title index shared by the editor's "Insert Link…" picker, the paste
         // menu, and drag & drop into a note (looked up by id, so it stays
         // correct even while a snippet is mutably borrowed below).
-        let snippet_index: Vec<(EntityId, String)> = self
+        // (id, title, content) snapshot shared by link insertion and inline
+        // embeds (id/content looked up by id, so it stays correct even while a
+        // snippet is mutably borrowed below).
+        let snippet_index: Vec<(EntityId, String, String)> = self
             .all_snippets
             .iter()
-            .map(|(id, snippet)| (id.clone(), snippet.title.clone()))
+            .map(|(id, snippet)| (id.clone(), snippet.title.clone(), snippet.content.clone()))
             .collect();
         let mut closed_views = Vec::new();
         let mut open_views = Vec::new();
