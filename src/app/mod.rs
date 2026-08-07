@@ -52,6 +52,17 @@ impl ViewMode {
     }
 }
 
+/// State of the "Insert Link…" picker for a snippet viewport.
+#[derive(Clone, Debug)]
+struct LinkPicker {
+    /// Char index in the note body where the link is inserted.
+    cursor: usize,
+    /// Substring filter over snippet titles.
+    filter: String,
+    /// Focus the filter field only once when the picker opens (IME-safe).
+    focus_requested: bool,
+}
+
 #[derive(Debug)]
 struct View {
     id: u64,
@@ -65,6 +76,11 @@ struct View {
     /// Transient: pointer position where the right-click view-mode menu should
     /// open (the preview pane, or the empty area below the editor), if any.
     mode_menu: Option<egui::Pos2>,
+    /// Transient: open "Insert Link…" picker, if any.
+    link_picker: Option<LinkPicker>,
+    /// Transient: last broken-link click error (message + remaining frames),
+    /// auto-dismissed after a short while.
+    link_error: Option<(String, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -428,6 +444,8 @@ impl HomePage {
             markdown_cache: egui_commonmark::CommonMarkCache::default(),
             focus_edit: false,
             mode_menu: None,
+            link_picker: None,
+            link_error: None,
         });
     }
 
@@ -864,13 +882,28 @@ impl App for HomePage {
         self.render_delete_dialog(ui);
         self.render_rename_dialog(ui);
 
+        // Title index shared by the editor's "Insert Link…" picker, the paste
+        // menu, and drag & drop into a note (looked up by id, so it stays
+        // correct even while a snippet is mutably borrowed below).
+        let snippet_index: Vec<(EntityId, String)> = self
+            .all_snippets
+            .iter()
+            .map(|(id, snippet)| (id.clone(), snippet.title.clone()))
+            .collect();
         let mut closed_views = Vec::new();
         let mut open_views = Vec::new();
         for view in &mut self.views {
             let Some(item) = self.all_snippets.get_mut(&view.entity_id) else {
                 continue;
             };
-            match Self::render_snippet_viewport(ui, view, item, &self.store) {
+            match Self::render_snippet_viewport(
+                ui,
+                view,
+                item,
+                &self.store,
+                &snippet_index,
+                &self.clipboard,
+            ) {
                 ViewAction::Close => closed_views.push(view.id),
                 ViewAction::OpenSnippet(id) => open_views.push(id),
                 ViewAction::None => {}
