@@ -31,7 +31,9 @@ stable_id!(ReferenceId);
 stable_id!(TextId);
 
 impl EntityId {
-    pub(crate) fn from_string(value: &str) -> Self {
+    /// Rebuilds an id from its string form (e.g. parsed out of a
+    /// `{title}--{id}.md` filename in a markdown link).
+    pub fn from_string(value: &str) -> Self {
         Self(value.to_owned())
     }
 }

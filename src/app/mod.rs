@@ -35,11 +35,36 @@ pub(crate) struct HomePage {
     consumed_drops: BTreeSet<(ContainerId, ReferenceId)>,
 }
 
+/// Display mode of a snippet viewport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ViewMode {
+    /// Raw markdown editing (single pane).
+    Source,
+    /// Rendered CommonMark preview (read-only).
+    #[default]
+    Preview,
+}
+
+impl ViewMode {
+    /// Whether the viewport is currently showing the raw-markdown editor.
+    fn is_editing(self) -> bool {
+        self == ViewMode::Source
+    }
+}
+
 #[derive(Debug)]
 struct View {
     id: u64,
     entity_id: EntityId,
-    editable: bool,
+    mode: ViewMode,
+    /// Per-view CommonMark cache shared by every preview pane.
+    markdown_cache: egui_commonmark::CommonMarkCache,
+    /// Transient: request focus for the source editor next frame (set when
+    /// entering `Source` from a preview action).
+    focus_edit: bool,
+    /// Transient: pointer position where the right-click view-mode menu should
+    /// open (the preview pane, or the empty area below the editor), if any.
+    mode_menu: Option<egui::Pos2>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,11 +145,14 @@ struct PendingDelete {
     origin: egui::ViewportId,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 enum ViewAction {
     #[default]
     None,
     Close,
+    /// Open another snippet, requested by clicking a local markdown link in a
+    /// preview pane.
+    OpenSnippet(EntityId),
 }
 
 #[derive(Debug)]
@@ -382,14 +410,24 @@ impl HomePage {
         self.clipboard = None;
         let id = self.next_view_id;
         self.next_view_id += 1;
-        let editable = self
+        // Empty snippets open straight into the editor so they can be typed
+        // into immediately; notes with content open as a rendered preview.
+        let mode = if self
             .all_snippets
             .get(&entity_id)
-            .is_some_and(|snippet| snippet.content.is_empty());
+            .is_some_and(|snippet| snippet.content.is_empty())
+        {
+            ViewMode::Source
+        } else {
+            ViewMode::Preview
+        };
         self.views.push(View {
             id,
             entity_id,
-            editable,
+            mode,
+            markdown_cache: egui_commonmark::CommonMarkCache::default(),
+            focus_edit: false,
+            mode_menu: None,
         });
     }
 
@@ -827,18 +865,23 @@ impl App for HomePage {
         self.render_rename_dialog(ui);
 
         let mut closed_views = Vec::new();
+        let mut open_views = Vec::new();
         for view in &mut self.views {
             let Some(item) = self.all_snippets.get_mut(&view.entity_id) else {
                 continue;
             };
-            if matches!(
-                Self::render_snippet_viewport(ui, view, item, &self.store),
-                ViewAction::Close
-            ) {
-                closed_views.push(view.id);
+            match Self::render_snippet_viewport(ui, view, item, &self.store) {
+                ViewAction::Close => closed_views.push(view.id),
+                ViewAction::OpenSnippet(id) => open_views.push(id),
+                ViewAction::None => {}
             }
         }
         self.views.retain(|view| !closed_views.contains(&view.id));
+        for id in open_views {
+            if self.all_snippets.contains_key(&id) {
+                self.open_view(id);
+            }
+        }
 
         let mut commands_by_viewport: Vec<(egui::ViewportId, Vec<CanvasCommand>)> = Vec::new();
         for (container_id, canvas) in &mut self.folder_views {
