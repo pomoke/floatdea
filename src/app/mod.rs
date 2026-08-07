@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use eframe::{egui, App};
 
@@ -28,6 +29,10 @@ pub(crate) struct HomePage {
     pending_delete: Option<PendingDelete>,
     rename_dialog: RenameDialogState,
     clipboard: Option<ClipboardEntry>,
+    /// Reference drops consumed by `DropOnCanvas` commands this frame; used by
+    /// [`HomePage::finalize_drops`] to decide whether a dangling drag should
+    /// bounce back to its start position.
+    consumed_drops: BTreeSet<(ContainerId, ReferenceId)>,
 }
 
 #[derive(Debug)]
@@ -89,6 +94,19 @@ struct ClipboardEntry {
     origin: egui::ViewportId,
 }
 
+/// A card drag published to egui's drag-and-drop payload. Any canvas can be a
+/// drop target: dropping on an empty canvas creates/moves a reference in that
+/// container, dropping on a folder card targets that folder's container.
+/// Must be `Send + Sync` for [`egui::DragAndDrop::set_payload`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DragPayload {
+    Reference {
+        source_container: ContainerId,
+        reference_id: ReferenceId,
+        target: ReferenceTarget,
+    },
+}
+
 /// A pending "delete last reference" confirmation. Deleting the final link to
 /// a snippet or folder permanently removes the underlying entity/container, so
 /// a confirmation dialog is shown first.
@@ -117,11 +135,14 @@ struct CanvasItem {
     size: egui::Vec2,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct DragState {
     index: usize,
     start_position: [f32; 2],
     invalid: bool,
+    /// Identity of the dragged reference; used to match the egui
+    /// drag-and-drop payload and to resolve the card safely at frame end.
+    reference_id: ReferenceId,
 }
 
 #[derive(Debug)]
@@ -169,6 +190,16 @@ enum CanvasCommand {
     PasteClipboard {
         container: ContainerId,
         entry: ClipboardEntry,
+    },
+    /// Drop a dragged card onto this canvas: create (default) or move (Shift)
+    /// the reference into `container`.
+    DropOnCanvas {
+        container: ContainerId,
+        /// Drop position in the target canvas's local coordinates; `None`
+        /// picks a free default slot (used when dropping onto a folder card).
+        position: Option<[f32; 2]>,
+        payload: DragPayload,
+        move_semantics: bool,
     },
 }
 
@@ -298,6 +329,7 @@ impl HomePage {
             pending_delete: None,
             rename_dialog: RenameDialogState::default(),
             clipboard: None,
+            consumed_drops: BTreeSet::new(),
         }
     }
 
@@ -432,6 +464,25 @@ impl HomePage {
                         // The clipboard is single-use: clear it after a
                         // successful paste (Link or Move).
                         self.clipboard = None;
+                    }
+                }
+                CanvasCommand::DropOnCanvas {
+                    container,
+                    position,
+                    payload,
+                    move_semantics,
+                } => {
+                    if self.apply_drop(&container, position, &payload, move_semantics)
+                        && let DragPayload::Reference {
+                            source_container,
+                            reference_id,
+                            ..
+                        } = &payload
+                    {
+                        // Record the consumption so `finalize_drops` knows the
+                        // drag ended in a successful drop (no bounce-back).
+                        self.consumed_drops
+                            .insert((source_container.clone(), reference_id.clone()));
                     }
                 }
             }
@@ -588,6 +639,165 @@ impl HomePage {
         true
     }
 
+    /// Applies a drag-and-drop: adds a reference to `container` at `position`
+    /// (or a free default slot when `None`), optionally removing the source
+    /// reference (`move_semantics`). Returns `false` when the drop is not
+    /// allowed (self-reference, move within the same container, stale target).
+    fn apply_drop(
+        &mut self,
+        container: &ContainerId,
+        position: Option<[f32; 2]>,
+        payload: &DragPayload,
+        move_semantics: bool,
+    ) -> bool {
+        let DragPayload::Reference {
+            source_container,
+            reference_id,
+            target,
+        } = payload;
+        if !canvas::drop_valid_for(
+            payload,
+            container,
+            &self.all_snippets,
+            &self.workspace,
+            move_semantics,
+        ) {
+            return false;
+        }
+        let new_reference_id = match target {
+            ReferenceTarget::Snippet(entity_id) => {
+                let Ok(id) = self
+                    .workspace
+                    .add_snippet_reference(container, entity_id.clone())
+                else {
+                    return false;
+                };
+                id
+            }
+            ReferenceTarget::Container(target_id) => {
+                let Ok(id) = self
+                    .workspace
+                    .add_container_reference(container, target_id.clone())
+                else {
+                    return false;
+                };
+                id
+            }
+        };
+        let position = match position {
+            Some(position) => position,
+            None => {
+                let items: &[CanvasItem] = self
+                    .canvas_for(container)
+                    .map(|canvas| canvas.items.as_slice())
+                    .unwrap_or(&[]);
+                canvas::default_position_for(
+                    items,
+                    &self.all_snippets,
+                    &self.workspace,
+                    &[],
+                )
+            }
+        };
+        let target_canvas = if container == &self.root.container_id {
+            Some(&mut self.root)
+        } else {
+            self.folder_views.get_mut(container)
+        };
+        if let Some(canvas) = target_canvas {
+            canvas.items.push(CanvasItem {
+                reference_id: new_reference_id.clone(),
+                target: target.clone(),
+                position,
+                size: egui::vec2(CARD_WIDTH, 25.0),
+            });
+            canvas.layout.items.insert(
+                new_reference_id.clone(),
+                CardLayout {
+                    position,
+                    color: None,
+                },
+            );
+            canvas.save_layout(&self.workspace_store);
+        } else {
+            // The target container is not open: persist just the layout entry.
+            let mut layout = self
+                .workspace_store
+                .load_layout(container)
+                .unwrap_or_else(|_| ContainerLayout::empty(container.clone()));
+            layout.items.insert(
+                new_reference_id.clone(),
+                CardLayout {
+                    position,
+                    color: None,
+                },
+            );
+            let _ = self.workspace_store.save_layout(&layout);
+        }
+        if move_semantics && source_container != container {
+            let _ = self
+                .workspace
+                .remove_reference(source_container, reference_id);
+            let source_canvas = if source_container == &self.root.container_id {
+                Some(&mut self.root)
+            } else {
+                self.folder_views.get_mut(source_container)
+            };
+            if let Some(canvas) = source_canvas {
+                canvas
+                    .items
+                    .retain(|item| &item.reference_id != reference_id);
+                canvas.layout.items.remove(reference_id);
+                canvas.save_layout(&self.workspace_store);
+            }
+        }
+        let _ = self.workspace_store.save(&self.workspace);
+        true
+    }
+
+    /// End-of-frame pass for cross-window drags. A drag that leaves its source
+    /// canvas keeps the pointer "down" there (egui deliberately does not turn
+    /// [`egui::Event::PointerGone`] into a release), so the source canvas never
+    /// observes the release itself. The egui payload is the authoritative
+    /// "still dragging" signal: once it is gone (consumed by a drop target or
+    /// cleared by egui on release) the drag is finalized. Cards whose drop was
+    /// not consumed bounce back to their start position.
+    fn finalize_drops(&mut self, ctx: &egui::Context) {
+        let payload = egui::DragAndDrop::payload::<DragPayload>(ctx)
+            .map(|arc| (*arc).clone());
+        let consumed = std::mem::take(&mut self.consumed_drops);
+        let mut canvases: Vec<&mut ContainerCanvas> = std::iter::once(&mut self.root)
+            .chain(self.folder_views.values_mut())
+            .collect();
+        for canvas in &mut canvases {
+            let Some(drag) = canvas.dragging.clone() else {
+                continue;
+            };
+            // While the payload still matches this drag, the user is still
+            // dragging (the pointer may be over another window).
+            let alive = payload.as_ref().is_some_and(|p| {
+                matches!(p, DragPayload::Reference { reference_id, .. }
+                    if reference_id == &drag.reference_id)
+            });
+            if alive {
+                continue;
+            }
+            let card_present = drag.index < canvas.items.len()
+                && canvas.items[drag.index].reference_id == drag.reference_id;
+            let consumed_here = consumed.contains(&(
+                canvas.container_id.clone(),
+                drag.reference_id.clone(),
+            ));
+            if card_present && !consumed_here {
+                // The drop was not consumed by any canvas: bounce back.
+                canvas.items[drag.index].position = drag.start_position;
+            }
+            if card_present {
+                canvas.save_layout(&self.workspace_store);
+            }
+            canvas.dragging = None;
+        }
+    }
 }
 
 /// Counts how many references across the whole workspace point at `target`.
@@ -657,6 +867,9 @@ impl App for HomePage {
         for (viewport_id, commands) in commands_by_viewport {
             self.process_canvas_commands(commands, viewport_id);
         }
+        // Finalize any cross-window drag whose payload was consumed or cleared
+        // during this frame (bouncing back un-consumed drops).
+        self.finalize_drops(ui.ctx());
     }
 }
 
@@ -817,6 +1030,113 @@ mod tests {
             origin: egui::ViewportId::ROOT,
         };
         assert!(!page.paste_clipboard(&folder_id, &entry));
+    }
+
+    #[test]
+    fn drop_creates_link_reference_in_folder() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let _ = page.workspace.add_container_to_root(folder_id.clone());
+        page.open_folder(&folder_id);
+
+        let (entity_id, reference_id) = root_first_snippet(&page);
+        let payload = DragPayload::Reference {
+            source_container: page.root.container_id.clone(),
+            reference_id,
+            target: ReferenceTarget::Snippet(entity_id),
+        };
+        let root_count = page.root.items.len();
+        assert!(page.apply_drop(&folder_id, Some([88.0, 44.0]), &payload, false));
+        // Link keeps the source card.
+        assert_eq!(page.root.items.len(), root_count);
+        let folder_canvas = page.folder_views.get(&folder_id).expect("folder view open");
+        assert_eq!(folder_canvas.items.len(), 1);
+        assert_eq!(folder_canvas.items[0].position, [88.0, 44.0]);
+        assert_eq!(page.workspace.containers[&folder_id].members.len(), 1);
+    }
+
+    #[test]
+    fn drop_moves_reference_into_folder() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let _ = page.workspace.add_container_to_root(folder_id.clone());
+        page.open_folder(&folder_id);
+
+        let (entity_id, reference_id) = root_first_snippet(&page);
+        let payload = DragPayload::Reference {
+            source_container: page.root.container_id.clone(),
+            reference_id,
+            target: ReferenceTarget::Snippet(entity_id.clone()),
+        };
+        let root_count = page.root.items.len();
+        assert!(page.apply_drop(&folder_id, None, &payload, true));
+        assert_eq!(
+            page.root.items.len(),
+            root_count - 1,
+            "move removes the source card"
+        );
+        assert_eq!(page.workspace.containers[&folder_id].members.len(), 1);
+        // The entity itself is untouched; only the reference moved.
+        assert!(page.all_snippets.contains_key(&entity_id));
+    }
+
+    #[test]
+    fn drop_rejects_self_reference() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let reference_id = page.workspace.add_container_to_root(folder_id.clone());
+        let payload = DragPayload::Reference {
+            source_container: page.root.container_id.clone(),
+            reference_id,
+            target: ReferenceTarget::Container(folder_id.clone()),
+        };
+        assert!(!page.apply_drop(&folder_id, None, &payload, false));
+    }
+
+    #[test]
+    fn drop_rejects_move_into_same_container() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let (entity_id, reference_id) = root_first_snippet(&page);
+        let payload = DragPayload::Reference {
+            source_container: page.root.container_id.clone(),
+            reference_id,
+            target: ReferenceTarget::Snippet(entity_id),
+        };
+        let root_id = page.root.container_id.clone();
+        let root_count = page.root.items.len();
+        assert!(!page.apply_drop(&root_id, Some([24.0, 24.0]), &payload, true));
+        assert_eq!(page.root.items.len(), root_count);
+    }
+
+    #[test]
+    fn drop_command_records_consumption() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let _ = page.workspace.add_container_to_root(folder_id.clone());
+        let (entity_id, reference_id) = root_first_snippet(&page);
+        let payload = DragPayload::Reference {
+            source_container: page.root.container_id.clone(),
+            reference_id: reference_id.clone(),
+            target: ReferenceTarget::Snippet(entity_id),
+        };
+        page.process_canvas_commands(
+            vec![CanvasCommand::DropOnCanvas {
+                container: folder_id.clone(),
+                position: None,
+                payload,
+                move_semantics: false,
+            }],
+            egui::ViewportId::ROOT,
+        );
+        assert!(page
+            .consumed_drops
+            .contains(&(page.root.container_id.clone(), reference_id)));
+        assert_eq!(page.workspace.containers[&folder_id].members.len(), 1);
     }
 
     #[test]

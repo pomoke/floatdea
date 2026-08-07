@@ -404,6 +404,12 @@ impl HomePage {
         );
 
         let pointer_pos = ui.input(|input| input.pointer.interact_pos());
+        // A card drag in any canvas publishes an egui drag-and-drop payload;
+        // this canvas may be a drop target while the pointer is over it.
+        let drag_payload = egui::DragAndDrop::payload::<DragPayload>(ui.ctx())
+            .map(|payload| (*payload).clone());
+        let mut folder_drop_target: Option<(usize, ContainerId)> = None;
+        let mut folder_drop_invalid = false;
         let mut pointer_over_card = false;
         let mut dragged = None;
         // Remember the right-click position on the canvas so new snippets,
@@ -455,6 +461,29 @@ impl HomePage {
             );
             let target = canvas.items[index].target.clone();
             let reference_id = canvas.items[index].reference_id.clone();
+            // A folder card under the pointer is a drop target for the dragged
+            // card: the drop links/moves the reference into that folder.
+            if is_folder
+                && let Some(payload) = &drag_payload
+                && pointer_pos.is_some_and(|position| rect.contains(position))
+            {
+                let folder_id = match &target {
+                    ReferenceTarget::Container(id) => id.clone(),
+                    _ => unreachable!("folder cards reference containers"),
+                };
+                let shift = ui.input(|input| input.modifiers.shift);
+                if drop_valid_for(
+                    payload,
+                    &folder_id,
+                    data.snippets,
+                    data.workspace,
+                    shift,
+                ) {
+                    folder_drop_target = Some((index, folder_id));
+                } else {
+                    folder_drop_invalid = true;
+                }
+            }
 
             response.context_menu(|ui| {
                 let origin = ui.ctx().viewport_id();
@@ -515,20 +544,60 @@ impl HomePage {
                     index,
                     start_position: canvas.items[index].position,
                     invalid: false,
+                    reference_id: reference_id.clone(),
                 });
+                // Publish the drag to egui's shared payload so other canvases
+                // (other windows) can act as drop targets.
+                egui::DragAndDrop::set_payload(
+                    ui.ctx(),
+                    DragPayload::Reference {
+                        source_container: canvas.container_id.clone(),
+                        reference_id: reference_id.clone(),
+                        target: canvas.items[index].target.clone(),
+                    },
+                );
             }
-            if canvas.dragging.is_some_and(|drag| drag.index == index) && response.dragged() {
+            if canvas
+                .dragging
+                .as_ref()
+                .is_some_and(|drag| drag.index == index)
+                && response.dragged()
+            {
                 dragged = Some((index, ui.input(|input| input.pointer.delta())));
+                // Refresh the payload so it stays alive while dragging.
+                egui::DragAndDrop::set_payload(
+                    ui.ctx(),
+                    DragPayload::Reference {
+                        source_container: canvas.container_id.clone(),
+                        reference_id: canvas.items[index].reference_id.clone(),
+                        target: canvas.items[index].target.clone(),
+                    },
+                );
             }
 
             paint_card(
                 painter,
                 rect,
                 &galley,
-                canvas.dragging.is_some_and(|drag| drag.index == index),
+                canvas
+                    .dragging
+                    .as_ref()
+                    .is_some_and(|drag| drag.index == index),
                 is_folder,
                 ui.visuals(),
             );
+            // Highlight a folder card that is currently a drop target.
+            if folder_drop_target
+                .as_ref()
+                .is_some_and(|(idx, _)| *idx == index)
+            {
+                painter.rect_stroke(
+                    rect.expand(3.0),
+                    4.0,
+                    egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                    egui::StrokeKind::Outside,
+                );
+            }
         }
 
         if let Some((index, delta)) = dragged {
@@ -539,6 +608,9 @@ impl HomePage {
                 egui::pos2(item.position[0], item.position[1]),
                 item.size,
             );
+            // While hovering a valid folder drop target, that folder card is
+            // excluded from the overlap check so the drop is not rejected.
+            let drop_target = folder_drop_target.as_ref().map(|(idx, _)| *idx);
             let invalid = overlaps(
                 canvas,
                 Some(index),
@@ -547,21 +619,130 @@ impl HomePage {
                 data.snippets,
                 data.workspace,
                 &text_layouts,
+                drop_target,
             );
             if let Some(drag) = &mut canvas.dragging {
                 drag.invalid = invalid;
             }
         }
 
-        if canvas.dragging.is_some_and(|drag| drag.invalid) {
+        if canvas.dragging.as_ref().is_some_and(|drag| drag.invalid) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
         }
         if canvas.dragging.is_some() && !ui.input(|input| input.pointer.any_down()) {
             let drag = canvas.dragging.take().expect("drag state disappeared");
-            if drag.invalid {
+            let pointer_in_canvas =
+                pointer_pos.is_some_and(|position| canvas_rect.contains(position));
+            let dropped_on_folder = pointer_in_canvas
+                && folder_drop_target
+                    .as_ref()
+                    .is_some_and(|(idx, _)| *idx != drag.index);
+            if pointer_in_canvas && !dropped_on_folder {
+                // Plain reposition within this canvas.
+                if drag.invalid {
+                    canvas.items[drag.index].position = drag.start_position;
+                } else {
+                    canvas.save_layout(data.workspace_store);
+                }
+                egui::DragAndDrop::clear_payload(ui.ctx());
+            } else if dropped_on_folder {
+                // Dropped on a folder card in this canvas: the drop branch
+                // below emits the DropOnCanvas command; the source card
+                // returns home.
                 canvas.items[drag.index].position = drag.start_position;
-            } else {
                 canvas.save_layout(data.workspace_store);
+            } else {
+                // Released outside this canvas: a cross-canvas drop may be
+                // applied at frame end. Keep the card where it is; the drag
+                // state is finalized by `HomePage::finalize_drops` once the
+                // payload is consumed or cleared.
+                canvas.save_layout(data.workspace_store);
+            }
+        }
+
+        // ---- Drop targets (payload-based, cross-window) ----
+        if let Some(payload) = &drag_payload {
+            let DragPayload::Reference { source_container, .. } = payload;
+            let move_semantics = ui.input(|input| input.modifiers.shift);
+            let hovering_canvas =
+                pointer_pos.is_some_and(|position| canvas_rect.contains(position));
+            let hovering_folder_card = folder_drop_target.is_some() || folder_drop_invalid;
+            let canvas_drop_valid = source_container != &canvas.container_id
+                && hovering_canvas
+                && !hovering_folder_card
+                && drop_valid_for(
+                    payload,
+                    &canvas.container_id,
+                    data.snippets,
+                    data.workspace,
+                    move_semantics,
+                );
+
+            // Cursor semantics.
+            if folder_drop_invalid {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+            } else if folder_drop_target.is_some() {
+                ui.ctx().set_cursor_icon(if move_semantics {
+                    egui::CursorIcon::Move
+                } else {
+                    egui::CursorIcon::Copy
+                });
+            } else if source_container != &canvas.container_id && hovering_canvas {
+                if !drop_valid_for(
+                    payload,
+                    &canvas.container_id,
+                    data.snippets,
+                    data.workspace,
+                    move_semantics,
+                ) {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+                } else if move_semantics {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+                } else {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Copy);
+                }
+            }
+
+            // Drop on a folder card: link/move the reference into that folder.
+            if let Some((_, folder_id)) = &folder_drop_target
+                && ui.input(|input| input.pointer.primary_released())
+            {
+                commands.push(CanvasCommand::DropOnCanvas {
+                    container: folder_id.clone(),
+                    position: None,
+                    payload: payload.clone(),
+                    move_semantics,
+                });
+                egui::DragAndDrop::clear_payload(ui.ctx());
+            }
+            // Drop on the empty area of a *different* canvas.
+            else if canvas_drop_valid && ui.input(|input| input.pointer.primary_released()) {
+                let position = pointer_pos.map(|pointer| {
+                    [
+                        (pointer.x - canvas_rect.min.x).max(0.0),
+                        (pointer.y - canvas_rect.min.y).max(0.0),
+                    ]
+                });
+                commands.push(CanvasCommand::DropOnCanvas {
+                    container: canvas.container_id.clone(),
+                    position,
+                    payload: payload.clone(),
+                    move_semantics,
+                });
+                egui::DragAndDrop::clear_payload(ui.ctx());
+            }
+
+            // Visual feedback: highlight the canvas and preview the drop.
+            if canvas_drop_valid
+                && let Some(pointer) = pointer_pos
+            {
+                paint_drop_preview(
+                    painter,
+                    canvas_rect,
+                    pointer,
+                    move_semantics,
+                    ui.visuals(),
+                );
             }
         }
 
@@ -685,6 +866,7 @@ fn render_canvas_texts(
                 data.snippets,
                 data.workspace,
                 text_layouts,
+                None,
             );
             if let Some(drag) = &mut canvas.dragging_text {
                 drag.2 = invalid;
@@ -895,6 +1077,32 @@ pub(super) fn clipboard_valid_for(
     }
 }
 
+/// Whether dropping `payload` into `container` is currently allowed (the same
+/// rules as [`clipboard_valid_for`], with the source container checked for
+/// moves). Drop targets reject invalid drops with a `NotAllowed` cursor.
+pub(super) fn drop_valid_for(
+    payload: &DragPayload,
+    container: &ContainerId,
+    snippets: &BTreeMap<EntityId, Snippet>,
+    workspace: &Workspace,
+    move_semantics: bool,
+) -> bool {
+    let DragPayload::Reference {
+        source_container,
+        target,
+        ..
+    } = payload;
+    if move_semantics && source_container == container {
+        return false;
+    }
+    match target {
+        ReferenceTarget::Snippet(entity_id) => snippets.contains_key(entity_id),
+        ReferenceTarget::Container(target_id) => {
+            workspace.containers.contains_key(target_id) && target_id != container
+        }
+    }
+}
+
 /// Renders the clipboard status indicator in the viewport that originated the
 /// current clipboard entry (the window where `Link`/`Move` was chosen).
 fn render_clipboard_status(ui: &mut egui::Ui, data: &mut CanvasData<'_>) {
@@ -971,6 +1179,36 @@ fn layout_title(
     );
     job.wrap.max_width = max_width.max(10.0);
     painter.layout_job(job)
+}
+
+/// Paints the cross-window drop indicator: a highlighted canvas border plus a
+/// preview card under the pointer, labeled with the drop semantics.
+fn paint_drop_preview(
+    painter: &egui::Painter,
+    canvas_rect: egui::Rect,
+    pointer: egui::Pos2,
+    move_semantics: bool,
+    visuals: &egui::Visuals,
+) {
+    let accent = visuals.selection.stroke.color;
+    painter.rect_stroke(
+        canvas_rect.expand(2.0),
+        4.0,
+        egui::Stroke::new(2.0, accent.gamma_multiply(0.8)),
+        egui::StrokeKind::Outside,
+    );
+    let preview = egui::Rect::from_center_size(pointer, egui::vec2(CARD_WIDTH, 34.0));
+    painter.rect_stroke(
+        preview,
+        2.5,
+        egui::Stroke::new(1.5, accent),
+        egui::StrokeKind::Inside,
+    );
+    let label = if move_semantics { "Move" } else { "Link" };
+    let galley = layout_title(painter, label, 60.0, accent);
+    let label_rect = egui::Rect::from_min_size(preview.max + egui::vec2(6.0, 4.0), galley.size());
+    painter.rect_filled(label_rect.expand(3.0), 3.0, visuals.panel_fill);
+    painter.galley(label_rect.min, galley, accent);
 }
 
 fn paint_card(
@@ -1119,7 +1357,9 @@ fn card_rect(item: &CanvasItem) -> egui::Rect {
 }
 
 /// Whether `rect` overlaps any card or any text, excluding the dragged element
-/// itself (`card_index` / `text_index`).
+/// itself (`card_index` / `text_index`) and an optional additional card
+/// (`exclude_card`, used to allow dropping onto a folder drop target).
+#[allow(clippy::too_many_arguments)]
 fn overlaps(
     canvas: &ContainerCanvas,
     card_index: Option<usize>,
@@ -1128,9 +1368,11 @@ fn overlaps(
     snippets: &BTreeMap<EntityId, Snippet>,
     workspace: &Workspace,
     text_layouts: &[TextLayout],
+    exclude_card: Option<usize>,
 ) -> bool {
     let card_overlap = canvas.items.iter().enumerate().any(|(index, item)| {
         Some(index) != card_index
+            && Some(index) != exclude_card
             && item_label(item, snippets, workspace).is_some()
             && card_rect(item).intersects(rect)
     });
