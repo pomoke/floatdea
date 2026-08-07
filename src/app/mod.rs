@@ -4,13 +4,18 @@ use std::path::PathBuf;
 use eframe::{egui, App};
 
 use floatdea::data::{
+    settings::{Settings, SettingsStore, ThemeSetting},
     storage::SnippetStore,
-    workspace::{CanvasText, CardLayout, ContainerLayout, ReferenceTarget, Workspace, WorkspaceStore},
+    workspace::{
+        CanvasText, CardLayout, ContainerLayout, ReferenceTarget, SpecialKind, Workspace,
+        WorkspaceStore,
+    },
     ContainerId, EntityId, ReferenceId, Snippet, TextId,
 };
 
 mod canvas;
 mod math;
+mod settings;
 mod snippet;
 
 use math::MathRenderer;
@@ -38,6 +43,11 @@ pub(crate) struct HomePage {
     /// [`HomePage::finalize_drops`] to decide whether a dangling drag should
     /// bounce back to its start position.
     consumed_drops: BTreeSet<(ContainerId, ReferenceId)>,
+    /// Persisted user settings (theme, preview font size, math cap, grid).
+    settings: Settings,
+    settings_store: SettingsStore,
+    /// Whether the system settings window is open.
+    settings_open: bool,
 }
 
 /// Display mode of a snippet viewport.
@@ -223,6 +233,8 @@ struct ContainerCanvas {
 enum CanvasCommand {
     OpenSnippet(EntityId),
     OpenFolder(ContainerId),
+    /// Open the system page for a built-in special item (e.g. Settings).
+    OpenSpecial(SpecialKind),
     /// Remove a reference from `owner`. If it is the last link to its target,
     /// a confirmation dialog is shown before the entity/container is deleted.
     DeleteReference {
@@ -357,6 +369,9 @@ impl HomePage {
         let workspace = workspace_store
             .load_or_initialize(&snippets)
             .expect("failed to load workspace metadata");
+        let settings_store =
+            SettingsStore::open(&workspace_path).expect("failed to open settings store");
+        let settings = settings_store.load();
         let all_snippets = snippets
             .into_iter()
             .map(|snippet| (snippet.id.clone(), snippet))
@@ -382,6 +397,9 @@ impl HomePage {
             clipboard: None,
             math_renderer: MathRenderer::default(),
             consumed_drops: BTreeSet::new(),
+            settings,
+            settings_store,
+            settings_open: false,
         }
     }
 
@@ -402,6 +420,8 @@ impl HomePage {
             .filter(|reference| match &reference.target {
                 ReferenceTarget::Snippet(id) => snippets.contains_key(id),
                 ReferenceTarget::Container(id) => workspace.containers.contains_key(id),
+                // Special items always resolve.
+                ReferenceTarget::Special(_) => true,
             })
             .enumerate()
             .map(|(index, reference)| CanvasItem {
@@ -462,6 +482,9 @@ impl HomePage {
             match command {
                 CanvasCommand::OpenSnippet(id) => self.open_view(id),
                 CanvasCommand::OpenFolder(id) => self.open_folder(&id),
+                CanvasCommand::OpenSpecial(kind) => match kind {
+                    SpecialKind::Settings => self.settings_open = true,
+                },
                 CanvasCommand::DeleteReference {
                     owner,
                     reference,
@@ -613,6 +636,8 @@ impl HomePage {
                 )));
                 self.folder_views.remove(&container_id);
             }
+            // Special items cannot be deleted; this arm is unreachable.
+            ReferenceTarget::Special(_) => {}
         }
         self.pending_delete = None;
     }
@@ -651,6 +676,8 @@ impl HomePage {
                 };
                 id
             }
+            // Special items cannot be linked or pasted.
+            ReferenceTarget::Special(_) => return false,
         };
         let position = self.canvas_for(container).map(|canvas| {
             canvas::default_position_for(
@@ -747,6 +774,8 @@ impl HomePage {
                 };
                 id
             }
+            // Special items cannot be linked or dropped.
+            ReferenceTarget::Special(_) => return false,
         };
         let position = match position {
             Some(position) => position,
@@ -884,6 +913,7 @@ fn default_card_position(index: usize) -> [f32; 2] {
 
 impl App for HomePage {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.apply_theme(ui.ctx());
         let root_viewport = ui.ctx().viewport_id();
         let root_commands = self.render_home_panel(ui);
         self.process_canvas_commands(root_commands, root_viewport);
@@ -915,6 +945,7 @@ impl App for HomePage {
                 &snippet_index,
                 &self.clipboard,
                 &self.math_renderer,
+                &self.settings,
             ) {
                 ViewAction::Close => closed_views.push(view.id),
                 ViewAction::OpenSnippet(id) => open_views.push(id),
@@ -958,6 +989,8 @@ impl App for HomePage {
         // Finalize any cross-window drag whose payload was consumed or cleared
         // during this frame (bouncing back un-consumed drops).
         self.finalize_drops(ui.ctx());
+        // The system settings window floats above the root canvas.
+        self.render_settings_window(ui.ctx());
     }
 }
 
@@ -1087,6 +1120,7 @@ mod tests {
         assert!(page.all_snippets.contains_key(match &entry.target {
             ReferenceTarget::Snippet(id) => id,
             ReferenceTarget::Container(_) => panic!("root cards are snippets"),
+            ReferenceTarget::Special(_) => panic!("clipboard entries never target specials"),
         }));
     }
 
@@ -1266,9 +1300,69 @@ mod tests {
         let snippet_id = match &page.root.items[0].target {
             ReferenceTarget::Snippet(id) => id.clone(),
             ReferenceTarget::Container(_) => panic!("root cards are snippets"),
+            ReferenceTarget::Special(_) => panic!("root cards are snippets"),
         };
         page.open_view(snippet_id);
         assert!(page.clipboard.is_none());
+    }
+
+    #[test]
+    fn root_always_holds_a_settings_special_card() {
+        let folder = TestFolder::new();
+        let page = HomePage::new(&folder.0);
+        assert!(page.root.items.iter().any(|item| matches!(
+            &item.target,
+            ReferenceTarget::Special(SpecialKind::Settings)
+        )));
+    }
+
+    #[test]
+    fn settings_special_cannot_be_pasted_or_dropped() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let (special_reference, special_target) = {
+            let special = page
+                .root
+                .items
+                .iter()
+                .find(|item| matches!(item.target, ReferenceTarget::Special(_)))
+                .expect("root has a settings special card");
+            (special.reference_id.clone(), special.target.clone())
+        };
+        let folder_id = page.workspace.create_container("Folder");
+        let entry = ClipboardEntry {
+            source_container: page.root.container_id.clone(),
+            reference_id: special_reference.clone(),
+            target: special_target.clone(),
+            semantics: ClipboardSemantics::Link,
+            origin: egui::ViewportId::ROOT,
+        };
+        assert!(
+            !page.paste_clipboard(&folder_id, &entry),
+            "special items cannot be pasted"
+        );
+        let payload = DragPayload::Reference {
+            source_container: page.root.container_id.clone(),
+            reference_id: special_reference.clone(),
+            target: special_target.clone(),
+        };
+        assert!(
+            !page.apply_drop(&folder_id, None, &payload, false),
+            "special items cannot be dropped"
+        );
+        assert_eq!(page.workspace.containers[&folder_id].members.len(), 0);
+    }
+
+    #[test]
+    fn opening_special_opens_the_settings_window() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        assert!(!page.settings_open);
+        page.process_canvas_commands(
+            vec![CanvasCommand::OpenSpecial(SpecialKind::Settings)],
+            egui::ViewportId::ROOT,
+        );
+        assert!(page.settings_open);
     }
 
     #[test]
@@ -1333,6 +1427,7 @@ mod tests {
         let entity_id = match &page.root.items[0].target {
             ReferenceTarget::Snippet(id) => id.clone(),
             ReferenceTarget::Container(_) => panic!("root cards are snippets"),
+            ReferenceTarget::Special(_) => panic!("root cards are snippets"),
         };
         (entity_id, page.root.items[0].reference_id.clone())
     }

@@ -174,6 +174,7 @@ impl HomePage {
         pane_rect: egui::Rect,
         snippet_index: &[(EntityId, String, String)],
         math_renderer: &MathRenderer,
+        settings: &Settings,
     ) -> Option<EntityId> {
         // Only internal references (no URL scheme) are hooked so a click can be
         // intercepted; scheme'd URLs remain normal hyperlinks.
@@ -189,15 +190,16 @@ impl HomePage {
 
         let mut open_snippet = None;
         let segments = split_embeds(&snippet.content);
+        let math_cap_scale = settings.math_cap_scale;
         let callback_renderer = math_renderer.clone();
         let render_math = move |ui: &mut egui::Ui, source: &str, inline: bool| {
-            callback_renderer.show(ui, source, inline);
+            callback_renderer.show(ui, source, inline, math_cap_scale);
         };
         ui.scope(|ui| {
-            // Slightly larger body text for readability; headings derive from it.
+            // Body text size comes from settings; headings derive from it.
             ui.style_mut().text_styles.insert(
                 egui::TextStyle::Body,
-                egui::FontId::proportional(16.0),
+                egui::FontId::proportional(settings.preview_font_size),
             );
             for segment in &segments {
                 match segment {
@@ -213,6 +215,7 @@ impl HomePage {
                             dest,
                             snippet_index,
                             math_renderer,
+                            settings,
                         );
                     }
                 }
@@ -255,6 +258,7 @@ impl HomePage {
         dest: &str,
         snippet_index: &[(EntityId, String, String)],
         math_renderer: &MathRenderer,
+        settings: &Settings,
     ) {
         let Some(id) = parse_snippet_link(dest) else {
             ui.colored_label(ui.visuals().warn_fg_color, format!("invalid embed: {dest}"));
@@ -275,9 +279,10 @@ impl HomePage {
             .corner_radius(egui::CornerRadius::same(4))
             .show(ui, |ui| {
                 // Non-recursive: embed markers inside the target become links.
+                let math_cap_scale = settings.math_cap_scale;
                 let math_renderer = math_renderer.clone();
                 let render_math = move |ui: &mut egui::Ui, source: &str, inline: bool| {
-                    math_renderer.show(ui, source, inline);
+                    math_renderer.show(ui, source, inline, math_cap_scale);
                 };
                 let _ = egui_commonmark::CommonMarkViewer::new()
                     .render_math_fn(Some(&render_math))
@@ -408,6 +413,7 @@ impl HomePage {
         view.link_picker = Some(picker);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_snippet_viewport(
         ui: &mut egui::Ui,
         view: &mut View,
@@ -416,6 +422,7 @@ impl HomePage {
         snippet_index: &[(EntityId, String, String)],
         clipboard: &Option<ClipboardEntry>,
         math_renderer: &MathRenderer,
+        settings: &Settings,
     ) -> ViewAction {
         ui.show_viewport_immediate(
             egui::ViewportId::from_hash_of(("snippet-view", view.id)),
@@ -451,6 +458,7 @@ impl HomePage {
                                                 pane_rect,
                                                 snippet_index,
                                                 math_renderer,
+                                                settings,
                                             ) {
                                                 action = ViewAction::OpenSnippet(id);
                                             }

@@ -77,7 +77,7 @@ impl Default for MathRenderer {
 }
 
 impl MathRenderer {
-    pub(super) fn show(&self, ui: &mut egui::Ui, source: &str, inline: bool) {
+    pub(super) fn show(&self, ui: &mut egui::Ui, source: &str, inline: bool, cap_scale: f32) {
         self.collect_finished();
 
         let key = MathKey {
@@ -117,7 +117,7 @@ impl MathRenderer {
                 // the same point size, and `Image` defaults to filling the
                 // available width. Fit the formula to slightly more than one
                 // body-text line, preserving its aspect ratio.
-                let cap = ui.text_style_height(&egui::TextStyle::Body) * 1.15;
+                let cap = ui.text_style_height(&egui::TextStyle::Body) * cap_scale;
                 ui.add(
                     egui::Image::new(egui::ImageSource::Bytes {
                         uri: uri.into(),

@@ -11,11 +11,30 @@ use super::{ContainerId, EntityId, ReferenceId, Snippet, TextId};
 const WORKSPACE_VERSION: u32 = 1;
 const LAYOUT_VERSION: u32 = 1;
 
+/// A built-in, system-owned special item. Instances are permanent in their
+/// container: they can be dragged around but never deleted or linked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpecialKind {
+    /// Opens the system settings page.
+    Settings,
+}
+
+impl SpecialKind {
+    /// Human-readable label shown on the card.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SpecialKind::Settings => "Settings",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum ReferenceTarget {
     Snippet(EntityId),
     Container(ContainerId),
+    Special(SpecialKind),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +149,37 @@ impl Workspace {
             .expect("workspace root container must exist")
     }
 
+    pub fn add_special_reference(
+        &mut self,
+        container: &ContainerId,
+        kind: SpecialKind,
+    ) -> io::Result<ReferenceId> {
+        self.add_reference(container, ReferenceTarget::Special(kind))
+    }
+
+    pub fn add_special_to_root(&mut self, kind: SpecialKind) -> ReferenceId {
+        let root = self.root.clone();
+        self.add_special_reference(&root, kind)
+            .expect("workspace root container must exist")
+    }
+
+    /// Ensures `container` holds exactly one reference to `kind`; returns
+    /// whether a reference was added.
+    pub fn ensure_special(&mut self, container: &ContainerId, kind: SpecialKind) -> io::Result<bool> {
+        let exists = self.containers.get(container).is_some_and(|container| {
+            container
+                .members
+                .iter()
+                .any(|reference| reference.target == ReferenceTarget::Special(kind))
+        });
+        if exists {
+            Ok(false)
+        } else {
+            self.add_special_reference(container, kind)?;
+            Ok(true)
+        }
+    }
+
     fn add_reference(
         &mut self,
         container: &ContainerId,
@@ -241,17 +291,24 @@ impl WorkspaceStore {
 
     pub fn load_or_initialize(&self, snippets: &[Snippet]) -> io::Result<Workspace> {
         let path = self.root.join("workspace.json");
-        if path.exists() {
+        let mut workspace = if path.exists() {
             let workspace: Workspace = read_json(&path)?;
             workspace.validate()?;
-            return Ok(workspace);
+            workspace
+        } else {
+            let mut workspace = Workspace::empty();
+            for snippet in snippets {
+                workspace.add_snippet_to_root(snippet.id.clone());
+            }
+            workspace
+        };
+        // Ensure the permanent settings entry exists in the root box (migrates
+        // workspaces created before special items were introduced).
+        let root = workspace.root.clone();
+        let added = workspace.ensure_special(&root, SpecialKind::Settings)?;
+        if added || !path.exists() {
+            self.save(&workspace)?;
         }
-
-        let mut workspace = Workspace::empty();
-        for snippet in snippets {
-            workspace.add_snippet_to_root(snippet.id.clone());
-        }
-        self.save(&workspace)?;
         Ok(workspace)
     }
 
@@ -426,6 +483,48 @@ mod tests {
             ReferenceTarget::Container(id) if id == &container
         ));
         assert_eq!(workspace.root().members[0].id, reference);
+    }
+
+    #[test]
+    fn root_holds_the_settings_special_after_initialization() {
+        let folder = TestFolder::new();
+        let store = WorkspaceStore::open(&folder.0).unwrap();
+        let snippet = Snippet {
+            id: EntityId::new(),
+            title: "hello".to_owned(),
+            content: String::new(),
+        };
+
+        let workspace = store
+            .load_or_initialize(std::slice::from_ref(&snippet))
+            .unwrap();
+
+        assert!(workspace.root().members.iter().any(|reference| {
+            matches!(
+                &reference.target,
+                ReferenceTarget::Special(SpecialKind::Settings)
+            )
+        }));
+    }
+
+    #[test]
+    fn ensure_special_is_idempotent() {
+        let mut workspace = Workspace::empty();
+        let root = workspace.root.clone();
+        assert!(workspace.ensure_special(&root, SpecialKind::Settings).unwrap());
+        assert!(!workspace.ensure_special(&root, SpecialKind::Settings).unwrap());
+        assert_eq!(
+            workspace
+                .root()
+                .members
+                .iter()
+                .filter(|reference| matches!(
+                    &reference.target,
+                    ReferenceTarget::Special(SpecialKind::Settings)
+                ))
+                .count(),
+            1
+        );
     }
 
     #[test]

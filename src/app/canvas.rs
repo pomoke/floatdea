@@ -117,6 +117,11 @@ impl HomePage {
                     return DeleteDialogResult::None;
                 }
             },
+            // Special items cannot be deleted; the dialog never opens for them.
+            ReferenceTarget::Special(_) => {
+                *pending = None;
+                return DeleteDialogResult::None;
+            }
         };
         let mut confirmed = false;
         let mut cancelled = false;
@@ -425,16 +430,16 @@ impl HomePage {
         }
 
         for index in 0..canvas.items.len() {
-            let Some((title, is_folder)) =
+            let Some((title, kind)) =
                 item_label(&canvas.items[index], data.snippets, data.workspace)
             else {
                 continue;
             };
             let item = &canvas.items[index];
-            let label = if is_folder {
-                format!("📁 {title}")
-            } else {
-                title
+            let label = match kind {
+                ItemKind::Folder => format!("📁 {title}"),
+                ItemKind::Special => format!("⚙ {title}"),
+                ItemKind::Snippet => title,
             };
             let galley = layout_title(
                 painter,
@@ -463,7 +468,7 @@ impl HomePage {
             let reference_id = canvas.items[index].reference_id.clone();
             // A folder card under the pointer is a drop target for the dragged
             // card: the drop links/moves the reference into that folder.
-            if is_folder
+            if kind == ItemKind::Folder
                 && let Some(payload) = &drag_payload
                 && pointer_pos.is_some_and(|position| rect.contains(position))
             {
@@ -485,60 +490,72 @@ impl HomePage {
                 }
             }
 
-            response.context_menu(|ui| {
-                let origin = ui.ctx().viewport_id();
-                if ui.button("Link").clicked() {
-                    *data.clipboard = Some(ClipboardEntry {
-                        source_container: canvas.container_id.clone(),
-                        reference_id: reference_id.clone(),
-                        target: target.clone(),
-                        semantics: ClipboardSemantics::Link,
-                        origin,
-                    });
-                    ui.close();
-                }
-                if ui.button("Move").clicked() {
-                    *data.clipboard = Some(ClipboardEntry {
-                        source_container: canvas.container_id.clone(),
-                        reference_id: reference_id.clone(),
-                        target: target.clone(),
-                        semantics: ClipboardSemantics::Move,
-                        origin,
-                    });
-                    ui.close();
-                }
-                ui.separator();
-                match &target {
-                    ReferenceTarget::Snippet(entity_id) => {
-                        if ui.button("Rename").clicked() {
-                            commands.push(CanvasCommand::RenameSnippet(entity_id.clone()));
-                            ui.close();
-                        }
+            // Special (system) items have no context menu: they cannot be
+            // linked, renamed, or deleted.
+            if kind != ItemKind::Special {
+                response.context_menu(|ui| {
+                    let origin = ui.ctx().viewport_id();
+                    if ui.button("Link").clicked() {
+                        *data.clipboard = Some(ClipboardEntry {
+                            source_container: canvas.container_id.clone(),
+                            reference_id: reference_id.clone(),
+                            target: target.clone(),
+                            semantics: ClipboardSemantics::Link,
+                            origin,
+                        });
+                        ui.close();
                     }
-                    ReferenceTarget::Container(container_id) => {
-                        if ui.button("Rename").clicked() {
-                            commands.push(CanvasCommand::RenameFolder(container_id.clone()));
-                            ui.close();
-                        }
+                    if ui.button("Move").clicked() {
+                        *data.clipboard = Some(ClipboardEntry {
+                            source_container: canvas.container_id.clone(),
+                            reference_id: reference_id.clone(),
+                            target: target.clone(),
+                            semantics: ClipboardSemantics::Move,
+                            origin,
+                        });
+                        ui.close();
                     }
-                }
-                let last_link = reference_count(data.workspace, &target) == 1;
-                if ui.button(if last_link { "Delete" } else { "Unlink" }).clicked() {
-                    commands.push(CanvasCommand::DeleteReference {
-                        owner: canvas.container_id.clone(),
-                        reference: reference_id.clone(),
-                        target: target.clone(),
-                    });
-                    ui.close();
-                }
-            });
+                    ui.separator();
+                    match &target {
+                        ReferenceTarget::Snippet(entity_id) => {
+                            if ui.button("Rename").clicked() {
+                                commands.push(CanvasCommand::RenameSnippet(entity_id.clone()));
+                                ui.close();
+                            }
+                        }
+                        ReferenceTarget::Container(container_id) => {
+                            if ui.button("Rename").clicked() {
+                                commands.push(CanvasCommand::RenameFolder(container_id.clone()));
+                                ui.close();
+                            }
+                        }
+                        ReferenceTarget::Special(_) => {}
+                    }
+                    let last_link = reference_count(data.workspace, &target) == 1;
+                    if ui.button(if last_link { "Delete" } else { "Unlink" }).clicked() {
+                        commands.push(CanvasCommand::DeleteReference {
+                            owner: canvas.container_id.clone(),
+                            reference: reference_id.clone(),
+                            target: target.clone(),
+                        });
+                        ui.close();
+                    }
+                });
+            }
 
             if response.clicked() {
                 commands.push(match target {
                     ReferenceTarget::Snippet(id) => CanvasCommand::OpenSnippet(id),
                     ReferenceTarget::Container(id) => CanvasCommand::OpenFolder(id),
+                    ReferenceTarget::Special(kind) => CanvasCommand::OpenSpecial(kind),
                 });
             }
+            // Every card (Special included) publishes a drag payload: the
+            // cross-window drag-liveness signal used by `finalize_drops` is the
+            // payload's presence, so a drag without one would bounce back every
+            // frame and appear stuck. Special items stay unlinkable because
+            // every drop/paste guard rejects `ReferenceTarget::Special`, so no
+            // other canvas can ever accept their payload.
             if response.drag_started() {
                 canvas.dragging = Some(DragState {
                     index,
@@ -583,7 +600,7 @@ impl HomePage {
                     .dragging
                     .as_ref()
                     .is_some_and(|drag| drag.index == index),
-                is_folder,
+                kind,
                 ui.visuals(),
             );
             // Highlight a folder card that is currently a drop target.
@@ -770,6 +787,7 @@ impl HomePage {
                             .get(id)
                             .map(|container| container.title.as_str())
                             .unwrap_or("?"),
+                        ReferenceTarget::Special(special) => special.label(),
                     };
                     let verb = match entry.semantics {
                         ClipboardSemantics::Link => "Paste (Link)",
@@ -946,16 +964,29 @@ fn render_canvas_texts(
     pointer_over_text
 }
 
+/// The visual kind of a canvas card, used to pick the label prefix, card
+/// styling, and interaction rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ItemKind {
+    Snippet,
+    Folder,
+    Special,
+}
+
 fn item_label(
     item: &CanvasItem,
     snippets: &BTreeMap<EntityId, Snippet>,
     workspace: &Workspace,
-) -> Option<(String, bool)> {
-    let (title, is_folder) = match &item.target {
-        ReferenceTarget::Snippet(id) => (&snippets.get(id)?.title, false),
-        ReferenceTarget::Container(id) => (&workspace.containers.get(id)?.title, true),
+) -> Option<(String, ItemKind)> {
+    let (title, kind) = match &item.target {
+        ReferenceTarget::Snippet(id) => (snippets.get(id)?.title.as_str(), ItemKind::Snippet),
+        ReferenceTarget::Container(id) => (
+            workspace.containers.get(id)?.title.as_str(),
+            ItemKind::Folder,
+        ),
+        ReferenceTarget::Special(special) => (special.label(), ItemKind::Special),
     };
-    (!title.is_empty()).then(|| (title.clone(), is_folder))
+    (!title.is_empty()).then(|| (title.to_owned(), kind))
 }
 
 fn create_snippet(
@@ -1074,6 +1105,8 @@ pub(super) fn clipboard_valid_for(
         ReferenceTarget::Container(target_id) => {
             workspace.containers.contains_key(target_id) && target_id != container
         }
+        // Special items cannot be linked or pasted.
+        ReferenceTarget::Special(_) => false,
     }
 }
 
@@ -1100,6 +1133,8 @@ pub(super) fn drop_valid_for(
         ReferenceTarget::Container(target_id) => {
             workspace.containers.contains_key(target_id) && target_id != container
         }
+        // Special items cannot be linked or dropped into other containers.
+        ReferenceTarget::Special(_) => false,
     }
 }
 
@@ -1124,6 +1159,7 @@ fn render_clipboard_status(ui: &mut egui::Ui, data: &mut CanvasData<'_>) {
             .get(id)
             .map(|container| container.title.clone())
             .unwrap_or_else(|| "?".to_owned()),
+        ReferenceTarget::Special(special) => special.label().to_owned(),
     };
     let verb = match entry.semantics {
         ClipboardSemantics::Link => "Link",
@@ -1216,19 +1252,23 @@ fn paint_card(
     rect: egui::Rect,
     galley: &std::sync::Arc<egui::Galley>,
     dragging: bool,
-    is_folder: bool,
+    kind: ItemKind,
     visuals: &egui::Visuals,
 ) {
     let bg = if dragging {
         visuals.widgets.active.bg_fill
-    } else if is_folder {
+    } else if kind == ItemKind::Special {
+        visuals.widgets.hovered.bg_fill.gamma_multiply(0.5)
+    } else if kind == ItemKind::Folder {
         visuals.widgets.hovered.bg_fill.gamma_multiply(0.7)
     } else {
         visuals.widgets.inactive.bg_fill
     };
     let stroke = if dragging {
         egui::Stroke::new(2.0, visuals.selection.stroke.color)
-    } else if is_folder {
+    } else if kind == ItemKind::Special {
+        egui::Stroke::new(1.5, visuals.selection.stroke.color.gamma_multiply(0.5))
+    } else if kind == ItemKind::Folder {
         egui::Stroke::new(1.5, visuals.selection.stroke.color.gamma_multiply(0.65))
     } else {
         egui::Stroke::new(1.0, visuals.widgets.inactive.bg_stroke.color)
