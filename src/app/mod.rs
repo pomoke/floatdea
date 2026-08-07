@@ -10,7 +10,10 @@ use floatdea::data::{
 };
 
 mod canvas;
+mod math;
 mod snippet;
+
+use math::MathRenderer;
 
 const CANVAS_MARGIN: f32 = 0.0;
 const CARD_WIDTH: f32 = 150.0;
@@ -29,6 +32,8 @@ pub(crate) struct HomePage {
     pending_delete: Option<PendingDelete>,
     rename_dialog: RenameDialogState,
     clipboard: Option<ClipboardEntry>,
+    /// Shared local TeX-to-SVG renderer for previews and document embeds.
+    math_renderer: MathRenderer,
     /// Reference drops consumed by `DropOnCanvas` commands this frame; used by
     /// [`HomePage::finalize_drops`] to decide whether a dangling drag should
     /// bounce back to its start position.
@@ -375,6 +380,7 @@ impl HomePage {
             pending_delete: None,
             rename_dialog: RenameDialogState::default(),
             clipboard: None,
+            math_renderer: MathRenderer::default(),
             consumed_drops: BTreeSet::new(),
         }
     }
@@ -908,6 +914,7 @@ impl App for HomePage {
                 &self.store,
                 &snippet_index,
                 &self.clipboard,
+                &self.math_renderer,
             ) {
                 ViewAction::Close => closed_views.push(view.id),
                 ViewAction::OpenSnippet(id) => open_views.push(id),
