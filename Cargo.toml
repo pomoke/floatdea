@@ -6,10 +6,12 @@ edition = "2024"
 [dependencies]
 eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "wayland", "wgpu", "x11"] }
 egui = { version = "0.35.0", default-features = false }
-egui_extras = "0.35.0"
+egui_extras = { version = "0.35.0", features = ["svg"] }
+egui_commonmark = { version = "0.24", default-features = false, features = ["pulldown_cmark"] }
 epaint_default_fonts = "0.35.0"
 env_logger = "0.11.11"
 log = "0.4.33"
+mathjax-svg-rs = "0.4.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 system-fonts = "0.1.2"
