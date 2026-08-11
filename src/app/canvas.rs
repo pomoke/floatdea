@@ -106,6 +106,7 @@ impl HomePage {
             let commands = egui::Window::new("Root - FloatDea")
                 .id(egui::Id::new("root-window"))
                 .open(&mut open)
+                .default_pos(egui::pos2(8.0, 8.0))
                 .default_size(egui::vec2(ROOT_CANVAS_SIZE[0], ROOT_CANVAS_SIZE[1]))
                 .show(ui.ctx(), |ui| {
                     Self::render_canvas_panel(ui, &mut self.root, &mut data)
@@ -411,6 +412,7 @@ impl HomePage {
         let mut commands = egui::Window::new(format!("{title} - FloatDea"))
             .id(egui::Id::new(("folder-window", container_id.as_str())))
             .open(&mut open)
+            .default_pos(egui::pos2(680.0, 60.0))
             .default_size([640.0, 480.0])
             .show(ui.ctx(), |ui| {
                 let mut data = CanvasData::new(
@@ -573,9 +575,13 @@ impl HomePage {
             let reference_id = canvas.items[index].reference_id.clone();
             // A folder card under the pointer is a drop target for the dragged
             // card: the drop links/moves the reference into that folder.
+            // The card must be the topmost widget under the pointer: while
+            // dragging, the source canvas grows to follow the dragged card, so a
+            // geometric check alone would also "hit" folder cards that are
+            // actually covered by another window (full-window mode).
             if kind == ItemKind::Folder
                 && let Some(payload) = &drag_payload
-                && pointer_pos.is_some_and(|position| rect.contains(position))
+                && ui.ctx().rect_contains_pointer(ui.layer_id(), rect)
             {
                 let folder_id = match &target {
                     ReferenceTarget::Container(id) => id.clone(),
@@ -778,15 +784,25 @@ impl HomePage {
             ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
         }
         if canvas.dragging.is_some() && !ui.input(|input| input.pointer.any_down()) {
-            let drag = canvas.dragging.take().expect("drag state disappeared");
-            let pointer_in_canvas =
-                pointer_pos.is_some_and(|position| canvas_rect.contains(position));
-            let dropped_on_folder = pointer_in_canvas
-                && folder_drop_target
-                    .as_ref()
-                    .is_some_and(|(idx, _)| *idx != drag.index);
-            if pointer_in_canvas && !dropped_on_folder {
+            // Only a release whose pointer is actually over THIS canvas (its
+            // window/layer is the topmost at the pointer) counts as a plain
+            // reposition. While dragging, the source canvas rect grows to follow
+            // the dragged card, so the pointer can be geometrically inside it
+            // while really hovering another window (full-window mode); such a
+            // release belongs to the drop targets and is finalized by
+            // `HomePage::finalize_drops` instead.
+            let pointer_really_over_canvas = pointer_pos
+                .is_some_and(|_| ui.ctx().rect_contains_pointer(ui.layer_id(), canvas_rect));
+            let dropped_on_folder = pointer_really_over_canvas
+                && folder_drop_target.as_ref().is_some_and(|(idx, _)| {
+                    canvas
+                        .dragging
+                        .as_ref()
+                        .is_some_and(|drag| *idx != drag.index)
+                });
+            if pointer_really_over_canvas && !dropped_on_folder {
                 // Plain reposition within this canvas.
+                let drag = canvas.dragging.take().expect("drag state disappeared");
                 if drag.invalid {
                     canvas.items[drag.index].position = drag.start_position;
                 } else {
@@ -797,15 +813,13 @@ impl HomePage {
                 // Dropped on a folder card in this canvas: the drop branch
                 // below emits the DropOnCanvas command; the source card
                 // returns home.
+                let drag = canvas.dragging.take().expect("drag state disappeared");
                 canvas.items[drag.index].position = drag.start_position;
                 canvas.save_layout(data.workspace_store);
-            } else {
-                // Released outside this canvas: a cross-canvas drop may be
-                // applied at frame end. Keep the card where it is; the drag
-                // state is finalized by `HomePage::finalize_drops` once the
-                // payload is consumed or cleared.
-                canvas.save_layout(data.workspace_store);
             }
+            // Released over a different window: keep the `DragState`; the
+            // frame-end `HomePage::finalize_drops` bounces the card back unless
+            // a drop target consumed the payload.
         }
 
         // ---- Drop targets (payload-based, cross-window) ----
@@ -814,8 +828,9 @@ impl HomePage {
                 source_container, ..
             } = payload;
             let move_semantics = ui.input(|input| input.modifiers.shift);
-            let hovering_canvas =
-                pointer_pos.is_some_and(|position| canvas_rect.contains(position));
+            // Layer-aware hover: the canvas must be the topmost window under the
+            // pointer to be a drop target (see the source-canvas release above).
+            let hovering_canvas = ui.ctx().rect_contains_pointer(ui.layer_id(), canvas_rect);
             let hovering_folder_card = folder_drop_target.is_some() || folder_drop_invalid;
             let canvas_drop_valid = source_container != &canvas.container_id
                 && hovering_canvas

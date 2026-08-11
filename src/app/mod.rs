@@ -997,6 +997,15 @@ fn default_card_position(index: usize) -> [f32; 2] {
 
 impl App for HomePage {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.ui_impl(ui);
+    }
+}
+
+impl HomePage {
+    /// Per-frame UI entry shared by [`App::ui`] and tests. Kept free of
+    /// [`eframe::Frame`] so a whole frame can be driven headlessly with
+    /// [`egui::Context::run_ui`].
+    pub(crate) fn ui_impl(&mut self, ui: &mut egui::Ui) {
         self.apply_theme(ui.ctx());
         let root_viewport = ui.ctx().viewport_id();
         // In full-window mode all snippet/folder windows float inside the root
@@ -1808,5 +1817,83 @@ mod tests {
         assert_eq!(canvas::snap_position([25.0, 47.0]), [32.0, 32.0]);
         assert_eq!(canvas::snap_position([63.0, 49.0]), [64.0, 64.0]);
         assert_eq!(canvas::snap_position([32.0, 96.0]), [32.0, 96.0]);
+    }
+
+    /// A single-frame `RawInput` with the pointer at `pos`. `button` presses or
+    /// releases the primary button on that frame; `None` is a pure move.
+    fn pointer_frame(
+        pos: egui::Pos2,
+        button: Option<(egui::PointerButton, bool)>,
+    ) -> egui::RawInput {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        if let Some((button, pressed)) = button {
+            events.push(egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 1000.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn floating_windows_accept_cross_window_card_drops() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        page.settings.window_mode = WindowMode::Floating;
+        let folder_id = page.workspace.create_container("Folder");
+        let _ = page.workspace.add_container_to_root(folder_id.clone());
+        page.workspace_store.save(&page.workspace).unwrap();
+        page.open_folder(&folder_id);
+        let root_card_count = page.root.items.len();
+
+        // Deterministic window placement: the root box window opens at (8,8)
+        // and the folder box window at (680,60), so root card 0 (a snippet,
+        // the first of the default layout) is near (90,67) and the folder's
+        // empty canvas covers (1000,250).
+        let press = egui::pos2(90.0, 67.0);
+        let drop = egui::pos2(1000.0, 250.0);
+
+        let ctx = egui::Context::default();
+        // Settle the floating windows: egui runs sizing passes on the first
+        // frames, which are unreliable for hit-testing.
+        for _ in 0..3 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| page.ui_impl(ui));
+        }
+        // Park the pointer, then press on the root card.
+        let _ = ctx.run_ui(pointer_frame(press, None), |ui| page.ui_impl(ui));
+        let _ = ctx.run_ui(
+            pointer_frame(press, Some((egui::PointerButton::Primary, true))),
+            |ui| page.ui_impl(ui),
+        );
+        // Drag over to the folder window (drag starts, payload published).
+        let _ = ctx.run_ui(pointer_frame(drop, None), |ui| page.ui_impl(ui));
+        // Release over the folder canvas → DropOnCanvas → reference created.
+        let _ = ctx.run_ui(
+            pointer_frame(drop, Some((egui::PointerButton::Primary, false))),
+            |ui| page.ui_impl(ui),
+        );
+
+        assert_eq!(
+            page.workspace.containers[&folder_id].members.len(),
+            1,
+            "a card dropped onto another floating window's canvas creates a reference"
+        );
+        let folder_canvas = page.folder_views.get(&folder_id).expect("folder view open");
+        assert_eq!(folder_canvas.items.len(), 1);
+        assert!(matches!(
+            folder_canvas.items[0].target,
+            ReferenceTarget::Snippet(_)
+        ));
+        // Link semantics: the source card stays in the root box.
+        assert_eq!(page.root.items.len(), root_card_count);
     }
 }
