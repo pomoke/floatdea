@@ -22,6 +22,19 @@ pub enum ThemeSetting {
     Dark,
 }
 
+/// How snippet and folder windows are presented.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowMode {
+    /// Each canvas and snippet opens in its own native OS window
+    /// (egui multi-viewport).
+    #[default]
+    Native,
+    /// Everything floats as freely draggable windows inside the single main
+    /// window (full-window mode).
+    Floating,
+}
+
 /// Application settings. New fields must carry a `#[serde(default)]` so older
 /// settings files keep loading.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -42,6 +55,10 @@ pub struct Settings {
     /// Draw the 32 pt dot grid on every canvas.
     #[serde(default = "default_show_grid")]
     pub show_grid: bool,
+    /// How snippet/folder windows are presented: native OS windows or floating
+    /// windows inside the main window. Missing files fall back to `Native`.
+    #[serde(default)]
+    pub window_mode: WindowMode,
 }
 
 impl Default for Settings {
@@ -53,6 +70,7 @@ impl Default for Settings {
             math_cap_scale: default_math_cap_scale(),
             snap_to_grid: default_snap_to_grid(),
             show_grid: default_show_grid(),
+            window_mode: WindowMode::default(),
         }
     }
 }
@@ -158,6 +176,7 @@ mod tests {
             math_cap_scale: 1.4,
             snap_to_grid: false,
             show_grid: false,
+            window_mode: WindowMode::Floating,
             ..Settings::default()
         };
         store.save(&settings).unwrap();
@@ -188,5 +207,10 @@ mod tests {
         assert_eq!(loaded.math_cap_scale, default_math_cap_scale());
         assert!(loaded.snap_to_grid, "new fields default when missing");
         assert!(loaded.show_grid, "new fields default when missing");
+        assert_eq!(
+            loaded.window_mode,
+            WindowMode::Native,
+            "new fields default when missing"
+        );
     }
 }

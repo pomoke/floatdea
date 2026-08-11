@@ -10,9 +10,17 @@ pub(super) struct CanvasData<'a> {
     snap_to_grid: bool,
     /// Whether the dot grid is drawn on the canvas (from settings).
     show_grid: bool,
+    /// Whether this is the root canvas. In floating-window mode the clipboard
+    /// status indicator is only shown on the root canvas: every floating window
+    /// shares the root viewport, so showing it in each canvas would duplicate it.
+    is_root: bool,
+    /// Whether the app presents snippet/folder windows as floating windows
+    /// inside the main window (full-window mode) instead of native OS windows.
+    floating: bool,
 }
 
 impl<'a> CanvasData<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         snippets: &'a mut BTreeMap<EntityId, Snippet>,
         workspace: &'a mut Workspace,
@@ -21,6 +29,8 @@ impl<'a> CanvasData<'a> {
         clipboard: &'a mut Option<ClipboardEntry>,
         snap_to_grid: bool,
         show_grid: bool,
+        is_root: bool,
+        floating: bool,
     ) -> Self {
         Self {
             snippets,
@@ -30,6 +40,8 @@ impl<'a> CanvasData<'a> {
             clipboard,
             snap_to_grid,
             show_grid,
+            is_root,
+            floating,
         }
     }
 }
@@ -68,11 +80,11 @@ impl ContainerCanvas {
             &approx_text_rects(&self.texts),
         )
     }
-
 }
 
 impl HomePage {
     pub(super) fn render_home_panel(&mut self, ui: &mut egui::Ui) -> Vec<CanvasCommand> {
+        let floating = self.settings.window_mode == WindowMode::Floating;
         let mut data = CanvasData::new(
             &mut self.all_snippets,
             &mut self.workspace,
@@ -81,8 +93,33 @@ impl HomePage {
             &mut self.clipboard,
             self.settings.snap_to_grid,
             self.settings.show_grid,
+            true,
+            floating,
         );
-        Self::render_canvas_panel(ui, &mut self.root, &mut data)
+        if floating {
+            // Full-window mode: the root box is a normal draggable/resizable
+            // `egui::Window` sized 640×480 by default, floating over the larger
+            // main window. Its close button pops an "Exit?" confirmation
+            // (rendered by [`Self::render_root_exit_dialog`]) instead of
+            // closing the window, so it always stays visible until confirmed.
+            let mut open = true;
+            let commands = egui::Window::new("Root - FloatDea")
+                .id(egui::Id::new("root-window"))
+                .open(&mut open)
+                .default_size(egui::vec2(ROOT_CANVAS_SIZE[0], ROOT_CANVAS_SIZE[1]))
+                .show(ui.ctx(), |ui| {
+                    Self::render_canvas_panel(ui, &mut self.root, &mut data)
+                })
+                .and_then(|inner_response| inner_response.inner)
+                .unwrap_or_default();
+            if !open && !self.root_exit_pending {
+                self.root_exit_pending = true;
+            }
+            commands
+        } else {
+            // Native mode: the root box fills the main window.
+            Self::render_canvas_panel(ui, &mut self.root, &mut data)
+        }
     }
 
     pub(super) fn render_delete_dialog(&mut self, ui: &mut egui::Ui) {
@@ -318,6 +355,8 @@ impl HomePage {
                     clipboard,
                     snap_to_grid,
                     show_grid,
+                    false,
+                    false,
                 );
                 let mut commands = Self::render_canvas_panel(child_ui, canvas, &mut data);
                 if child_ui.input(|input| input.viewport().close_requested()) {
@@ -348,6 +387,51 @@ impl HomePage {
                 commands
             },
         )
+    }
+
+    /// Renders a folder canvas as a floating window inside the main window
+    /// (full-window mode). Same content as [`Self::render_folder_viewport`];
+    /// the rename/delete dialogs are not rendered here because they float at
+    /// the root viewport level (origins are the root viewport in this mode).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn render_folder_window(
+        ui: &mut egui::Ui,
+        canvas: &mut ContainerCanvas,
+        title: &str,
+        workspace: &mut Workspace,
+        workspace_store: &WorkspaceStore,
+        snippet_store: &SnippetStore,
+        snippets: &mut BTreeMap<EntityId, Snippet>,
+        clipboard: &mut Option<ClipboardEntry>,
+        snap_to_grid: bool,
+        show_grid: bool,
+    ) -> Vec<CanvasCommand> {
+        let container_id = canvas.container_id.clone();
+        let mut open = true;
+        let mut commands = egui::Window::new(format!("{title} - FloatDea"))
+            .id(egui::Id::new(("folder-window", container_id.as_str())))
+            .open(&mut open)
+            .default_size([640.0, 480.0])
+            .show(ui.ctx(), |ui| {
+                let mut data = CanvasData::new(
+                    snippets,
+                    workspace,
+                    workspace_store,
+                    snippet_store,
+                    clipboard,
+                    snap_to_grid,
+                    show_grid,
+                    false,
+                    true,
+                );
+                Self::render_canvas_panel(ui, canvas, &mut data)
+            })
+            .and_then(|inner_response| inner_response.inner)
+            .unwrap_or_default();
+        if !open {
+            commands.push(CanvasCommand::CloseFolder(container_id.clone()));
+        }
+        commands
     }
 
     fn render_canvas_panel(
@@ -432,8 +516,8 @@ impl HomePage {
         let pointer_pos = ui.input(|input| input.pointer.interact_pos());
         // A card drag in any canvas publishes an egui drag-and-drop payload;
         // this canvas may be a drop target while the pointer is over it.
-        let drag_payload = egui::DragAndDrop::payload::<DragPayload>(ui.ctx())
-            .map(|payload| (*payload).clone());
+        let drag_payload =
+            egui::DragAndDrop::payload::<DragPayload>(ui.ctx()).map(|payload| (*payload).clone());
         let mut folder_drop_target: Option<(usize, ContainerId)> = None;
         let mut folder_drop_invalid = false;
         let mut pointer_over_card = false;
@@ -498,13 +582,7 @@ impl HomePage {
                     _ => unreachable!("folder cards reference containers"),
                 };
                 let shift = ui.input(|input| input.modifiers.shift);
-                if drop_valid_for(
-                    payload,
-                    &folder_id,
-                    data.snippets,
-                    data.workspace,
-                    shift,
-                ) {
+                if drop_valid_for(payload, &folder_id, data.snippets, data.workspace, shift) {
                     folder_drop_target = Some((index, folder_id));
                 } else {
                     folder_drop_invalid = true;
@@ -553,7 +631,10 @@ impl HomePage {
                         ReferenceTarget::Special(_) => {}
                     }
                     let last_link = reference_count(data.workspace, &target) == 1;
-                    if ui.button(if last_link { "Delete" } else { "Unlink" }).clicked() {
+                    if ui
+                        .button(if last_link { "Delete" } else { "Unlink" })
+                        .clicked()
+                    {
                         commands.push(CanvasCommand::DeleteReference {
                             owner: canvas.container_id.clone(),
                             reference: reference_id.clone(),
@@ -669,7 +750,10 @@ impl HomePage {
                 };
             }
             let rect = egui::Rect::from_min_size(
-                egui::pos2(canvas.items[index].position[0], canvas.items[index].position[1]),
+                egui::pos2(
+                    canvas.items[index].position[0],
+                    canvas.items[index].position[1],
+                ),
                 canvas.items[index].size,
             );
             // While hovering a valid folder drop target, that folder card is
@@ -726,7 +810,9 @@ impl HomePage {
 
         // ---- Drop targets (payload-based, cross-window) ----
         if let Some(payload) = &drag_payload {
-            let DragPayload::Reference { source_container, .. } = payload;
+            let DragPayload::Reference {
+                source_container, ..
+            } = payload;
             let move_semantics = ui.input(|input| input.modifiers.shift);
             let hovering_canvas =
                 pointer_pos.is_some_and(|position| canvas_rect.contains(position));
@@ -802,16 +888,8 @@ impl HomePage {
             }
 
             // Visual feedback: highlight the canvas and preview the drop.
-            if canvas_drop_valid
-                && let Some(pointer) = pointer_pos
-            {
-                paint_drop_preview(
-                    painter,
-                    canvas_rect,
-                    pointer,
-                    move_semantics,
-                    ui.visuals(),
-                );
+            if canvas_drop_valid && let Some(pointer) = pointer_pos {
+                paint_drop_preview(painter, canvas_rect, pointer, move_semantics, ui.visuals());
             }
         }
 
@@ -909,7 +987,11 @@ fn render_canvas_texts(
 
         let response = ui.interact(
             rect,
-            egui::Id::new(("canvas-text", canvas.container_id.as_str(), text_id.as_str())),
+            egui::Id::new((
+                "canvas-text",
+                canvas.container_id.as_str(),
+                text_id.as_str(),
+            )),
             egui::Sense::click_and_drag(),
         );
 
@@ -922,12 +1004,13 @@ fn render_canvas_texts(
         }
         if canvas.dragging_text.is_some_and(|drag| drag.0 == index) && response.dragged() {
             let delta = ui.input(|input| input.pointer.delta());
-            canvas.texts[index].position[0] =
-                (canvas.texts[index].position[0] + delta.x).max(0.0);
-            canvas.texts[index].position[1] =
-                (canvas.texts[index].position[1] + delta.y).max(0.0);
+            canvas.texts[index].position[0] = (canvas.texts[index].position[0] + delta.x).max(0.0);
+            canvas.texts[index].position[1] = (canvas.texts[index].position[1] + delta.y).max(0.0);
             let drag_rect = egui::Rect::from_min_size(
-                egui::pos2(canvas.texts[index].position[0], canvas.texts[index].position[1]),
+                egui::pos2(
+                    canvas.texts[index].position[0],
+                    canvas.texts[index].position[1],
+                ),
                 layout.rect.size(),
             );
             let invalid = overlaps(
@@ -1135,7 +1218,9 @@ pub(super) fn default_position_for(
                     item.size,
                 )
                 .intersects(candidate)
-        }) || text_rects.iter().any(|text_rect| text_rect.intersects(candidate));
+        }) || text_rects
+            .iter()
+            .any(|text_rect| text_rect.intersects(candidate));
         if !occupied {
             return position;
         }
@@ -1199,6 +1284,12 @@ fn render_clipboard_status(ui: &mut egui::Ui, data: &mut CanvasData<'_>) {
         return;
     };
     if entry.origin != ui.ctx().viewport_id() {
+        return;
+    }
+    // In floating-window mode every canvas shares the root viewport, so the
+    // status is only shown on the root canvas to avoid duplicating it in every
+    // floating window.
+    if data.floating && !data.is_root {
         return;
     }
     let title = match &entry.target {
@@ -1522,11 +1613,8 @@ fn default_text_position(canvas: &ContainerCanvas) -> [f32; 2] {
             egui::vec2(TEXT_APPROX_WIDTH, TEXT_MIN_HEIGHT),
         );
         let occupied = canvas.items.iter().any(|item| {
-            egui::Rect::from_min_size(
-                egui::pos2(item.position[0], item.position[1]),
-                item.size,
-            )
-            .intersects(candidate)
+            egui::Rect::from_min_size(egui::pos2(item.position[0], item.position[1]), item.size)
+                .intersects(candidate)
         }) || text_rects.iter().any(|rect| rect.intersects(candidate));
         if !occupied {
             return position;

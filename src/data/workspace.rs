@@ -165,7 +165,11 @@ impl Workspace {
 
     /// Ensures `container` holds exactly one reference to `kind`; returns
     /// whether a reference was added.
-    pub fn ensure_special(&mut self, container: &ContainerId, kind: SpecialKind) -> io::Result<bool> {
+    pub fn ensure_special(
+        &mut self,
+        container: &ContainerId,
+        kind: SpecialKind,
+    ) -> io::Result<bool> {
         let exists = self.containers.get(container).is_some_and(|container| {
             container
                 .members
@@ -511,8 +515,16 @@ mod tests {
     fn ensure_special_is_idempotent() {
         let mut workspace = Workspace::empty();
         let root = workspace.root.clone();
-        assert!(workspace.ensure_special(&root, SpecialKind::Settings).unwrap());
-        assert!(!workspace.ensure_special(&root, SpecialKind::Settings).unwrap());
+        assert!(
+            workspace
+                .ensure_special(&root, SpecialKind::Settings)
+                .unwrap()
+        );
+        assert!(
+            !workspace
+                .ensure_special(&root, SpecialKind::Settings)
+                .unwrap()
+        );
         assert_eq!(
             workspace
                 .root()

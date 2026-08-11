@@ -89,6 +89,45 @@ impl HomePage {
                     changed = true;
                 }
 
+                ui.add_space(10.0);
+                ui.label("Window mode");
+                let mut mode_changed = false;
+                egui::ComboBox::from_id_salt("settings-window-mode")
+                    .selected_text(match self.settings.window_mode {
+                        WindowMode::Native => "Native windows",
+                        WindowMode::Floating => "Floating (single window)",
+                    })
+                    .show_ui(ui, |ui| {
+                        mode_changed |= ui
+                            .selectable_value(
+                                &mut self.settings.window_mode,
+                                WindowMode::Native,
+                                "Native windows",
+                            )
+                            .changed();
+                        mode_changed |= ui
+                            .selectable_value(
+                                &mut self.settings.window_mode,
+                                WindowMode::Floating,
+                                "Floating (single window)",
+                            )
+                            .on_hover_text(
+                                "Canvas and snippet windows float inside the main window and can be dragged freely",
+                            )
+                            .changed();
+                    });
+                if mode_changed {
+                    changed = true;
+                    // Resize the main window to match: larger in full-window mode
+                    // to leave room for the floating windows, 640×480 otherwise.
+                    let size = if self.settings.window_mode == WindowMode::Floating {
+                        egui::vec2(FLOATING_MAIN_SIZE[0], FLOATING_MAIN_SIZE[1])
+                    } else {
+                        egui::vec2(ROOT_CANVAS_SIZE[0], ROOT_CANVAS_SIZE[1])
+                    };
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                }
+
                 ui.add_space(16.0);
                 ui.separator();
                 ui.label(format!("FloatDea {}", env!("CARGO_PKG_VERSION")));

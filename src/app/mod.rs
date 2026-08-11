@@ -1,16 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use eframe::{egui, App};
+use eframe::{App, egui};
 
 use floatdea::data::{
-    settings::{Settings, SettingsStore, ThemeSetting},
+    ContainerId, EntityId, ReferenceId, Snippet, TextId,
+    settings::{Settings, SettingsStore, ThemeSetting, WindowMode},
     storage::SnippetStore,
     workspace::{
         CanvasText, CardLayout, ContainerLayout, ReferenceTarget, SpecialKind, Workspace,
         WorkspaceStore,
     },
-    ContainerId, EntityId, ReferenceId, Snippet, TextId,
 };
 
 mod canvas;
@@ -24,6 +24,13 @@ const CANVAS_MARGIN: f32 = 0.0;
 const CARD_WIDTH: f32 = 150.0;
 const CARD_PADDING_H: f32 = 8.0;
 const CARD_MARGIN_Y: f32 = 6.0;
+
+/// The fixed size of the root canvas; also the main-window inner size in native
+/// multi-window mode.
+pub(crate) const ROOT_CANVAS_SIZE: [f32; 2] = [640.0, 480.0];
+/// The larger main-window inner size used in full-window mode to leave room for
+/// the floating snippet/folder windows.
+pub(crate) const FLOATING_MAIN_SIZE: [f32; 2] = [1280.0, 800.0];
 
 pub(crate) struct HomePage {
     all_snippets: BTreeMap<EntityId, Snippet>,
@@ -48,6 +55,9 @@ pub(crate) struct HomePage {
     settings_store: SettingsStore,
     /// Whether the system settings window is open.
     settings_open: bool,
+    /// Full-window mode: the root window's close button was clicked and the
+    /// "Exit?" confirmation is awaiting a decision.
+    root_exit_pending: bool,
 }
 
 /// Display mode of a snippet viewport.
@@ -419,6 +429,7 @@ impl HomePage {
             settings,
             settings_store,
             settings_open: false,
+            root_exit_pending: false,
         }
     }
 
@@ -496,6 +507,66 @@ impl HomePage {
         });
     }
 
+    /// Whether snippet/folder windows are presented as floating windows inside
+    /// the single main window (full-window mode) instead of native OS windows.
+    fn floating_windows(&self) -> bool {
+        self.settings.window_mode == WindowMode::Floating
+    }
+
+    /// Full-window mode: the "Exit?" confirmation shown when the user presses
+    /// the root window's close button. Confirming exits the app; cancelling
+    /// keeps the root window (and everything else) open.
+    fn render_root_exit_dialog(&mut self, ctx: &egui::Context) {
+        if !self.root_exit_pending {
+            return;
+        }
+        let mut exit = false;
+        let mut cancel = false;
+        egui::Window::new("Exit?")
+            .id(egui::Id::new("root-exit-dialog"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Exit FloatDea?");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    let exit_button =
+                        egui::Button::new(egui::RichText::new("Exit").color(egui::Color32::WHITE))
+                            .fill(egui::Color32::from_rgb(179, 38, 30));
+                    if ui.add(exit_button).clicked() {
+                        exit = true;
+                    }
+                });
+            });
+        if cancel {
+            self.root_exit_pending = false;
+        }
+        if exit {
+            self.root_exit_pending = false;
+            // Closing the root viewport terminates the app.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// In floating-window mode every dialog carries the root viewport origin,
+    /// so closing a folder window must clear dialogs by their target id.
+    fn clear_dialog_for_folder(&mut self, container_id: &ContainerId) {
+        if self.rename_dialog.pending.as_ref().is_some_and(
+            |target| matches!(target, RenameTarget::Folder { id, .. } if id == container_id),
+        ) {
+            self.rename_dialog.pending = None;
+        }
+        if self.pending_delete.as_ref().is_some_and(|pending| {
+            matches!(&pending.target, ReferenceTarget::Container(id) if id == container_id)
+        }) {
+            self.pending_delete = None;
+        }
+    }
+
     fn process_canvas_commands(&mut self, commands: Vec<CanvasCommand>, origin: egui::ViewportId) {
         for command in commands {
             match command {
@@ -521,9 +592,11 @@ impl HomePage {
                     }
                 }
                 CanvasCommand::CloseFolder(id) => {
-                    let viewport =
-                        egui::ViewportId::from_hash_of(("folder-view", id.as_str()));
+                    let viewport = egui::ViewportId::from_hash_of(("folder-view", id.as_str()));
                     self.clear_rename_for_viewport(viewport);
+                    if self.floating_windows() {
+                        self.clear_dialog_for_folder(&id);
+                    }
                     if self
                         .pending_delete
                         .as_ref()
@@ -803,12 +876,7 @@ impl HomePage {
                     .canvas_for(container)
                     .map(|canvas| canvas.items.as_slice())
                     .unwrap_or(&[]);
-                canvas::default_position_for(
-                    items,
-                    &self.all_snippets,
-                    &self.workspace,
-                    &[],
-                )
+                canvas::default_position_for(items, &self.all_snippets, &self.workspace, &[])
             }
         };
         let target_canvas = if container == &self.root.container_id {
@@ -875,8 +943,7 @@ impl HomePage {
     /// cleared by egui on release) the drag is finalized. Cards whose drop was
     /// not consumed bounce back to their start position.
     fn finalize_drops(&mut self, ctx: &egui::Context) {
-        let payload = egui::DragAndDrop::payload::<DragPayload>(ctx)
-            .map(|arc| (*arc).clone());
+        let payload = egui::DragAndDrop::payload::<DragPayload>(ctx).map(|arc| (*arc).clone());
         let consumed = std::mem::take(&mut self.consumed_drops);
         let mut canvases: Vec<&mut ContainerCanvas> = std::iter::once(&mut self.root)
             .chain(self.folder_views.values_mut())
@@ -896,10 +963,8 @@ impl HomePage {
             }
             let card_present = drag.index < canvas.items.len()
                 && canvas.items[drag.index].reference_id == drag.reference_id;
-            let consumed_here = consumed.contains(&(
-                canvas.container_id.clone(),
-                drag.reference_id.clone(),
-            ));
+            let consumed_here =
+                consumed.contains(&(canvas.container_id.clone(), drag.reference_id.clone()));
             if card_present && !consumed_here {
                 // The drop was not consumed by any canvas: bounce back.
                 canvas.items[drag.index].position = drag.start_position;
@@ -934,8 +999,28 @@ impl App for HomePage {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.apply_theme(ui.ctx());
         let root_viewport = ui.ctx().viewport_id();
+        // In full-window mode all snippet/folder windows float inside the root
+        // viewport, so their dialogs and clipboard entries also carry the root
+        // origin and are rendered at the root level.
+        let floating = self.settings.window_mode == WindowMode::Floating;
+        if floating {
+            // The root `ui` handed to `App::ui` has no background; in full-window
+            // mode nothing else fills the main window (the root box is itself a
+            // floating window), so paint a theme-aware desktop fill instead of
+            // egui's near-black clear color. Light theme → light gray/white,
+            // dark theme → dark gray.
+            ui.painter()
+                .rect_filled(ui.max_rect(), 0.0, ui.visuals().panel_fill);
+        }
         let root_commands = self.render_home_panel(ui);
         self.process_canvas_commands(root_commands, root_viewport);
+        if floating {
+            // Full-window mode: the root window's close button opens an "Exit?"
+            // confirmation (only present in this mode; native mode exits directly).
+            self.render_root_exit_dialog(ui.ctx());
+        } else {
+            self.root_exit_pending = false;
+        }
         self.render_delete_dialog(ui);
         self.render_rename_dialog(ui);
 
@@ -956,16 +1041,30 @@ impl App for HomePage {
             let Some(item) = self.all_snippets.get_mut(&view.entity_id) else {
                 continue;
             };
-            match Self::render_snippet_viewport(
-                ui,
-                view,
-                item,
-                &self.store,
-                &snippet_index,
-                &self.clipboard,
-                &self.math_renderer,
-                &self.settings,
-            ) {
+            let action = if floating {
+                Self::render_snippet_window(
+                    ui,
+                    view,
+                    item,
+                    &self.store,
+                    &snippet_index,
+                    &self.clipboard,
+                    &self.math_renderer,
+                    &self.settings,
+                )
+            } else {
+                Self::render_snippet_viewport(
+                    ui,
+                    view,
+                    item,
+                    &self.store,
+                    &snippet_index,
+                    &self.clipboard,
+                    &self.math_renderer,
+                    &self.settings,
+                )
+            };
+            match action {
                 ViewAction::Close => closed_views.push(view.id),
                 ViewAction::OpenSnippet(id) => open_views.push(id),
                 ViewAction::None => {}
@@ -986,22 +1085,42 @@ impl App for HomePage {
                 .get(container_id)
                 .map(|container| container.title.clone())
                 .unwrap_or_default();
-            let viewport_id =
-                egui::ViewportId::from_hash_of(("folder-view", container_id.as_str()));
-            let commands = Self::render_folder_viewport(
-                ui,
-                canvas,
-                &title,
-                &mut self.workspace,
-                &self.workspace_store,
-                &self.store,
-                &mut self.all_snippets,
-                &mut self.rename_dialog,
-                &mut self.pending_delete,
-                &mut self.clipboard,
-                self.settings.snap_to_grid,
-                self.settings.show_grid,
-            );
+            let commands = if floating {
+                Self::render_folder_window(
+                    ui,
+                    canvas,
+                    &title,
+                    &mut self.workspace,
+                    &self.workspace_store,
+                    &self.store,
+                    &mut self.all_snippets,
+                    &mut self.clipboard,
+                    self.settings.snap_to_grid,
+                    self.settings.show_grid,
+                )
+            } else {
+                Self::render_folder_viewport(
+                    ui,
+                    canvas,
+                    &title,
+                    &mut self.workspace,
+                    &self.workspace_store,
+                    &self.store,
+                    &mut self.all_snippets,
+                    &mut self.rename_dialog,
+                    &mut self.pending_delete,
+                    &mut self.clipboard,
+                    self.settings.snap_to_grid,
+                    self.settings.show_grid,
+                )
+            };
+            let viewport_id = if floating {
+                // All floating windows share the root viewport; dialogs are
+                // rendered at the root level in this mode.
+                egui::ViewportId::ROOT
+            } else {
+                egui::ViewportId::from_hash_of(("folder-view", container_id.as_str()))
+            };
             commands_by_viewport.push((viewport_id, commands));
         }
         for (viewport_id, commands) in commands_by_viewport {
@@ -1276,9 +1395,10 @@ mod tests {
             }],
             egui::ViewportId::ROOT,
         );
-        assert!(page
-            .consumed_drops
-            .contains(&(page.root.container_id.clone(), reference_id)));
+        assert!(
+            page.consumed_drops
+                .contains(&(page.root.container_id.clone(), reference_id))
+        );
         assert_eq!(page.workspace.containers[&folder_id].members.len(), 1);
     }
 
@@ -1397,7 +1517,11 @@ mod tests {
         let viewport_height = 480.0;
         // Snap off → organize lays cards out on the grid with breathing room.
         page.settings.snap_to_grid = false;
-        page.root.organize(&page.workspace_store, viewport_height, page.settings.snap_to_grid);
+        page.root.organize(
+            &page.workspace_store,
+            viewport_height,
+            page.settings.snap_to_grid,
+        );
 
         // Mirror the layout math used by `organize` to derive the expected grid.
         const GRID: f32 = 32.0;
@@ -1416,9 +1540,10 @@ mod tests {
         let rows_per_column = (((viewport_height - MARGIN) / step_y).floor() as usize).max(1);
         // Every organized card corner is exactly on a grid point.
         assert!(
-            page.root.items.iter().all(|item| {
-                item.position[0] % GRID == 0.0 && item.position[1] % GRID == 0.0
-            }),
+            page.root
+                .items
+                .iter()
+                .all(|item| { item.position[0] % GRID == 0.0 && item.position[1] % GRID == 0.0 }),
             "organize always aligns cards to the grid"
         );
 
@@ -1464,7 +1589,11 @@ mod tests {
         let viewport_height = 480.0;
         // Snap on → organize packs densely without gaps.
         page.settings.snap_to_grid = true;
-        page.root.organize(&page.workspace_store, viewport_height, page.settings.snap_to_grid);
+        page.root.organize(
+            &page.workspace_store,
+            viewport_height,
+            page.settings.snap_to_grid,
+        );
 
         // Dense: column pitch = card width, row pitch = tallest card, no gaps.
         const MARGIN: f32 = 32.0;
@@ -1558,10 +1687,12 @@ mod tests {
         // Not the last link → no confirmation dialog, entity untouched.
         assert!(page.pending_delete.is_none());
         assert_eq!(page.root.items.len(), root_count - 1);
-        assert!(page.folder_views[&folder_id]
-            .items
-            .iter()
-            .any(|item| item.target == ReferenceTarget::Snippet(entity_id.clone())));
+        assert!(
+            page.folder_views[&folder_id]
+                .items
+                .iter()
+                .any(|item| item.target == ReferenceTarget::Snippet(entity_id.clone()))
+        );
         assert!(page.all_snippets.contains_key(&entity_id));
     }
 
@@ -1625,6 +1756,8 @@ mod tests {
                 &mut page.clipboard,
                 page.settings.snap_to_grid,
                 page.settings.show_grid,
+                true,
+                false,
             );
             canvas::create_text(&mut page.root, &mut data, [24.0, 36.0]);
 
@@ -1653,6 +1786,8 @@ mod tests {
                 &mut page.clipboard,
                 page.settings.snap_to_grid,
                 page.settings.show_grid,
+                true,
+                false,
             );
             canvas::create_text(&mut page.root, &mut data, [24.0, 24.0]);
             let text_id = page.root.texts[0].id.clone();

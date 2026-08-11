@@ -2,7 +2,8 @@ mod app;
 
 use std::{collections::BTreeMap, fs, path::PathBuf, sync::Arc};
 
-use app::HomePage;
+use app::{FLOATING_MAIN_SIZE, HomePage, ROOT_CANVAS_SIZE};
+use floatdea::data::settings::{SettingsStore, WindowMode};
 use system_fonts::{FontPreset, FontStyle, FoundFont, FoundFontSource};
 
 fn read_font(font: FoundFont) -> Option<(String, Arc<egui::FontData>)> {
@@ -113,8 +114,18 @@ fn main() -> eframe::Result {
         .map(PathBuf::from)
         .unwrap_or_else(default_workspace);
 
+    // In full-window mode the main window opens larger to leave room for the
+    // floating snippet/folder windows; the root canvas itself stays 640×480.
+    let window_mode = SettingsStore::open(&workspace)
+        .map(|store| store.load().window_mode)
+        .unwrap_or_default();
+    let initial_size = if window_mode == WindowMode::Floating {
+        FLOATING_MAIN_SIZE
+    } else {
+        ROOT_CANVAS_SIZE
+    };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([640., 480.]),
+        viewport: egui::ViewportBuilder::default().with_inner_size(initial_size),
         ..Default::default()
     };
 

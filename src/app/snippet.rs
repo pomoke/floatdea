@@ -264,8 +264,9 @@ impl HomePage {
             ui.colored_label(ui.visuals().warn_fg_color, format!("invalid embed: {dest}"));
             return;
         };
-        let Some((_, _, content)) =
-            snippet_index.iter().find(|(existing, _, _)| existing == &id)
+        let Some((_, _, content)) = snippet_index
+            .iter()
+            .find(|(existing, _, _)| existing == &id)
         else {
             ui.colored_label(ui.visuals().warn_fg_color, format!("missing page: {dest}"));
             return;
@@ -357,8 +358,7 @@ impl HomePage {
                 ui.separator();
                 // The list scrolls and fits the viewport instead of growing
                 // the window without bounds.
-                let list_height =
-                    (ui.ctx().viewport_rect().height() - 130.0).clamp(80.0, 300.0);
+                let list_height = (ui.ctx().viewport_rect().height() - 130.0).clamp(80.0, 300.0);
                 egui::ScrollArea::vertical()
                     .id_salt(("insert-link-list", view.id))
                     .max_height(list_height)
@@ -434,121 +434,185 @@ impl HomePage {
                 })
                 .with_inner_size([480.0, 320.0]),
             |child_ui, _| {
-                let mut action = ViewAction::None;
-                let panel = egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::new()
-                            .inner_margin(egui::Margin::same(16))
-                            .fill(child_ui.visuals().panel_fill),
-                    )
-                    .show(child_ui, |ui| {
-                        egui::Frame::new()
-                            .inner_margin(egui::Margin::same(12))
-                            .show(ui, |ui| match view.mode {
-                                ViewMode::Preview => {
-                                    let pane_rect = ui.available_rect_before_wrap();
-                                    egui::ScrollArea::vertical()
-                                        .id_salt(("preview-scroll", view.id))
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            if let Some(id) = Self::render_markdown_preview(
-                                                ui,
-                                                view,
-                                                snippet,
-                                                pane_rect,
-                                                snippet_index,
-                                                math_renderer,
-                                                settings,
-                                            ) {
-                                                action = ViewAction::OpenSnippet(id);
-                                            }
-                                        });
-                                }
-                                ViewMode::Source => {
-                                    let pane_rect = ui.available_rect_before_wrap();
-                                    egui::ScrollArea::vertical()
-                                        .id_salt(("source-scroll", view.id))
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            Self::render_snippet_content(
-                                                ui,
-                                                view,
-                                                snippet,
-                                                store,
-                                                pane_rect,
-                                                snippet_index,
-                                                clipboard,
-                                            );
-                                        });
-                                }
-                            });
-                    });
-
-                // Cross-window drag & drop: a card dragged from a canvas and
-                // released over this note inserts a reference link at the
-                // editor cursor (or appends when there is no editor cursor).
-                let ctx = child_ui.ctx();
-                let drop_payload = egui::DragAndDrop::payload::<DragPayload>(ctx)
-                    .map(|payload| (*payload).clone());
-                if let Some(DragPayload::Reference {
-                    target: ReferenceTarget::Snippet(target_id),
-                    ..
-                }) = &drop_payload
-                    && ctx.input(|input| input.pointer.primary_released())
-                    && ctx
-                        .input(|input| input.pointer.interact_pos())
-                        .is_some_and(|pos| panel.response.rect.contains(pos))
-                {
-                    if let Some((_, title, _)) =
-                        snippet_index.iter().find(|(id, _, _)| id == target_id)
-                    {
-                        let cursor = egui::TextEdit::load_state(
-                            ctx,
-                            egui::Id::new(("snippet-content", view.id)),
-                        )
-                        .and_then(|state| state.cursor.char_range())
-                        .map(|range| range.primary.index.0)
-                        .unwrap_or_else(|| snippet.content.chars().count());
-                        insert_markdown_link(&mut snippet.content, cursor, title, target_id);
-                        let _ = store.save(snippet);
-                        ctx.request_repaint();
-                    }
-                    egui::DragAndDrop::clear_payload(ctx);
-                }
-
-                // Broken-link click errors float as a toast (like the
-                // clipboard status), auto-dismissed after a short while.
-                let mut dismiss_error = false;
-                if let Some((message, frames)) = &mut view.link_error {
-                    *frames = frames.saturating_sub(1);
-                    if *frames == 0 {
-                        dismiss_error = true;
-                    } else {
-                        egui::Window::new("link-error")
-                            .id(egui::Id::new(("snippet-link-error", view.id)))
-                            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
-                            .collapsible(false)
-                            .resizable(false)
-                            .title_bar(false)
-                            .show(ctx, |ui| {
-                                ui.colored_label(ui.visuals().error_fg_color, message.as_str());
-                            });
-                    }
-                }
-                if dismiss_error {
-                    view.link_error = None;
-                }
-
-                // The right-click view-mode menu floats above the content.
-                Self::render_view_mode_menu(ctx, view);
-                // The "Insert Link…" picker window.
-                Self::render_link_picker(ctx, view, snippet, store, snippet_index);
+                let mut action = Self::render_snippet_panel(
+                    child_ui,
+                    view,
+                    snippet,
+                    store,
+                    snippet_index,
+                    clipboard,
+                    math_renderer,
+                    settings,
+                );
                 if child_ui.input(|input| input.viewport().close_requested()) {
                     action = ViewAction::Close;
                 }
                 action
             },
         )
+    }
+
+    /// Renders a snippet as a floating window inside the main window (full-window
+    /// mode). Same content as [`Self::render_snippet_viewport`].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn render_snippet_window(
+        ui: &mut egui::Ui,
+        view: &mut View,
+        snippet: &mut Snippet,
+        store: &SnippetStore,
+        snippet_index: &[(EntityId, String, String)],
+        clipboard: &Option<ClipboardEntry>,
+        math_renderer: &MathRenderer,
+        settings: &Settings,
+    ) -> ViewAction {
+        let mut open = true;
+        egui::Window::new(if view.mode.is_editing() {
+            format!("[Edit] {} - FloatDea", snippet.title)
+        } else {
+            format!("{} - FloatDea", snippet.title)
+        })
+        .id(egui::Id::new(("snippet-window", view.id)))
+        .open(&mut open)
+        .default_size([480.0, 320.0])
+        .show(ui.ctx(), |ui| {
+            Self::render_snippet_panel(
+                ui,
+                view,
+                snippet,
+                store,
+                snippet_index,
+                clipboard,
+                math_renderer,
+                settings,
+            );
+        });
+        if open {
+            ViewAction::None
+        } else {
+            ViewAction::Close
+        }
+    }
+
+    /// The body shared by the native snippet viewport and the floating snippet
+    /// window: the content panel, cross-window drop target, error toast,
+    /// view-mode menu, and "Insert Link…" picker.
+    #[allow(clippy::too_many_arguments)]
+    fn render_snippet_panel(
+        ui: &mut egui::Ui,
+        view: &mut View,
+        snippet: &mut Snippet,
+        store: &SnippetStore,
+        snippet_index: &[(EntityId, String, String)],
+        clipboard: &Option<ClipboardEntry>,
+        math_renderer: &MathRenderer,
+        settings: &Settings,
+    ) -> ViewAction {
+        let mut action = ViewAction::None;
+        let panel = egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::same(16))
+                    .fill(ui.visuals().panel_fill),
+            )
+            .show(ui, |ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| match view.mode {
+                        ViewMode::Preview => {
+                            let pane_rect = ui.available_rect_before_wrap();
+                            egui::ScrollArea::vertical()
+                                .id_salt(("preview-scroll", view.id))
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    if let Some(id) = Self::render_markdown_preview(
+                                        ui,
+                                        view,
+                                        snippet,
+                                        pane_rect,
+                                        snippet_index,
+                                        math_renderer,
+                                        settings,
+                                    ) {
+                                        action = ViewAction::OpenSnippet(id);
+                                    }
+                                });
+                        }
+                        ViewMode::Source => {
+                            let pane_rect = ui.available_rect_before_wrap();
+                            egui::ScrollArea::vertical()
+                                .id_salt(("source-scroll", view.id))
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    Self::render_snippet_content(
+                                        ui,
+                                        view,
+                                        snippet,
+                                        store,
+                                        pane_rect,
+                                        snippet_index,
+                                        clipboard,
+                                    );
+                                });
+                        }
+                    });
+            });
+
+        // Cross-window drag & drop: a card dragged from a canvas and
+        // released over this note inserts a reference link at the
+        // editor cursor (or appends when there is no editor cursor).
+        let ctx = ui.ctx();
+        let drop_payload =
+            egui::DragAndDrop::payload::<DragPayload>(ctx).map(|payload| (*payload).clone());
+        if let Some(DragPayload::Reference {
+            target: ReferenceTarget::Snippet(target_id),
+            ..
+        }) = &drop_payload
+            && ctx.input(|input| input.pointer.primary_released())
+            && ctx
+                .input(|input| input.pointer.interact_pos())
+                .is_some_and(|pos| panel.response.rect.contains(pos))
+        {
+            if let Some((_, title, _)) = snippet_index.iter().find(|(id, _, _)| id == target_id) {
+                let cursor =
+                    egui::TextEdit::load_state(ctx, egui::Id::new(("snippet-content", view.id)))
+                        .and_then(|state| state.cursor.char_range())
+                        .map(|range| range.primary.index.0)
+                        .unwrap_or_else(|| snippet.content.chars().count());
+                insert_markdown_link(&mut snippet.content, cursor, title, target_id);
+                let _ = store.save(snippet);
+                ctx.request_repaint();
+            }
+            egui::DragAndDrop::clear_payload(ctx);
+        }
+
+        // Broken-link click errors float as a toast (like the
+        // clipboard status), auto-dismissed after a short while.
+        let mut dismiss_error = false;
+        if let Some((message, frames)) = &mut view.link_error {
+            *frames = frames.saturating_sub(1);
+            if *frames == 0 {
+                dismiss_error = true;
+            } else {
+                egui::Window::new("link-error")
+                    .id(egui::Id::new(("snippet-link-error", view.id)))
+                    .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
+                    .collapsible(false)
+                    .resizable(false)
+                    .title_bar(false)
+                    .show(ctx, |ui| {
+                        ui.colored_label(ui.visuals().error_fg_color, message.as_str());
+                    });
+            }
+        }
+        if dismiss_error {
+            view.link_error = None;
+        }
+
+        // The right-click view-mode menu floats above the content.
+        Self::render_view_mode_menu(ctx, view);
+        // The "Insert Link…" picker window.
+        Self::render_link_picker(ctx, view, snippet, store, snippet_index);
+        action
     }
 }
 
@@ -747,8 +811,7 @@ mod tests {
 
     #[test]
     fn parses_snippet_link_id_from_filename() {
-        let id = parse_snippet_link("my note--0123456789abcdef0123.md")
-            .expect("link should parse");
+        let id = parse_snippet_link("my note--0123456789abcdef0123.md").expect("link should parse");
         assert_eq!(id.as_str(), "0123456789abcdef0123");
         // Titles may contain `--`: the trailing segment wins.
         let id = parse_snippet_link("a--b--0123456789abcdef0123.md").unwrap();
