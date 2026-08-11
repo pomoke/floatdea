@@ -36,6 +36,12 @@ pub struct Settings {
     /// line (MathJax SVG metrics render larger than egui text).
     #[serde(default = "default_math_cap_scale")]
     pub math_cap_scale: f32,
+    /// Snap dragged cards to the 32 pt canvas grid.
+    #[serde(default = "default_snap_to_grid")]
+    pub snap_to_grid: bool,
+    /// Draw the 32 pt dot grid on every canvas.
+    #[serde(default = "default_show_grid")]
+    pub show_grid: bool,
 }
 
 impl Default for Settings {
@@ -45,6 +51,8 @@ impl Default for Settings {
             theme: ThemeSetting::default(),
             preview_font_size: default_preview_font_size(),
             math_cap_scale: default_math_cap_scale(),
+            snap_to_grid: default_snap_to_grid(),
+            show_grid: default_show_grid(),
         }
     }
 }
@@ -55,6 +63,14 @@ fn default_preview_font_size() -> f32 {
 
 fn default_math_cap_scale() -> f32 {
     1.15
+}
+
+fn default_snap_to_grid() -> bool {
+    true
+}
+
+fn default_show_grid() -> bool {
+    true
 }
 
 /// Loads and saves [`Settings`] atomically. Missing or corrupt files fall back
@@ -140,6 +156,8 @@ mod tests {
             theme: ThemeSetting::Dark,
             preview_font_size: 18.0,
             math_cap_scale: 1.4,
+            snap_to_grid: false,
+            show_grid: false,
             ..Settings::default()
         };
         store.save(&settings).unwrap();
@@ -168,5 +186,7 @@ mod tests {
         assert_eq!(loaded.theme, ThemeSetting::Light);
         assert_eq!(loaded.preview_font_size, default_preview_font_size());
         assert_eq!(loaded.math_cap_scale, default_math_cap_scale());
+        assert!(loaded.snap_to_grid, "new fields default when missing");
+        assert!(loaded.show_grid, "new fields default when missing");
     }
 }

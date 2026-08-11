@@ -73,6 +73,22 @@ impl HomePage {
                     changed = true;
                 }
 
+                ui.add_space(10.0);
+                if ui
+                    .checkbox(&mut self.settings.snap_to_grid, "Snap dragged cards to grid")
+                    .on_hover_text("Cards align to the 32 pt canvas grid while dragging")
+                    .changed()
+                {
+                    changed = true;
+                }
+                if ui
+                    .checkbox(&mut self.settings.show_grid, "Show canvas grid")
+                    .on_hover_text("Draw the 32 pt dot grid on every canvas")
+                    .changed()
+                {
+                    changed = true;
+                }
+
                 ui.add_space(16.0);
                 ui.separator();
                 ui.label(format!("FloatDea {}", env!("CARGO_PKG_VERSION")));

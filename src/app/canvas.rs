@@ -6,6 +6,10 @@ pub(super) struct CanvasData<'a> {
     workspace_store: &'a WorkspaceStore,
     snippet_store: &'a SnippetStore,
     clipboard: &'a mut Option<ClipboardEntry>,
+    /// Snap dragged cards and drop positions to the canvas grid (from settings).
+    snap_to_grid: bool,
+    /// Whether the dot grid is drawn on the canvas (from settings).
+    show_grid: bool,
 }
 
 impl<'a> CanvasData<'a> {
@@ -15,6 +19,8 @@ impl<'a> CanvasData<'a> {
         workspace_store: &'a WorkspaceStore,
         snippet_store: &'a SnippetStore,
         clipboard: &'a mut Option<ClipboardEntry>,
+        snap_to_grid: bool,
+        show_grid: bool,
     ) -> Self {
         Self {
             snippets,
@@ -22,6 +28,8 @@ impl<'a> CanvasData<'a> {
             workspace_store,
             snippet_store,
             clipboard,
+            snap_to_grid,
+            show_grid,
         }
     }
 }
@@ -71,6 +79,8 @@ impl HomePage {
             &self.workspace_store,
             &self.store,
             &mut self.clipboard,
+            self.settings.snap_to_grid,
+            self.settings.show_grid,
         );
         Self::render_canvas_panel(ui, &mut self.root, &mut data)
     }
@@ -290,6 +300,8 @@ impl HomePage {
         rename_dialog: &mut RenameDialogState,
         pending_delete: &mut Option<PendingDelete>,
         clipboard: &mut Option<ClipboardEntry>,
+        snap_to_grid: bool,
+        show_grid: bool,
     ) -> Vec<CanvasCommand> {
         let container_id = canvas.container_id.clone();
         ui.show_viewport_immediate(
@@ -298,8 +310,15 @@ impl HomePage {
                 .with_title(format!("{title} - FloatDea"))
                 .with_inner_size([640.0, 480.0]),
             |child_ui, _| {
-                let mut data =
-                    CanvasData::new(snippets, workspace, workspace_store, snippet_store, clipboard);
+                let mut data = CanvasData::new(
+                    snippets,
+                    workspace,
+                    workspace_store,
+                    snippet_store,
+                    clipboard,
+                    snap_to_grid,
+                    show_grid,
+                );
                 let mut commands = Self::render_canvas_panel(child_ui, canvas, &mut data);
                 if child_ui.input(|input| input.viewport().close_requested()) {
                     commands.push(CanvasCommand::CloseFolder(container_id.clone()));
@@ -402,11 +421,13 @@ impl HomePage {
         let painter = ui.painter();
 
         painter.rect_filled(canvas_rect, 0.0, ui.visuals().panel_fill);
-        paint_grid(
-            painter,
-            canvas_rect,
-            ui.visuals().weak_text_color().gamma_multiply(0.12),
-        );
+        if data.show_grid {
+            paint_grid(
+                painter,
+                canvas_rect,
+                ui.visuals().weak_text_color().gamma_multiply(0.7),
+            );
+        }
 
         let pointer_pos = ui.input(|input| input.pointer.interact_pos());
         // A card drag in any canvas publishes an egui drag-and-drop payload;
@@ -557,11 +578,17 @@ impl HomePage {
             // every drop/paste guard rejects `ReferenceTarget::Special`, so no
             // other canvas can ever accept their payload.
             if response.drag_started() {
+                // Remember where the cursor grabbed the card so it stays glued
+                // to the pointer while dragging (smooth in free and snap modes).
+                let grab_offset = pointer_pos
+                    .map(|pointer| pointer - rect.min)
+                    .unwrap_or_default();
                 canvas.dragging = Some(DragState {
                     index,
                     start_position: canvas.items[index].position,
                     invalid: false,
                     reference_id: reference_id.clone(),
+                    grab_offset,
                 });
                 // Publish the drag to egui's shared payload so other canvases
                 // (other windows) can act as drop targets.
@@ -580,7 +607,7 @@ impl HomePage {
                 .is_some_and(|drag| drag.index == index)
                 && response.dragged()
             {
-                dragged = Some((index, ui.input(|input| input.pointer.delta())));
+                dragged = Some(index);
                 // Refresh the payload so it stays alive while dragging.
                 egui::DragAndDrop::set_payload(
                     ui.ctx(),
@@ -617,13 +644,33 @@ impl HomePage {
             }
         }
 
-        if let Some((index, delta)) = dragged {
-            let item = &mut canvas.items[index];
-            item.position[0] = (item.position[0] + delta.x).max(0.0);
-            item.position[1] = (item.position[1] + delta.y).max(0.0);
+        if let Some(index) = dragged {
+            // Follow the pointer exactly (grab offset preserved), then snap the
+            // target to the grid when enabled. Tracking the pointer instead of
+            // accumulating per-frame deltas avoids the dead-zone/jump feel that
+            // comes from snapping an already-snapped position every frame.
+            if let Some(pointer) = pointer_pos {
+                let grab_offset = canvas
+                    .dragging
+                    .as_ref()
+                    .map(|drag| drag.grab_offset)
+                    .unwrap_or_default();
+                let mut target = [
+                    pointer.x - grab_offset.x - canvas_rect.min.x,
+                    pointer.y - grab_offset.y - canvas_rect.min.y,
+                ];
+                target[0] = target[0].max(0.0);
+                target[1] = target[1].max(0.0);
+                let item = &mut canvas.items[index];
+                item.position = if data.snap_to_grid {
+                    snap_position(target)
+                } else {
+                    target
+                };
+            }
             let rect = egui::Rect::from_min_size(
-                egui::pos2(item.position[0], item.position[1]),
-                item.size,
+                egui::pos2(canvas.items[index].position[0], canvas.items[index].position[1]),
+                canvas.items[index].size,
             );
             // While hovering a valid folder drop target, that folder card is
             // excluded from the overlap check so the drop is not rejected.
@@ -735,10 +782,15 @@ impl HomePage {
             // Drop on the empty area of a *different* canvas.
             else if canvas_drop_valid && ui.input(|input| input.pointer.primary_released()) {
                 let position = pointer_pos.map(|pointer| {
-                    [
+                    let position = [
                         (pointer.x - canvas_rect.min.x).max(0.0),
                         (pointer.y - canvas_rect.min.y).max(0.0),
-                    ]
+                    ];
+                    if data.snap_to_grid {
+                        snap_position(position)
+                    } else {
+                        position
+                    }
                 });
                 commands.push(CanvasCommand::DropOnCanvas {
                     container: canvas.container_id.clone(),
@@ -828,7 +880,9 @@ impl HomePage {
                     ui.close();
                 }
                 if ui.button("Organize").clicked() {
-                    canvas.organize(data.workspace_store, available.y);
+                    // Follows the snap-to-grid setting: on → dense packing
+                    // without gaps, off → grid-aligned with breathing room.
+                    canvas.organize(data.workspace_store, available.y, data.snap_to_grid);
                     ui.close();
                 }
             });
@@ -1184,17 +1238,39 @@ fn render_clipboard_status(ui: &mut egui::Ui, data: &mut CanvasData<'_>) {
     }
 }
 
+/// Paints a dot grid: minor dots every cell and slightly larger, stronger dots
+/// every fifth cell, so the canvas reads as a structured work surface. The
+/// base `color` is used for major intersections; minor dots are derived from it.
 fn paint_grid(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     const STEP: f32 = 32.0;
-    let mut y = rect.min.y + STEP;
+    const MAJOR_EVERY: i32 = 5;
+    let minor_color = color.gamma_multiply(0.65);
+    let (mut row, mut y) = (1, rect.min.y + STEP);
     while y < rect.max.y {
-        let mut x = rect.min.x + STEP;
+        let (mut col, mut x) = (1, rect.min.x + STEP);
         while x < rect.max.x {
-            painter.circle_filled(egui::pos2(x, y), 1.0, color);
+            let major = col % MAJOR_EVERY == 0 && row % MAJOR_EVERY == 0;
+            let (radius, dot_color) = if major {
+                (1.8, color)
+            } else {
+                (1.1, minor_color)
+            };
+            painter.circle_filled(egui::pos2(x, y), radius, dot_color);
+            col += 1;
             x += STEP;
         }
+        row += 1;
         y += STEP;
     }
+}
+
+/// Rounds a canvas position to the nearest 32 pt grid point.
+pub(super) fn snap_position(position: [f32; 2]) -> [f32; 2] {
+    const STEP: f32 = 32.0;
+    [
+        (position[0] / STEP).round() * STEP,
+        (position[1] / STEP).round() * STEP,
+    ]
 }
 
 fn layout_title(

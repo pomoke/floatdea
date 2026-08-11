@@ -204,6 +204,10 @@ struct DragState {
     /// Identity of the dragged reference; used to match the egui
     /// drag-and-drop payload and to resolve the card safely at frame end.
     reference_id: ReferenceId,
+    /// Pointer offset from the card's top-left at grab time. The card follows
+    /// the cursor by this offset, so dragging feels glued to the pointer
+    /// (smooth in both free and grid-snap modes).
+    grab_offset: egui::Vec2,
 }
 
 #[derive(Debug)]
@@ -286,9 +290,15 @@ impl ContainerCanvas {
     /// of rows per column is chosen so a column fits within `viewport_height`
     /// (the visible canvas height); when there are more cards than that, the
     /// layout overflows horizontally into the scroll area.
-    fn organize(&mut self, store: &WorkspaceStore, viewport_height: f32) {
-        const MARGIN: f32 = 24.0;
-        const STEP_X: f32 = CARD_WIDTH + 24.0;
+    ///
+    /// The layout **follows the `snap_to_grid` setting**: when snapped, cards
+    /// are packed densely **without gaps** (column pitch = card width, row
+    /// pitch = the tallest card); otherwise they are aligned to the 32 pt
+    /// canvas grid with breathing room.
+    fn organize(&mut self, store: &WorkspaceStore, viewport_height: f32, snap_to_grid: bool) {
+        const GRID: f32 = 32.0;
+        // On-grid origin: every card corner lands on a grid point.
+        const MARGIN: f32 = GRID;
         const GAP_Y: f32 = 12.0;
         const MIN_CARD_HEIGHT: f32 = 25.0;
 
@@ -298,7 +308,16 @@ impl ContainerCanvas {
             .map(|item| item.size.y)
             .fold(MIN_CARD_HEIGHT, f32::max)
             .max(MIN_CARD_HEIGHT);
-        let step_y = max_height + GAP_Y;
+        let (step_x, step_y) = if snap_to_grid {
+            // Dense: cards touch; no gaps at all.
+            (CARD_WIDTH, max_height)
+        } else {
+            // Grid-aligned: fixed on-grid column pitch; round the row pitch up
+            // to whole grid cells so every row sits on-grid, with gaps.
+            let step_x = 6.0 * GRID;
+            let step_y = ((max_height + GAP_Y) / GRID).ceil() * GRID;
+            (step_x, step_y)
+        };
         let rows_per_column = if viewport_height <= MARGIN {
             1
         } else {
@@ -308,7 +327,7 @@ impl ContainerCanvas {
             let column = index / rows_per_column;
             let row = index % rows_per_column;
             item.position = [
-                MARGIN + column as f32 * STEP_X,
+                MARGIN + column as f32 * step_x,
                 MARGIN + row as f32 * step_y,
             ];
         }
@@ -980,6 +999,8 @@ impl App for HomePage {
                 &mut self.rename_dialog,
                 &mut self.pending_delete,
                 &mut self.clipboard,
+                self.settings.snap_to_grid,
+                self.settings.show_grid,
             );
             commands_by_viewport.push((viewport_id, commands));
         }
@@ -1374,11 +1395,14 @@ mod tests {
             item.position = [1000.0 + index as f32, 1000.0];
         }
         let viewport_height = 480.0;
-        page.root.organize(&page.workspace_store, viewport_height);
+        // Snap off → organize lays cards out on the grid with breathing room.
+        page.settings.snap_to_grid = false;
+        page.root.organize(&page.workspace_store, viewport_height, page.settings.snap_to_grid);
 
         // Mirror the layout math used by `organize` to derive the expected grid.
-        const MARGIN: f32 = 24.0;
-        const STEP_X: f32 = CARD_WIDTH + 24.0;
+        const GRID: f32 = 32.0;
+        const MARGIN: f32 = GRID;
+        const STEP_X: f32 = 6.0 * GRID;
         const GAP_Y: f32 = 12.0;
         const MIN_CARD_HEIGHT: f32 = 25.0;
         let max_height = page
@@ -1388,8 +1412,15 @@ mod tests {
             .map(|item| item.size.y)
             .fold(MIN_CARD_HEIGHT, f32::max)
             .max(MIN_CARD_HEIGHT);
-        let step_y = max_height + GAP_Y;
+        let step_y = ((max_height + GAP_Y) / GRID).ceil() * GRID;
         let rows_per_column = (((viewport_height - MARGIN) / step_y).floor() as usize).max(1);
+        // Every organized card corner is exactly on a grid point.
+        assert!(
+            page.root.items.iter().all(|item| {
+                item.position[0] % GRID == 0.0 && item.position[1] % GRID == 0.0
+            }),
+            "organize always aligns cards to the grid"
+        );
 
         for (index, item) in page.root.items.iter().enumerate() {
             let column = index / rows_per_column;
@@ -1420,6 +1451,62 @@ mod tests {
                     MARGIN + row as f32 * step_y
                 ]
             );
+        }
+    }
+
+    #[test]
+    fn organize_dense_packs_cards_without_gaps() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        for (index, item) in page.root.items.iter_mut().enumerate() {
+            item.position = [1000.0 + index as f32, 1000.0];
+        }
+        let viewport_height = 480.0;
+        // Snap on → organize packs densely without gaps.
+        page.settings.snap_to_grid = true;
+        page.root.organize(&page.workspace_store, viewport_height, page.settings.snap_to_grid);
+
+        // Dense: column pitch = card width, row pitch = tallest card, no gaps.
+        const MARGIN: f32 = 32.0;
+        let max_height = page
+            .root
+            .items
+            .iter()
+            .map(|item| item.size.y)
+            .fold(25.0, f32::max)
+            .max(25.0);
+        let rows_per_column = (((viewport_height - MARGIN) / max_height).floor() as usize).max(1);
+        for (index, item) in page.root.items.iter().enumerate() {
+            let column = index / rows_per_column;
+            let row = index % rows_per_column;
+            assert_eq!(
+                item.position,
+                [
+                    MARGIN + column as f32 * CARD_WIDTH,
+                    MARGIN + row as f32 * max_height
+                ]
+            );
+        }
+        // Adjacent cards touch: vertical gap within a column and horizontal gap
+        // across columns are both zero. Column-major order means items i and
+        // i+1 share a column; items i and i+rows_per_column share a row.
+        for i in 0..page.root.items.len() {
+            if (i + 1) % rows_per_column != 0 && i + 1 < page.root.items.len() {
+                let top = &page.root.items[i];
+                let bottom = &page.root.items[i + 1];
+                assert!(
+                    (top.position[1] + max_height - bottom.position[1]).abs() < 0.01,
+                    "dense rows touch vertically"
+                );
+            }
+            if i + rows_per_column < page.root.items.len() {
+                let left = &page.root.items[i];
+                let right = &page.root.items[i + rows_per_column];
+                assert!(
+                    (left.position[0] + CARD_WIDTH - right.position[0]).abs() < 0.01,
+                    "dense columns touch horizontally"
+                );
+            }
         }
     }
 
@@ -1536,6 +1623,8 @@ mod tests {
                 &page.workspace_store,
                 &page.store,
                 &mut page.clipboard,
+                page.settings.snap_to_grid,
+                page.settings.show_grid,
             );
             canvas::create_text(&mut page.root, &mut data, [24.0, 36.0]);
 
@@ -1562,6 +1651,8 @@ mod tests {
                 &page.workspace_store,
                 &page.store,
                 &mut page.clipboard,
+                page.settings.snap_to_grid,
+                page.settings.show_grid,
             );
             canvas::create_text(&mut page.root, &mut data, [24.0, 24.0]);
             let text_id = page.root.texts[0].id.clone();
@@ -1575,5 +1666,12 @@ mod tests {
 
         let reloaded = HomePage::new(&folder.0);
         assert!(reloaded.root.texts.is_empty());
+    }
+
+    #[test]
+    fn snaps_positions_to_the_nearest_grid_point() {
+        assert_eq!(canvas::snap_position([25.0, 47.0]), [32.0, 32.0]);
+        assert_eq!(canvas::snap_position([63.0, 49.0]), [64.0, 64.0]);
+        assert_eq!(canvas::snap_position([32.0, 96.0]), [32.0, 96.0]);
     }
 }
