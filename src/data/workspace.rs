@@ -6,10 +6,45 @@ use std::{
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use super::{ContainerId, EntityId, ReferenceId, Snippet, TextId};
+use super::{ContainerId, ConversationId, EntityId, ReferenceId, Snippet, TextId};
 
 const WORKSPACE_VERSION: u32 = 1;
 const LAYOUT_VERSION: u32 = 1;
+
+/// The kind of a container. Ordinary containers and AI workspaces share the
+/// same canvas/layout/reference machinery; the kind only selects AI-specific
+/// member roles and the per-box AI sidecar store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerKind {
+    /// A regular knowledge container.
+    #[default]
+    Normal,
+    /// An AI workspace: a bounded workbench whose linked members are read-only
+    /// sources, conversation cards, and user-confirmed outputs.
+    AiWorkspace,
+}
+
+/// The role a member reference plays inside an AI workspace. Roles are
+/// meaningful only inside AI boxes; ordinary containers always use `Normal`.
+/// Roles are stored explicitly so card visuals, context menus and permissions
+/// never depend on guessing from titles, colors or filenames.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberRole {
+    #[default]
+    Normal,
+    /// A linked, read-only context source inside an AI box. The AI box never
+    /// holds the source entity's lifecycle: removal is always an unlink.
+    Source,
+    /// A user-confirmed AI answer saved as a regular snippet.
+    Output,
+    /// A conversation card inside an AI box (sidecar state, not Markdown).
+    Conversation,
+    /// A transient, unsaved AI result (reserved; draft cards are not yet
+    /// rendered on the canvas).
+    Draft,
+}
 
 /// A built-in, system-owned special item. Instances are permanent in their
 /// container: they can be dragged around but never deleted or linked.
@@ -35,6 +70,11 @@ pub enum ReferenceTarget {
     Snippet(EntityId),
     Container(ContainerId),
     Special(SpecialKind),
+    /// A conversation card inside an AI workspace. The conversation's actual
+    /// state (title, messages, source bindings) lives in the AI sidecar store
+    /// keyed by `ConversationId`; the card itself is a plain member reference
+    /// so it reuses the existing canvas/layout persistence.
+    Conversation(ConversationId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +85,10 @@ pub struct Reference {
     pub alias: Option<String>,
     #[serde(default)]
     pub presentation: ReferencePresentation,
+    /// The role this reference plays inside an AI workspace. Defaults to
+    /// `Normal` so older workspace files keep loading unchanged.
+    #[serde(default)]
+    pub role: MemberRole,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +103,8 @@ pub enum ReferencePresentation {
 pub struct Container {
     pub id: ContainerId,
     pub title: String,
+    #[serde(default)]
+    pub kind: ContainerKind,
     #[serde(default)]
     pub members: Vec<Reference>,
 }
@@ -76,6 +122,7 @@ impl Workspace {
         let container = Container {
             id: root.clone(),
             title: "Home".to_owned(),
+            kind: ContainerKind::Normal,
             members: Vec::new(),
         };
         Self {
@@ -98,10 +145,71 @@ impl Workspace {
             Container {
                 id: id.clone(),
                 title: title.into(),
+                kind: ContainerKind::Normal,
                 members: Vec::new(),
             },
         );
         id
+    }
+
+    /// Creates a new AI workspace container. AI boxes are ordinary containers
+    /// with `ContainerKind::AiWorkspace`; the workspace may hold zero or more.
+    pub fn create_ai_box(&mut self, title: impl Into<String>) -> ContainerId {
+        let id = ContainerId::new();
+        self.containers.insert(
+            id.clone(),
+            Container {
+                id: id.clone(),
+                title: title.into(),
+                kind: ContainerKind::AiWorkspace,
+                members: Vec::new(),
+            },
+        );
+        id
+    }
+
+    /// Whether `container` exists and is an AI workspace.
+    pub fn is_ai_box(&self, container: &ContainerId) -> bool {
+        self.containers
+            .get(container)
+            .is_some_and(|container| container.kind == ContainerKind::AiWorkspace)
+    }
+
+    /// Adds a member marked as a read-only `Source` role (AI box context).
+    pub fn add_source_reference(
+        &mut self,
+        container: &ContainerId,
+        target: ReferenceTarget,
+    ) -> io::Result<ReferenceId> {
+        self.add_reference_with_role(container, target, MemberRole::Source)
+    }
+
+    /// Adds a `Conversation` card to an AI box. The conversation's sidecar data
+    /// must be created by the AI store before the card is visible.
+    pub fn add_conversation_card(
+        &mut self,
+        container: &ContainerId,
+        conversation: ConversationId,
+    ) -> io::Result<ReferenceId> {
+        self.add_reference_with_role(
+            container,
+            ReferenceTarget::Conversation(conversation),
+            MemberRole::Conversation,
+        )
+    }
+
+    /// Adds an `Output` reference to an AI box, pointing at a regular snippet
+    /// created by "Save as Snippet".
+    pub fn add_output_reference(
+        &mut self,
+        container: &ContainerId,
+        entity: EntityId,
+    ) -> io::Result<ReferenceId> {
+        self.add_reference_with_role(
+            container,
+            ReferenceTarget::Snippet(entity),
+            MemberRole::Output,
+        )
     }
 
     pub fn add_snippet_reference(
@@ -189,6 +297,15 @@ impl Workspace {
         container: &ContainerId,
         target: ReferenceTarget,
     ) -> io::Result<ReferenceId> {
+        self.add_reference_with_role(container, target, MemberRole::Normal)
+    }
+
+    fn add_reference_with_role(
+        &mut self,
+        container: &ContainerId,
+        target: ReferenceTarget,
+        role: MemberRole,
+    ) -> io::Result<ReferenceId> {
         let id = ReferenceId::new();
         self.containers
             .get_mut(container)
@@ -199,6 +316,7 @@ impl Workspace {
                 target,
                 alias: None,
                 presentation: ReferencePresentation::Card,
+                role,
             });
         Ok(id)
     }
@@ -562,5 +680,115 @@ mod tests {
         assert!(workspace.validate().is_ok());
         assert_eq!(workspace.containers[&left].members.len(), 2);
         assert_eq!(workspace.containers[&right].members.len(), 2);
+    }
+
+    #[test]
+    fn ai_boxes_are_containers_with_ai_workspace_kind() {
+        let mut workspace = Workspace::empty();
+        let ai_box = workspace.create_ai_box("Analysis");
+        assert!(workspace.is_ai_box(&ai_box));
+        assert_eq!(
+            workspace.containers[&ai_box].kind,
+            ContainerKind::AiWorkspace
+        );
+        let _ = workspace.add_container_to_root(ai_box.clone());
+        assert!(workspace.validate().is_ok());
+        // Ordinary containers stay Normal.
+        let folder = workspace.create_container("Folder");
+        assert_eq!(workspace.containers[&folder].kind, ContainerKind::Normal);
+        assert!(!workspace.is_ai_box(&folder));
+    }
+
+    #[test]
+    fn ai_box_member_roles_persist_through_the_store() {
+        let folder = TestFolder::new();
+        let store = WorkspaceStore::open(&folder.0).unwrap();
+        let mut workspace = Workspace::empty();
+        let ai_box = workspace.create_ai_box("AI");
+        let entity = EntityId::new();
+        let conversation = ConversationId::new();
+        let _ = workspace
+            .add_source_reference(&ai_box, ReferenceTarget::Snippet(entity.clone()))
+            .unwrap();
+        let conversation_ref = workspace
+            .add_conversation_card(&ai_box, conversation.clone())
+            .unwrap();
+        let _ = workspace
+            .add_output_reference(&ai_box, entity.clone())
+            .unwrap();
+        let _ = workspace
+            .add_snippet_reference(&ai_box, entity.clone())
+            .unwrap();
+        let _ = workspace.add_container_to_root(ai_box.clone());
+        store.save(&workspace).unwrap();
+
+        let loaded = store.load_or_initialize(&[]).unwrap();
+        let members = &loaded.containers[&ai_box].members;
+        let source = members
+            .iter()
+            .find(|reference| reference.role == MemberRole::Source)
+            .expect("source role");
+        assert!(matches!(
+            &source.target,
+            ReferenceTarget::Snippet(id) if id == &entity
+        ));
+        let output = members
+            .iter()
+            .find(|reference| reference.role == MemberRole::Output)
+            .expect("output role");
+        assert!(matches!(
+            &output.target,
+            ReferenceTarget::Snippet(id) if id == &entity
+        ));
+        let conversation_member = members
+            .iter()
+            .find(|reference| reference.id == conversation_ref)
+            .expect("conversation card");
+        assert!(matches!(
+            &conversation_member.target,
+            ReferenceTarget::Conversation(id) if id == &conversation
+        ));
+        assert_eq!(conversation_member.role, MemberRole::Conversation);
+        // A plain snippet reference inside the AI box keeps Normal role.
+        assert!(
+            members
+                .iter()
+                .any(|reference| reference.role == MemberRole::Normal)
+        );
+    }
+
+    #[test]
+    fn conversation_cards_validate_without_sidecar_entries() {
+        let mut workspace = Workspace::empty();
+        let ai_box = workspace.create_ai_box("AI");
+        let _ = workspace
+            .add_conversation_card(&ai_box, ConversationId::new())
+            .unwrap();
+        // The sidecar store is separate from the workspace graph, so a
+        // conversation card never fails workspace validation.
+        assert!(workspace.validate().is_ok());
+    }
+
+    #[test]
+    fn remove_entity_references_leaves_conversation_cards() {
+        let mut workspace = Workspace::empty();
+        let ai_box = workspace.create_ai_box("AI");
+        let entity = EntityId::new();
+        let _ = workspace
+            .add_source_reference(&ai_box, ReferenceTarget::Snippet(entity.clone()))
+            .unwrap();
+        let _ = workspace
+            .add_conversation_card(&ai_box, ConversationId::new())
+            .unwrap();
+        workspace.remove_entity_references(&entity);
+
+        let members = &workspace.containers[&ai_box].members;
+        assert!(!members.iter().any(|reference| matches!(
+            &reference.target,
+            ReferenceTarget::Snippet(id) if id == &entity
+        )));
+        assert!(members
+            .iter()
+            .any(|reference| matches!(reference.target, ReferenceTarget::Conversation(_))));
     }
 }

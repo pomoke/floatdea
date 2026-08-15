@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use eframe::{App, egui};
 
 use floatdea::data::{
-    ContainerId, EntityId, ReferenceId, Snippet, TextId,
+    ContainerId, ContainerKind, ConversationId, EntityId, ReferenceId, Snippet, TextId,
     settings::{Settings, SettingsStore, ThemeSetting, WindowMode},
     storage::SnippetStore,
     workspace::{
@@ -292,6 +292,12 @@ enum CanvasCommand {
         payload: DragPayload,
         move_semantics: bool,
     },
+    /// Open the conversation window for a `Conversation` card inside an AI box.
+    /// Wired to the AI conversation layer.
+    OpenConversation {
+        ai_box: ContainerId,
+        conversation: ConversationId,
+    },
 }
 
 impl ContainerCanvas {
@@ -465,8 +471,10 @@ impl HomePage {
             .filter(|reference| match &reference.target {
                 ReferenceTarget::Snippet(id) => snippets.contains_key(id),
                 ReferenceTarget::Container(id) => workspace.containers.contains_key(id),
-                // Special items always resolve.
-                ReferenceTarget::Special(_) => true,
+                // Special items and AI conversation cards always resolve (the
+                // conversation sidecar may be absent, in which case the card
+                // simply shows a placeholder title).
+                ReferenceTarget::Special(_) | ReferenceTarget::Conversation(_) => true,
             })
             .enumerate()
             .map(|(index, reference)| CanvasItem {
@@ -758,6 +766,17 @@ impl HomePage {
                             .insert((source_container.clone(), reference_id.clone()));
                     }
                 }
+                CanvasCommand::OpenConversation {
+                    ai_box,
+                    conversation,
+                } => {
+                    // Wired to the AI conversation layer in a later step.
+                    log::debug!(
+                        "open conversation {} in AI box {} (wired in a later step)",
+                        conversation.as_str(),
+                        ai_box.as_str()
+                    );
+                }
             }
         }
     }
@@ -824,6 +843,9 @@ impl HomePage {
             }
             // Special items cannot be deleted; this arm is unreachable.
             ReferenceTarget::Special(_) => {}
+            // Conversation cards are never deleted through the entity-delete
+            // path; the AI conversation layer handles their removal.
+            ReferenceTarget::Conversation(_) => {}
         }
         self.pending_delete = None;
     }
@@ -864,6 +886,8 @@ impl HomePage {
             }
             // Special items cannot be linked or pasted.
             ReferenceTarget::Special(_) => return false,
+            // Conversation cards cannot be pasted into other containers.
+            ReferenceTarget::Conversation(_) => return false,
         };
         let position = self.canvas_for(container).map(|canvas| {
             canvas::default_position_for(
@@ -962,6 +986,8 @@ impl HomePage {
             }
             // Special items cannot be linked or dropped.
             ReferenceTarget::Special(_) => return false,
+            // Conversation cards cannot be dropped into other containers.
+            ReferenceTarget::Conversation(_) => return false,
         };
         let position = match position {
             Some(position) => position,
@@ -1387,6 +1413,9 @@ mod tests {
             ReferenceTarget::Snippet(id) => id,
             ReferenceTarget::Container(_) => panic!("root cards are snippets"),
             ReferenceTarget::Special(_) => panic!("clipboard entries never target specials"),
+            ReferenceTarget::Conversation(_) => {
+                panic!("clipboard entries never target conversations")
+            }
         }));
     }
 
@@ -1568,6 +1597,7 @@ mod tests {
             ReferenceTarget::Snippet(id) => id.clone(),
             ReferenceTarget::Container(_) => panic!("root cards are snippets"),
             ReferenceTarget::Special(_) => panic!("root cards are snippets"),
+            ReferenceTarget::Conversation(_) => panic!("root cards are snippets"),
         };
         page.open_view(snippet_id);
         assert!(page.clipboard.is_none());
@@ -1819,6 +1849,7 @@ mod tests {
             ReferenceTarget::Snippet(id) => id.clone(),
             ReferenceTarget::Container(_) => panic!("root cards are snippets"),
             ReferenceTarget::Special(_) => panic!("root cards are snippets"),
+            ReferenceTarget::Conversation(_) => panic!("root cards are snippets"),
         };
         (entity_id, page.root.items[0].reference_id.clone())
     }

@@ -170,6 +170,12 @@ impl HomePage {
                 *pending = None;
                 return DeleteDialogResult::None;
             }
+            // Conversation cards are removed by the AI layer, never through the
+            // entity-delete confirmation.
+            ReferenceTarget::Conversation(_) => {
+                *pending = None;
+                return DeleteDialogResult::None;
+            }
         };
         let mut confirmed = false;
         let mut cancelled = false;
@@ -547,6 +553,10 @@ impl HomePage {
                 ItemKind::Folder => format!("📁 {title}"),
                 ItemKind::Special => format!("⚙ {title}"),
                 ItemKind::Snippet => title,
+                // AI boxes are ordinary containers but stay visually distinct
+                // from folders (a plain text prefix keeps it font-safe).
+                ItemKind::AiBox => format!("AI {title}"),
+                ItemKind::Conversation => title,
             };
             let galley = layout_title(
                 painter,
@@ -635,6 +645,9 @@ impl HomePage {
                             }
                         }
                         ReferenceTarget::Special(_) => {}
+                        // Conversation cards get their own AI context menu
+                        // (open / rename / delete) in the AI workbench layer.
+                        ReferenceTarget::Conversation(_) => {}
                     }
                     let last_link = reference_count(data.workspace, &target) == 1;
                     if ui
@@ -656,6 +669,10 @@ impl HomePage {
                     ReferenceTarget::Snippet(id) => CanvasCommand::OpenSnippet(id),
                     ReferenceTarget::Container(id) => CanvasCommand::OpenFolder(id),
                     ReferenceTarget::Special(kind) => CanvasCommand::OpenSpecial(kind),
+                    ReferenceTarget::Conversation(id) => CanvasCommand::OpenConversation {
+                        ai_box: canvas.container_id.clone(),
+                        conversation: id,
+                    },
                 });
             }
             // Every card (Special included) publishes a drag payload: the
@@ -938,6 +955,9 @@ impl HomePage {
                             .map(|container| container.title.as_str())
                             .unwrap_or("?"),
                         ReferenceTarget::Special(special) => special.label(),
+                        // Conversation cards cannot be picked up to the
+                        // clipboard; this arm is unreachable.
+                        ReferenceTarget::Conversation(_) => "Conversation",
                     };
                     let verb = match entry.semantics {
                         ClipboardSemantics::Link => "Paste (Link)",
@@ -1128,6 +1148,10 @@ enum ItemKind {
     Snippet,
     Folder,
     Special,
+    /// An AI workspace container (distinct from a plain folder).
+    AiBox,
+    /// An AI conversation card inside an AI box.
+    Conversation,
 }
 
 fn item_label(
@@ -1137,11 +1161,19 @@ fn item_label(
 ) -> Option<(String, ItemKind)> {
     let (title, kind) = match &item.target {
         ReferenceTarget::Snippet(id) => (snippets.get(id)?.title.as_str(), ItemKind::Snippet),
-        ReferenceTarget::Container(id) => (
-            workspace.containers.get(id)?.title.as_str(),
-            ItemKind::Folder,
-        ),
+        ReferenceTarget::Container(id) => {
+            let container = workspace.containers.get(id)?;
+            if container.kind == ContainerKind::AiWorkspace {
+                (container.title.as_str(), ItemKind::AiBox)
+            } else {
+                (container.title.as_str(), ItemKind::Folder)
+            }
+        }
         ReferenceTarget::Special(special) => (special.label(), ItemKind::Special),
+        // The conversation title is resolved from the AI sidecar store when the
+        // canvas is rendered inside an AI box; the placeholder keeps the card
+        // renderable even if the sidecar entry is missing.
+        ReferenceTarget::Conversation(_) => ("Conversation", ItemKind::Conversation),
     };
     (!title.is_empty()).then(|| (title.to_owned(), kind))
 }
@@ -1266,6 +1298,8 @@ pub(super) fn clipboard_valid_for(
         }
         // Special items cannot be linked or pasted.
         ReferenceTarget::Special(_) => false,
+        // Conversation cards cannot be linked or pasted.
+        ReferenceTarget::Conversation(_) => false,
     }
 }
 
@@ -1294,6 +1328,8 @@ pub(super) fn drop_valid_for(
         }
         // Special items cannot be linked or dropped into other containers.
         ReferenceTarget::Special(_) => false,
+        // Conversation cards cannot be linked or dropped into other containers.
+        ReferenceTarget::Conversation(_) => false,
     }
 }
 
@@ -1325,6 +1361,8 @@ fn render_clipboard_status(ui: &mut egui::Ui, data: &mut CanvasData<'_>) {
             .map(|container| container.title.clone())
             .unwrap_or_else(|| "?".to_owned()),
         ReferenceTarget::Special(special) => special.label().to_owned(),
+        // Conversation cards cannot be picked up to the clipboard; unreachable.
+        ReferenceTarget::Conversation(_) => "Conversation".to_owned(),
     };
     let verb = match entry.semantics {
         ClipboardSemantics::Link => "Link",
@@ -1448,6 +1486,8 @@ fn paint_card(
         visuals.widgets.hovered.bg_fill.gamma_multiply(0.5)
     } else if kind == ItemKind::Folder {
         visuals.widgets.hovered.bg_fill.gamma_multiply(0.7)
+    } else if kind == ItemKind::AiBox {
+        visuals.widgets.hovered.bg_fill.gamma_multiply(0.8)
     } else {
         visuals.widgets.inactive.bg_fill
     };
@@ -1457,6 +1497,8 @@ fn paint_card(
         egui::Stroke::new(1.5, visuals.selection.stroke.color.gamma_multiply(0.5))
     } else if kind == ItemKind::Folder {
         egui::Stroke::new(1.5, visuals.selection.stroke.color.gamma_multiply(0.65))
+    } else if kind == ItemKind::AiBox {
+        egui::Stroke::new(1.5, visuals.selection.stroke.color.gamma_multiply(0.8))
     } else {
         egui::Stroke::new(1.0, visuals.widgets.inactive.bg_stroke.color)
     };

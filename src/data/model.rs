@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 macro_rules! stable_id {
-    ($name:ident) => {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name(String);
@@ -29,6 +30,16 @@ stable_id!(EntityId);
 stable_id!(ContainerId);
 stable_id!(ReferenceId);
 stable_id!(TextId);
+stable_id! {
+    /// Identity of an AI conversation inside an AI workspace. Conversations are
+    /// sidecar state (not Markdown entities): the ID only appears in the AI
+    /// box's member list (as a `Conversation` card) and in the AI sidecar store.
+    ConversationId
+}
+stable_id! {
+    /// Identity of a single AI turn task (one request—streamed-response round).
+    TurnTaskId
+}
 
 impl EntityId {
     /// Rebuilds an id from its string form (e.g. parsed out of a
