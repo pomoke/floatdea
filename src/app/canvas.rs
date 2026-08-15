@@ -913,6 +913,11 @@ impl HomePage {
 
         if !pointer_over_card && !pointer_over_text {
             canvas_response.context_menu(|ui| {
+                if ui.button("Search…").clicked() {
+                    commands.push(CanvasCommand::OpenSearch);
+                    ui.close();
+                }
+                ui.separator();
                 if let Some(entry) = data.clipboard.as_ref() {
                     let valid = clipboard_valid_for(
                         entry,

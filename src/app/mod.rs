@@ -43,6 +43,9 @@ pub(crate) struct HomePage {
     next_view_id: u64,
     pending_delete: Option<PendingDelete>,
     rename_dialog: RenameDialogState,
+    /// Global search over all snippets (opened by `Ctrl+F`, `/`, or the box
+    /// context menu).
+    search: SearchState,
     clipboard: Option<ClipboardEntry>,
     /// Shared local TeX-to-SVG renderer for previews and document embeds.
     math_renderer: MathRenderer,
@@ -58,6 +61,15 @@ pub(crate) struct HomePage {
     /// Full-window mode: the root window's close button was clicked and the
     /// "Exit?" confirmation is awaiting a decision.
     root_exit_pending: bool,
+}
+
+/// State of the global search window.
+#[derive(Default)]
+struct SearchState {
+    open: bool,
+    filter: String,
+    /// Focus the filter field only on the first frame after opening (IME-safe).
+    focus_requested: bool,
 }
 
 /// Display mode of a snippet viewport.
@@ -249,6 +261,8 @@ enum CanvasCommand {
     OpenFolder(ContainerId),
     /// Open the system page for a built-in special item (e.g. Settings).
     OpenSpecial(SpecialKind),
+    /// Open the global search window.
+    OpenSearch,
     /// Remove a reference from `owner`. If it is the last link to its target,
     /// a confirmation dialog is shown before the entity/container is deleted.
     DeleteReference {
@@ -430,6 +444,7 @@ impl HomePage {
             settings_store,
             settings_open: false,
             root_exit_pending: false,
+            search: SearchState::default(),
         }
     }
 
@@ -552,6 +567,81 @@ impl HomePage {
         }
     }
 
+    /// Renders the global search window: a floating filter field over all
+    /// snippets. Typing filters title/body live (title hits first); clicking a
+    /// result (or pressing Enter) opens that snippet; `Esc` or the close button
+    /// dismisses the window. Opened via `Ctrl+F`, `/` (when nothing is being
+    /// edited), or the box context menu's "Search…".
+    fn render_search_window(&mut self, ctx: &egui::Context) {
+        if !self.search.open {
+            return;
+        }
+        let mut open = self.search.open;
+        let mut open_id: Option<EntityId> = None;
+        let mut close = false;
+        egui::Window::new("Search")
+            .id(egui::Id::new("search-window"))
+            .open(&mut open)
+            .default_size([360.0, 420.0])
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let filter = ui.add(
+                    egui::TextEdit::singleline(&mut self.search.filter)
+                        .id(egui::Id::new("search-filter"))
+                        .hint_text("Search snippets…"),
+                );
+                // Focus only once on open (IME-safe).
+                if self.search.focus_requested {
+                    filter.request_focus();
+                    self.search.focus_requested = false;
+                }
+                // Enter opens the first result; Esc closes the window. Both
+                // actions are deferred out of the closure (the window builder
+                // already borrows `self.search.open`).
+                if ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    && let Some(id) = search_snippets(&self.search.filter, &self.all_snippets)
+                        .into_iter()
+                        .next()
+                {
+                    open_id = Some(id);
+                }
+                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    ui.input_mut(|input| input.consume_key(input.modifiers, egui::Key::Escape));
+                    close = true;
+                }
+                ui.add_space(6.0);
+                let list_height = (ctx.viewport_rect().height() - 180.0).clamp(80.0, 320.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("search-results")
+                    .max_height(list_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        let query = self.search.filter.trim();
+                        let results = search_snippets(&self.search.filter, &self.all_snippets);
+                        if query.is_empty() {
+                            ui.label("Type to search all snippets");
+                        } else if results.is_empty() {
+                            ui.label("(no matches)");
+                        }
+                        for id in results {
+                            let title = &self.all_snippets[&id].title;
+                            if ui.selectable_label(false, title).clicked() {
+                                open_id = Some(id);
+                            }
+                        }
+                    });
+            });
+        if open_id.is_some() || close {
+            self.search.open = false;
+        } else {
+            // Reflect the close button (egui wrote back into `open`).
+            self.search.open = open;
+        }
+        if let Some(id) = open_id {
+            self.open_view(id);
+        }
+    }
+
     /// In floating-window mode every dialog carries the root viewport origin,
     /// so closing a folder window must clear dialogs by their target id.
     fn clear_dialog_for_folder(&mut self, container_id: &ContainerId) {
@@ -575,6 +665,10 @@ impl HomePage {
                 CanvasCommand::OpenSpecial(kind) => match kind {
                     SpecialKind::Settings => self.settings_open = true,
                 },
+                CanvasCommand::OpenSearch => {
+                    self.search.open = true;
+                    self.search.focus_requested = true;
+                }
                 CanvasCommand::DeleteReference {
                     owner,
                     reference,
@@ -988,6 +1082,27 @@ fn reference_count(workspace: &Workspace, target: &ReferenceTarget) -> usize {
         .count()
 }
 
+/// Case-insensitive substring search over all snippets. Title hits come first,
+/// then body hits; within each group the order follows `BTreeMap` (id) order.
+/// An empty/whitespace query matches nothing.
+fn search_snippets(query: &str, snippets: &BTreeMap<EntityId, Snippet>) -> Vec<EntityId> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut title_hits = Vec::new();
+    let mut body_hits = Vec::new();
+    for (id, snippet) in snippets {
+        if snippet.title.to_lowercase().contains(&query) {
+            title_hits.push(id.clone());
+        } else if snippet.content.to_lowercase().contains(&query) {
+            body_hits.push(id.clone());
+        }
+    }
+    title_hits.append(&mut body_hits);
+    title_hits
+}
+
 fn default_card_position(index: usize) -> [f32; 2] {
     [
         24.0 + (index % 16) as f32 * 200.0,
@@ -1140,6 +1255,8 @@ impl HomePage {
         self.finalize_drops(ui.ctx());
         // The system settings window floats above the root canvas.
         self.render_settings_window(ui.ctx());
+        // The global search window.
+        self.render_search_window(ui.ctx());
     }
 }
 
@@ -1513,6 +1630,55 @@ mod tests {
             egui::ViewportId::ROOT,
         );
         assert!(page.settings_open);
+    }
+
+    #[test]
+    fn open_search_command_opens_the_search_window() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        assert!(!page.search.open);
+        page.process_canvas_commands(vec![CanvasCommand::OpenSearch], egui::ViewportId::ROOT);
+        assert!(page.search.open);
+        assert!(page.search.focus_requested);
+    }
+
+    #[test]
+    fn search_snippets_prioritizes_titles_and_is_case_insensitive() {
+        let mut snippets = BTreeMap::new();
+        let insert = |snippets: &mut BTreeMap<EntityId, Snippet>, title: &str, content: &str| {
+            let id = EntityId::new();
+            snippets.insert(
+                id.clone(),
+                Snippet {
+                    id,
+                    title: title.to_owned(),
+                    content: content.to_owned(),
+                },
+            );
+        };
+        insert(&mut snippets, "Math Notes", "y = x^2");
+        insert(&mut snippets, "Shopping", "milk and math textbooks");
+        insert(&mut snippets, "Journal", "a walk by the lake");
+        let id_of = |title: &str| {
+            snippets
+                .iter()
+                .find(|(_, snippet)| snippet.title == title)
+                .map(|(id, _)| id.clone())
+                .expect("snippet exists")
+        };
+        let math_id = id_of("Math Notes");
+        let shopping_id = id_of("Shopping");
+
+        // Title hit comes before a body hit.
+        let results = search_snippets("math", &snippets);
+        assert_eq!(results[0], math_id, "title match ranks first");
+        assert!(results.contains(&shopping_id), "body match is found too");
+
+        // Case-insensitive.
+        assert_eq!(search_snippets("MILK", &snippets), vec![shopping_id]);
+
+        // Empty query matches nothing.
+        assert!(search_snippets("   ", &snippets).is_empty());
     }
 
     #[test]
