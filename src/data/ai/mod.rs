@@ -6,11 +6,18 @@
 //! synced or exported by default. Only answers the user saves as snippets
 //! become real knowledge entities.
 
+pub mod provider;
 mod store;
 mod types;
+pub mod worker;
 
+pub use provider::{
+    AiError, AiErrorKind, CancelFlag, Capabilities, ChatMessage, ChatProvider, ChatRequest,
+    ChatRole, ProviderConfig, ProviderKind, StreamEvent, StreamOutcome, TokenUsage, build_provider,
+};
 pub use store::AiStore;
 pub use types::{
     AI_BOX_DATA_VERSION, AiBoxData, Conversation, Message, MessageRole, MessageStatus, SourceRef,
     SourceTarget, content_hash, now_unix,
 };
+pub use worker::{AiWorker, TurnEvent, TurnIdentity, TurnRequest};

@@ -5,6 +5,7 @@ use eframe::{App, egui};
 
 use floatdea::data::{
     ContainerId, ContainerKind, ConversationId, EntityId, ReferenceId, Snippet, TextId,
+    ai::ProviderKind,
     settings::{Settings, SettingsStore, ThemeSetting, WindowMode},
     storage::SnippetStore,
     workspace::{
