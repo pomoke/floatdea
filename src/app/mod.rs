@@ -1,19 +1,27 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use eframe::{App, egui};
+use tokio::sync::mpsc;
 
 use floatdea::data::{
     ContainerId, ContainerKind, ConversationId, EntityId, ReferenceId, Snippet, TextId,
-    ai::ProviderKind,
+    TurnTaskId,
+    ai::{
+        AiBoxData, AiErrorKind, AiStore, AiWorker, ChatMessage, ChatProvider, ChatRequest,
+        Conversation, Message, MessageRole, MessageStatus, ProviderKind, SourceRef, SourceTarget,
+        TurnEvent, TurnIdentity, TurnRequest, build_provider, content_hash, now_unix,
+    },
     settings::{Settings, SettingsStore, ThemeSetting, WindowMode},
     storage::SnippetStore,
     workspace::{
-        CanvasText, CardLayout, ContainerLayout, ReferenceTarget, SpecialKind, Workspace,
-        WorkspaceStore,
+        CanvasText, CardLayout, ContainerLayout, MemberRole, ReferenceTarget, SpecialKind,
+        Workspace, WorkspaceStore,
     },
 };
 
+mod ai_chat;
 mod canvas;
 mod math;
 mod settings;
@@ -62,6 +70,28 @@ pub(crate) struct HomePage {
     /// Full-window mode: the root window's close button was clicked and the
     /// "Exit?" confirmation is awaiting a decision.
     root_exit_pending: bool,
+    /// AI sidecar store (conversations, messages, source snapshots).
+    ai_store: AiStore,
+    /// In-memory cache of per-AI-box sidecar data, kept in sync with
+    /// [`HomePage::ai_store`].
+    ai_boxes: BTreeMap<ContainerId, AiBoxData>,
+    /// The single shared AI worker and its event stream (one per app).
+    ai_worker: AiWorker,
+    ai_events: mpsc::Receiver<TurnEvent>,
+    /// The currently open conversation window: `(ai_box, conversation)`.
+    ai_open: Option<(ContainerId, ConversationId)>,
+    /// Input buffer of the open conversation.
+    ai_input: String,
+    /// Whether the `Sources: N` panel of the open conversation is visible.
+    ai_sources_panel: bool,
+    /// The running turn (matches streaming events; one per conversation).
+    ai_active_turn: Option<TurnIdentity>,
+    /// Transient streaming text of the active turn.
+    ai_streaming: String,
+    /// Source snapshots captured when the active turn was sent.
+    ai_snapshots: Vec<SourceRef>,
+    /// CommonMark cache for the open conversation's assistant answers.
+    ai_markdown_cache: egui_commonmark::CommonMarkCache,
 }
 
 /// State of the global search window.
@@ -108,6 +138,9 @@ struct View {
     id: u64,
     entity_id: EntityId,
     mode: ViewMode,
+    /// Read-only "Linked Source" preview opened from an AI box: the editor is
+    /// unreachable and the mode menu offers no `Source` option.
+    read_only: bool,
     /// Per-view CommonMark cache shared by every preview pane.
     markdown_cache: egui_commonmark::CommonMarkCache,
     /// Transient: request focus for the source editor next frame (set when
@@ -133,12 +166,19 @@ enum RenameTarget {
         id: ContainerId,
         origin: egui::ViewportId,
     },
+    Conversation {
+        ai_box: ContainerId,
+        id: ConversationId,
+        origin: egui::ViewportId,
+    },
 }
 
 impl RenameTarget {
     fn origin(&self) -> egui::ViewportId {
         match self {
-            RenameTarget::Snippet { origin, .. } | RenameTarget::Folder { origin, .. } => *origin,
+            RenameTarget::Snippet { origin, .. }
+            | RenameTarget::Folder { origin, .. }
+            | RenameTarget::Conversation { origin, .. } => *origin,
         }
     }
 }
@@ -215,6 +255,10 @@ enum ViewAction {
 struct CanvasItem {
     reference_id: ReferenceId,
     target: ReferenceTarget,
+    /// The AI member role of this reference. Inside an AI box this drives the
+    /// card visuals and the context menu (read-only Source vs. Conversation vs.
+    /// saved Output); ordinary containers keep `Normal`.
+    role: MemberRole,
     position: [f32; 2],
     size: egui::Vec2,
 }
@@ -298,6 +342,41 @@ enum CanvasCommand {
     OpenConversation {
         ai_box: ContainerId,
         conversation: ConversationId,
+    },
+    /// Create a new AI box container and place its card in `owner`.
+    NewAiBox {
+        owner: ContainerId,
+        position: Option<[f32; 2]>,
+    },
+    /// Create a new (initially empty) conversation inside an AI box.
+    NewConversation {
+        ai_box: ContainerId,
+        position: Option<[f32; 2]>,
+    },
+    /// Link an existing snippet as a read-only `Source` of an AI box.
+    LinkAiSource {
+        ai_box: ContainerId,
+        entity: EntityId,
+        position: Option<[f32; 2]>,
+    },
+    /// Remove a `Source` card from an AI box (unlink only; never deletes the
+    /// source entity).
+    RemoveAiSource {
+        ai_box: ContainerId,
+        reference: ReferenceId,
+    },
+    /// Delete a conversation (sidecar state + card) from an AI box.
+    DeleteConversation {
+        ai_box: ContainerId,
+        conversation: ConversationId,
+    },
+    /// Open a snippet in the read-only "Linked Source" preview.
+    OpenSnippetReadOnly(EntityId),
+    /// Open the rename dialog for a conversation card.
+    RenameConversation {
+        ai_box: ContainerId,
+        conversation: ConversationId,
+        origin: egui::ViewportId,
     },
 }
 
@@ -422,6 +501,16 @@ impl HomePage {
         let settings_store =
             SettingsStore::open(&workspace_path).expect("failed to open settings store");
         let settings = settings_store.load();
+        let ai_store = AiStore::open(&workspace_path).expect("failed to open AI sidecar store");
+        // Load sidecar state for every existing AI box so conversation titles
+        // and message history are available without touching the store each
+        // frame.
+        let ai_boxes: BTreeMap<ContainerId, AiBoxData> = workspace
+            .containers
+            .values()
+            .filter(|container| container.kind == ContainerKind::AiWorkspace)
+            .map(|container| (container.id.clone(), ai_store.load_box(&container.id)))
+            .collect();
         let all_snippets = snippets
             .into_iter()
             .map(|snippet| (snippet.id.clone(), snippet))
@@ -433,6 +522,7 @@ impl HomePage {
             workspace.root.clone(),
         );
 
+        let (ai_worker, ai_events) = AiWorker::spawn();
         Self {
             all_snippets,
             store,
@@ -452,6 +542,17 @@ impl HomePage {
             settings_open: false,
             root_exit_pending: false,
             search: SearchState::default(),
+            ai_store,
+            ai_boxes,
+            ai_worker,
+            ai_events,
+            ai_open: None,
+            ai_input: String::new(),
+            ai_sources_panel: false,
+            ai_active_turn: None,
+            ai_streaming: String::new(),
+            ai_snapshots: Vec::new(),
+            ai_markdown_cache: egui_commonmark::CommonMarkCache::default(),
         }
     }
 
@@ -481,6 +582,7 @@ impl HomePage {
             .map(|(index, reference)| CanvasItem {
                 reference_id: reference.id.clone(),
                 target: reference.target.clone(),
+                role: reference.role,
                 position: layout
                     .items
                     .get(&reference.id)
@@ -523,6 +625,30 @@ impl HomePage {
             id,
             entity_id,
             mode,
+            read_only: false,
+            markdown_cache: egui_commonmark::CommonMarkCache::default(),
+            focus_edit: false,
+            mode_menu: None,
+            link_picker: None,
+            link_error: None,
+        });
+    }
+
+    /// Opens a snippet as a read-only "Linked Source · Read-only" preview
+    /// (opened from an AI box source card). The editor is unreachable; use
+    /// `open_view` for the normal, writable window.
+    fn open_read_only_view(&mut self, entity_id: EntityId) {
+        if !self.all_snippets.contains_key(&entity_id) {
+            return;
+        }
+        self.clipboard = None;
+        let id = self.next_view_id;
+        self.next_view_id += 1;
+        self.views.push(View {
+            id,
+            entity_id,
+            mode: ViewMode::Preview,
+            read_only: true,
             markdown_cache: egui_commonmark::CommonMarkCache::default(),
             focus_edit: false,
             mode_menu: None,
@@ -731,6 +857,9 @@ impl HomePage {
                     let ok = match &target {
                         RenameTarget::Snippet { id, .. } => self.rename_snippet(id, new_title),
                         RenameTarget::Folder { id, .. } => self.rename_folder(id, new_title),
+                        RenameTarget::Conversation { ai_box, id, .. } => {
+                            self.rename_conversation(ai_box, id, new_title)
+                        }
                     };
                     if ok {
                         self.rename_dialog.pending = None;
@@ -770,13 +899,43 @@ impl HomePage {
                 CanvasCommand::OpenConversation {
                     ai_box,
                     conversation,
+                } => self.ai_open = Some((ai_box, conversation)),
+                CanvasCommand::NewAiBox { owner, position } => self.create_ai_box(&owner, position),
+                CanvasCommand::NewConversation { ai_box, position } => {
+                    self.create_conversation(&ai_box, position)
+                }
+                CanvasCommand::LinkAiSource {
+                    ai_box,
+                    entity,
+                    position,
+                } => self.link_ai_source(&ai_box, entity, position),
+                CanvasCommand::RemoveAiSource { ai_box, reference } => {
+                    self.remove_ai_source(&ai_box, &reference)
+                }
+                CanvasCommand::DeleteConversation {
+                    ai_box,
+                    conversation,
+                } => self.delete_conversation(&ai_box, &conversation),
+                CanvasCommand::OpenSnippetReadOnly(id) => self.open_read_only_view(id),
+                CanvasCommand::RenameConversation {
+                    ai_box,
+                    conversation,
+                    origin,
                 } => {
-                    // Wired to the AI conversation layer in a later step.
-                    log::debug!(
-                        "open conversation {} in AI box {} (wired in a later step)",
-                        conversation.as_str(),
-                        ai_box.as_str()
-                    );
+                    let title = self
+                        .ai_boxes
+                        .get(&ai_box)
+                        .and_then(|data| data.get(&conversation))
+                        .map(|conversation| conversation.title.clone());
+                    if let Some(title) = title {
+                        self.rename_dialog.buffer = title;
+                        self.rename_dialog.pending = Some(RenameTarget::Conversation {
+                            ai_box,
+                            id: conversation,
+                            origin,
+                        });
+                        self.rename_dialog.focus_requested = false;
+                    }
                 }
             }
         }
@@ -825,11 +984,18 @@ impl HomePage {
             }
             ReferenceTarget::Container(container_id) => {
                 let container_id = container_id.clone();
+                let was_ai_box = self.workspace.is_ai_box(&container_id);
                 let _ = self
                     .workspace
                     .remove_reference(&pending.owner, &pending.reference);
                 self.workspace.containers.remove(&container_id);
                 let _ = self.workspace_store.save(&self.workspace);
+                // Deleting an AI box only cleans its own sidecar state; source
+                // entities and saved outputs are never touched.
+                if was_ai_box {
+                    self.ai_boxes.remove(&container_id);
+                    let _ = self.ai_store.remove_box(&container_id);
+                }
                 if pending.owner == self.root.container_id {
                     self.root
                         .remove_reference(&pending.reference, &self.workspace_store);
@@ -859,6 +1025,272 @@ impl HomePage {
         }
     }
 
+    // ---- AI workbench operations (阶段 1: no-model workbench) ----
+
+    /// Creates a new AI box container and places its card in `owner`'s canvas.
+    fn create_ai_box(&mut self, owner: &ContainerId, position: Option<[f32; 2]>) {
+        let container_id = self.workspace.create_ai_box("AI Box");
+        let Ok(reference_id) = self
+            .workspace
+            .add_container_reference(owner, container_id.clone())
+        else {
+            return;
+        };
+        let _ = self.workspace_store.save(&self.workspace);
+        let position = position.unwrap_or_else(|| {
+            self.canvas_for(owner)
+                .map(|canvas| {
+                    canvas::default_position_for(
+                        owner,
+                        &canvas.items,
+                        &self.all_snippets,
+                        &self.workspace,
+                        &self.ai_boxes,
+                        &canvas::approx_text_rects(&canvas.texts),
+                    )
+                })
+                .unwrap_or_else(|| default_card_position(0))
+        });
+        // Direct field borrow so the layout save below can also borrow
+        // `self.workspace_store` (a method like `canvas_for_mut` would borrow
+        // all of `self`).
+        let target_canvas = if owner == &self.root.container_id {
+            Some(&mut self.root)
+        } else {
+            self.folder_views.get_mut(owner)
+        };
+        if let Some(canvas) = target_canvas {
+            canvas.items.push(CanvasItem {
+                reference_id: reference_id.clone(),
+                target: ReferenceTarget::Container(container_id),
+                role: MemberRole::Normal,
+                position,
+                size: egui::vec2(CARD_WIDTH, 25.0),
+            });
+            canvas.layout.items.insert(
+                reference_id,
+                CardLayout {
+                    position,
+                    color: None,
+                },
+            );
+            canvas.save_layout(&self.workspace_store);
+        }
+    }
+
+    /// The initial source bindings of a new conversation: every direct
+    /// `Source`-role snippet/container reference of the AI box, de-duplicated
+    /// by stable id. Per plan_ai.md §3.2, unbound cards never join the scope.
+    fn initial_conversation_sources(&self, ai_box: &ContainerId) -> Vec<SourceTarget> {
+        self.workspace
+            .containers
+            .get(ai_box)
+            .map(|container| {
+                container
+                    .members
+                    .iter()
+                    .filter(|reference| reference.role == MemberRole::Source)
+                    .filter_map(|reference| match &reference.target {
+                        ReferenceTarget::Snippet(id) => {
+                            Some(SourceTarget::Snippet(id.clone()))
+                        }
+                        ReferenceTarget::Container(id) => {
+                            Some(SourceTarget::Container(id.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Creates a conversation (sidecar state + card) inside an AI box. Initial
+    /// sources are the AI box's direct `Source` references.
+    fn create_conversation(&mut self, ai_box: &ContainerId, position: Option<[f32; 2]>) {
+        let sources = self.initial_conversation_sources(ai_box);
+        let conversation = ConversationId::new();
+        let data = self
+            .ai_boxes
+            .entry(ai_box.clone())
+            .or_insert_with(|| self.ai_store.load_box(ai_box));
+        if !data.create_conversation(
+            conversation.clone(),
+            "New Conversation",
+            false,
+            sources,
+            now_unix(),
+        ) {
+            return;
+        }
+        let _ = self.ai_store.save_box(data);
+        let Ok(reference_id) = self
+            .workspace
+            .add_conversation_card(ai_box, conversation.clone())
+        else {
+            return;
+        };
+        let _ = self.workspace_store.save(&self.workspace);
+        let position = position.unwrap_or_else(|| {
+            self.canvas_for(ai_box)
+                .map(|canvas| {
+                    canvas::default_position_for(
+                        ai_box,
+                        &canvas.items,
+                        &self.all_snippets,
+                        &self.workspace,
+                        &self.ai_boxes,
+                        &canvas::approx_text_rects(&canvas.texts),
+                    )
+                })
+                .unwrap_or_else(|| default_card_position(0))
+        });
+        let target_canvas = if ai_box == &self.root.container_id {
+            Some(&mut self.root)
+        } else {
+            self.folder_views.get_mut(ai_box)
+        };
+        if let Some(canvas) = target_canvas {
+            canvas.items.push(CanvasItem {
+                reference_id: reference_id.clone(),
+                target: ReferenceTarget::Conversation(conversation),
+                role: MemberRole::Conversation,
+                position,
+                size: egui::vec2(CARD_WIDTH, 25.0),
+            });
+            canvas.layout.items.insert(
+                reference_id,
+                CardLayout {
+                    position,
+                    color: None,
+                },
+            );
+            canvas.save_layout(&self.workspace_store);
+        }
+    }
+
+    /// Links an existing snippet as a read-only `Source` of an AI box.
+    fn link_ai_source(&mut self, ai_box: &ContainerId, entity: EntityId, position: Option<[f32; 2]>) {
+        let Ok(reference_id) = self
+            .workspace
+            .add_source_reference(ai_box, ReferenceTarget::Snippet(entity.clone()))
+        else {
+            return;
+        };
+        let _ = self.workspace_store.save(&self.workspace);
+        let position = position.unwrap_or_else(|| {
+            self.canvas_for(ai_box)
+                .map(|canvas| {
+                    canvas::default_position_for(
+                        ai_box,
+                        &canvas.items,
+                        &self.all_snippets,
+                        &self.workspace,
+                        &self.ai_boxes,
+                        &canvas::approx_text_rects(&canvas.texts),
+                    )
+                })
+                .unwrap_or_else(|| default_card_position(0))
+        });
+        let target_canvas = if ai_box == &self.root.container_id {
+            Some(&mut self.root)
+        } else {
+            self.folder_views.get_mut(ai_box)
+        };
+        if let Some(canvas) = target_canvas {
+            canvas.items.push(CanvasItem {
+                reference_id: reference_id.clone(),
+                target: ReferenceTarget::Snippet(entity),
+                role: MemberRole::Source,
+                position,
+                size: egui::vec2(CARD_WIDTH, 25.0),
+            });
+            canvas.layout.items.insert(
+                reference_id,
+                CardLayout {
+                    position,
+                    color: None,
+                },
+            );
+            canvas.save_layout(&self.workspace_store);
+        }
+    }
+
+    /// Removes a `Source` card from an AI box. Unlink only: the underlying
+    /// entity is never deleted, even when this was its last visible reference.
+    fn remove_ai_source(&mut self, ai_box: &ContainerId, reference: &ReferenceId) {
+        let _ = self.workspace.remove_reference(ai_box, reference);
+        let _ = self.workspace_store.save(&self.workspace);
+        let target_canvas = if ai_box == &self.root.container_id {
+            Some(&mut self.root)
+        } else {
+            self.folder_views.get_mut(ai_box)
+        };
+        if let Some(canvas) = target_canvas {
+            canvas.remove_reference(reference, &self.workspace_store);
+        }
+    }
+
+    /// Deletes a conversation: its sidecar state (title, messages, source
+    /// bindings) and its canvas card. Sources, saved outputs and source
+    /// entities are untouched.
+    fn delete_conversation(&mut self, ai_box: &ContainerId, conversation: &ConversationId) {
+        let reference = self
+            .workspace
+            .containers
+            .get(ai_box)
+            .and_then(|container| {
+                container
+                    .members
+                    .iter()
+                    .find(|reference| {
+                        matches!(
+                            &reference.target,
+                            ReferenceTarget::Conversation(id) if id == conversation
+                        )
+                    })
+                    .map(|reference| reference.id.clone())
+            });
+        if let Some(data) = self.ai_boxes.get_mut(ai_box) {
+            data.delete_conversation(conversation);
+            let _ = self.ai_store.save_box(data);
+        }
+        if let Some(reference) = reference {
+            let _ = self.workspace.remove_reference(ai_box, &reference);
+            let _ = self.workspace_store.save(&self.workspace);
+            let target_canvas = if ai_box == &self.root.container_id {
+                Some(&mut self.root)
+            } else {
+                self.folder_views.get_mut(ai_box)
+            };
+            if let Some(canvas) = target_canvas {
+                canvas.remove_reference(&reference, &self.workspace_store);
+            }
+        }
+    }
+
+    /// Renames a conversation in the sidecar (display only; never touches
+    /// source entities). The canvas reads titles from the sidecar cache, so the
+    /// card label updates on the next frame.
+    fn rename_conversation(
+        &mut self,
+        ai_box: &ContainerId,
+        conversation: &ConversationId,
+        title: String,
+    ) -> bool {
+        let title = title.trim();
+        if title.is_empty() {
+            return false;
+        }
+        let Some(data) = self.ai_boxes.get_mut(ai_box) else {
+            return false;
+        };
+        let ok = data.rename_conversation(conversation, title.to_owned());
+        if ok {
+            let _ = self.ai_store.save_box(data);
+        }
+        ok
+    }
+
     /// Applies a clipboard paste into `container`. Returns `false` when the
     /// operation is not allowed (self-reference, moving within the same
     /// container, or a stale target); the menu disables `Paste` in those cases.
@@ -866,21 +1298,37 @@ impl HomePage {
         if !canvas::clipboard_valid_for(entry, container, &self.all_snippets, &self.workspace) {
             return false;
         }
+        // Linking into an AI box always creates a read-only `Source`: Move is
+        // not allowed, so the source card stays in its original box.
+        let is_ai_box = self.workspace.is_ai_box(container);
+        let effective_move = matches!(entry.semantics, ClipboardSemantics::Move) && !is_ai_box;
         let new_reference_id = match &entry.target {
             ReferenceTarget::Snippet(entity_id) => {
-                let Ok(id) = self
-                    .workspace
-                    .add_snippet_reference(container, entity_id.clone())
-                else {
+                let result = if is_ai_box {
+                    self.workspace.add_source_reference(
+                        container,
+                        ReferenceTarget::Snippet(entity_id.clone()),
+                    )
+                } else {
+                    self.workspace
+                        .add_snippet_reference(container, entity_id.clone())
+                };
+                let Ok(id) = result else {
                     return false;
                 };
                 id
             }
             ReferenceTarget::Container(target_id) => {
-                let Ok(id) = self
-                    .workspace
-                    .add_container_reference(container, target_id.clone())
-                else {
+                let result = if is_ai_box {
+                    self.workspace.add_source_reference(
+                        container,
+                        ReferenceTarget::Container(target_id.clone()),
+                    )
+                } else {
+                    self.workspace
+                        .add_container_reference(container, target_id.clone())
+                };
+                let Ok(id) = result else {
                     return false;
                 };
                 id
@@ -890,11 +1338,18 @@ impl HomePage {
             // Conversation cards cannot be pasted into other containers.
             ReferenceTarget::Conversation(_) => return false,
         };
+        let role = if is_ai_box {
+            MemberRole::Source
+        } else {
+            MemberRole::Normal
+        };
         let position = self.canvas_for(container).map(|canvas| {
             canvas::default_position_for(
+                container,
                 &canvas.items,
                 &self.all_snippets,
                 &self.workspace,
+                &self.ai_boxes,
                 &canvas::approx_text_rects(&canvas.texts),
             )
         });
@@ -908,6 +1363,7 @@ impl HomePage {
             canvas.items.push(CanvasItem {
                 reference_id: new_reference_id.clone(),
                 target: entry.target.clone(),
+                role,
                 position,
                 size: egui::vec2(CARD_WIDTH, 25.0),
             });
@@ -920,7 +1376,7 @@ impl HomePage {
             );
             canvas.save_layout(&self.workspace_store);
         }
-        if matches!(entry.semantics, ClipboardSemantics::Move) {
+        if effective_move {
             let _ = self
                 .workspace
                 .remove_reference(&entry.source_container, &entry.reference_id);
@@ -966,21 +1422,37 @@ impl HomePage {
         ) {
             return false;
         }
+        // Dragging into an AI box is always a Link to a read-only Source
+        // (Shift never switches to Move, per plan_ai.md §2.4).
+        let is_ai_box = self.workspace.is_ai_box(container);
+        let move_semantics = move_semantics && !is_ai_box;
         let new_reference_id = match target {
             ReferenceTarget::Snippet(entity_id) => {
-                let Ok(id) = self
-                    .workspace
-                    .add_snippet_reference(container, entity_id.clone())
-                else {
+                let result = if is_ai_box {
+                    self.workspace.add_source_reference(
+                        container,
+                        ReferenceTarget::Snippet(entity_id.clone()),
+                    )
+                } else {
+                    self.workspace
+                        .add_snippet_reference(container, entity_id.clone())
+                };
+                let Ok(id) = result else {
                     return false;
                 };
                 id
             }
             ReferenceTarget::Container(target_id) => {
-                let Ok(id) = self
-                    .workspace
-                    .add_container_reference(container, target_id.clone())
-                else {
+                let result = if is_ai_box {
+                    self.workspace.add_source_reference(
+                        container,
+                        ReferenceTarget::Container(target_id.clone()),
+                    )
+                } else {
+                    self.workspace
+                        .add_container_reference(container, target_id.clone())
+                };
+                let Ok(id) = result else {
                     return false;
                 };
                 id
@@ -990,6 +1462,11 @@ impl HomePage {
             // Conversation cards cannot be dropped into other containers.
             ReferenceTarget::Conversation(_) => return false,
         };
+        let role = if is_ai_box {
+            MemberRole::Source
+        } else {
+            MemberRole::Normal
+        };
         let position = match position {
             Some(position) => position,
             None => {
@@ -997,7 +1474,14 @@ impl HomePage {
                     .canvas_for(container)
                     .map(|canvas| canvas.items.as_slice())
                     .unwrap_or(&[]);
-                canvas::default_position_for(items, &self.all_snippets, &self.workspace, &[])
+                canvas::default_position_for(
+                    container,
+                    items,
+                    &self.all_snippets,
+                    &self.workspace,
+                    &self.ai_boxes,
+                    &[],
+                )
             }
         };
         let target_canvas = if container == &self.root.container_id {
@@ -1009,6 +1493,7 @@ impl HomePage {
             canvas.items.push(CanvasItem {
                 reference_id: new_reference_id.clone(),
                 target: target.clone(),
+                role,
                 position,
                 size: egui::vec2(CARD_WIDTH, 25.0),
             });
@@ -1149,6 +1634,9 @@ impl HomePage {
     /// [`egui::Context::run_ui`].
     pub(crate) fn ui_impl(&mut self, ui: &mut egui::Ui) {
         self.apply_theme(ui.ctx());
+        // Apply worker events that arrived since the last frame (streaming
+        // deltas, completed turns, failures).
+        self.drain_ai_events();
         let root_viewport = ui.ctx().viewport_id();
         // In full-window mode all snippet/folder windows float inside the root
         // viewport, so their dialogs and clipboard entries also carry the root
@@ -1246,6 +1734,7 @@ impl HomePage {
                     &self.store,
                     &mut self.all_snippets,
                     &mut self.clipboard,
+                    &self.ai_boxes,
                     self.settings.snap_to_grid,
                     self.settings.show_grid,
                 )
@@ -1261,6 +1750,7 @@ impl HomePage {
                     &mut self.rename_dialog,
                     &mut self.pending_delete,
                     &mut self.clipboard,
+                    &self.ai_boxes,
                     self.settings.snap_to_grid,
                     self.settings.show_grid,
                 )
@@ -1284,6 +1774,65 @@ impl HomePage {
         self.render_settings_window(ui.ctx());
         // The global search window.
         self.render_search_window(ui.ctx());
+        // The AI conversation window (if open) and its Sources panel.
+        self.render_ai_conversation_window(ui);
+        self.render_ai_sources_panel(ui.ctx());
+        // Repaint while a turn is streaming so deltas appear without waiting
+        // for user input (throttled: the worker event channel bounds the rate).
+        if self.ai_active_turn.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Drains AI worker events once per frame and applies them to the
+    /// conversation state. Events that do not match the active turn identity
+    /// are dropped (late events from a cancelled/duplicated/deleted turn must
+    /// never land in the wrong conversation).
+    fn drain_ai_events(&mut self) {
+        while let Ok(event) = self.ai_events.try_recv() {
+            let Some(active) = self.ai_active_turn.clone() else {
+                continue;
+            };
+            match event {
+                TurnEvent::Delta { identity, delta } => {
+                    if identity != active {
+                        continue;
+                    }
+                    self.ai_streaming.push_str(&delta);
+                }
+                TurnEvent::Done {
+                    identity,
+                    content,
+                    usage: _,
+                } => {
+                    if identity != active {
+                        continue;
+                    }
+                    self.ai_active_turn = None;
+                    let snapshots = std::mem::take(&mut self.ai_snapshots);
+                    self.push_assistant(&identity, &content, MessageStatus::Completed, snapshots);
+                }
+                TurnEvent::Failed { identity, error } => {
+                    if identity != active {
+                        continue;
+                    }
+                    let partial = std::mem::take(&mut self.ai_streaming);
+                    let snapshots = std::mem::take(&mut self.ai_snapshots);
+                    let status = if error.kind == AiErrorKind::Cancelled {
+                        MessageStatus::Stopped
+                    } else {
+                        MessageStatus::Failed
+                    };
+                    let content = if partial.is_empty() {
+                        format!("(error: {})", error.message)
+                    } else {
+                        partial
+                    };
+                    self.ai_active_turn = None;
+                    self.push_assistant(&identity, &content, status, snapshots);
+                }
+            }
+        }
     }
 }
 
@@ -1346,6 +1895,7 @@ mod tests {
         first_session.root.items.push(CanvasItem {
             reference_id,
             target: ReferenceTarget::Container(folder_id),
+            role: MemberRole::Normal,
             position: [320.0, 144.0],
             size: egui::vec2(CARD_WIDTH, 25.0),
         });
@@ -1877,6 +2427,7 @@ mod tests {
             .push(CanvasItem {
                 reference_id: folder_ref,
                 target: ReferenceTarget::Snippet(entity_id.clone()),
+                role: MemberRole::Normal,
                 position: [24.0, 24.0],
                 size: egui::vec2(CARD_WIDTH, 25.0),
             });
@@ -1961,6 +2512,7 @@ mod tests {
                 &page.workspace_store,
                 &page.store,
                 &mut page.clipboard,
+                &page.ai_boxes,
                 page.settings.snap_to_grid,
                 page.settings.show_grid,
                 true,
@@ -1991,6 +2543,7 @@ mod tests {
                 &page.workspace_store,
                 &page.store,
                 &mut page.clipboard,
+                &page.ai_boxes,
                 page.settings.snap_to_grid,
                 page.settings.show_grid,
                 true,
@@ -2093,5 +2646,184 @@ mod tests {
         ));
         // Link semantics: the source card stays in the root box.
         assert_eq!(page.root.items.len(), root_card_count);
+    }
+
+    /// Creates a fresh AI box in the root canvas via the `NewAiBox` command.
+    fn create_ai_box_in_root(page: &mut HomePage) -> ContainerId {
+        let root = page.root.container_id.clone();
+        page.process_canvas_commands(
+            vec![CanvasCommand::NewAiBox {
+                owner: root,
+                position: Some([120.0, 90.0]),
+            }],
+            egui::ViewportId::ROOT,
+        );
+        page.workspace
+            .containers
+            .values()
+            .find(|container| container.kind == ContainerKind::AiWorkspace)
+            .expect("an AI box exists")
+            .id
+            .clone()
+    }
+
+    fn first_snippet_id(page: &HomePage) -> EntityId {
+        page.root
+            .items
+            .iter()
+            .find_map(|item| match &item.target {
+                ReferenceTarget::Snippet(id) => Some(id.clone()),
+                _ => None,
+            })
+            .expect("root has a snippet card")
+    }
+
+    #[test]
+    fn new_ai_box_command_creates_an_ai_workspace_card() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let before = page.root.items.len();
+        let ai_box = create_ai_box_in_root(&mut page);
+
+        assert!(page.workspace.is_ai_box(&ai_box));
+        assert_eq!(page.root.items.len(), before + 1);
+        let item = page
+            .root
+            .items
+            .iter()
+            .find(|item| matches!(&item.target, ReferenceTarget::Container(id) if id == &ai_box))
+            .expect("the AI box card was placed");
+        assert_eq!(item.position, [120.0, 90.0]);
+
+        drop(page);
+        let reloaded = HomePage::new(&folder.0);
+        assert!(reloaded
+            .workspace
+            .containers
+            .values()
+            .any(|container| container.kind == ContainerKind::AiWorkspace));
+    }
+
+    #[test]
+    fn new_conversation_binds_direct_sources_and_adds_card() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let ai_box = create_ai_box_in_root(&mut page);
+        let entity = first_snippet_id(&page);
+
+        page.process_canvas_commands(
+            vec![CanvasCommand::LinkAiSource {
+                ai_box: ai_box.clone(),
+                entity: entity.clone(),
+                position: Some([50.0, 50.0]),
+            }],
+            egui::ViewportId::ROOT,
+        );
+        assert!(page.workspace.containers[&ai_box]
+            .members
+            .iter()
+            .any(|reference| reference.role == MemberRole::Source));
+
+        page.process_canvas_commands(
+            vec![CanvasCommand::NewConversation {
+                ai_box: ai_box.clone(),
+                position: Some([80.0, 80.0]),
+            }],
+            egui::ViewportId::ROOT,
+        );
+
+        let data = page.ai_boxes.get(&ai_box).expect("sidecar loaded");
+        let conversation = data.conversations.values().next().expect("conversation created");
+        assert_eq!(conversation.sources.len(), 1);
+        assert!(matches!(conversation.sources[0], SourceTarget::Snippet(_)));
+        assert!(page.workspace.containers[&ai_box].members.iter().any(|reference| {
+            matches!(&reference.target, ReferenceTarget::Conversation(id) if id == &conversation.id)
+                && reference.role == MemberRole::Conversation
+        }));
+
+        drop(page);
+        let reloaded = HomePage::new(&folder.0);
+        assert_eq!(reloaded.ai_boxes[&ai_box].conversations.len(), 1);
+    }
+
+    #[test]
+    fn remove_ai_source_unlinks_without_deleting_the_entity() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let ai_box = create_ai_box_in_root(&mut page);
+        let entity = first_snippet_id(&page);
+        page.process_canvas_commands(
+            vec![CanvasCommand::LinkAiSource {
+                ai_box: ai_box.clone(),
+                entity: entity.clone(),
+                position: None,
+            }],
+            egui::ViewportId::ROOT,
+        );
+        let reference = page.workspace.containers[&ai_box]
+            .members
+            .iter()
+            .find(|reference| reference.role == MemberRole::Source)
+            .expect("a source reference exists")
+            .id
+            .clone();
+
+        page.process_canvas_commands(
+            vec![CanvasCommand::RemoveAiSource {
+                ai_box: ai_box.clone(),
+                reference: reference.clone(),
+            }],
+            egui::ViewportId::ROOT,
+        );
+
+        assert!(page.workspace.containers[&ai_box]
+            .members
+            .iter()
+            .all(|reference| reference.role != MemberRole::Source));
+        assert!(
+            page.all_snippets.contains_key(&entity),
+            "removing a source never deletes the entity"
+        );
+        drop(page);
+        let reloaded = HomePage::new(&folder.0);
+        assert!(reloaded.all_snippets.contains_key(&entity));
+    }
+
+    #[test]
+    fn deleting_an_ai_box_removes_only_its_sidecar() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let root = page.root.container_id.clone();
+        let ai_box = create_ai_box_in_root(&mut page);
+        page.process_canvas_commands(
+            vec![CanvasCommand::NewConversation {
+                ai_box: ai_box.clone(),
+                position: None,
+            }],
+            egui::ViewportId::ROOT,
+        );
+        assert_eq!(page.ai_boxes[&ai_box].conversations.len(), 1);
+
+        let reference = page.workspace.containers[&root]
+            .members
+            .iter()
+            .find(|reference| {
+                matches!(&reference.target, ReferenceTarget::Container(id) if id == &ai_box)
+            })
+            .expect("root holds the AI box card")
+            .id
+            .clone();
+        page.confirm_delete(PendingDelete {
+            owner: root.clone(),
+            reference,
+            target: ReferenceTarget::Container(ai_box.clone()),
+            origin: egui::ViewportId::ROOT,
+        });
+
+        assert!(!page.workspace.containers.contains_key(&ai_box));
+        assert!(!page.ai_boxes.contains_key(&ai_box));
+        drop(page);
+        let reloaded = HomePage::new(&folder.0);
+        assert!(!reloaded.ai_boxes.contains_key(&ai_box));
     }
 }

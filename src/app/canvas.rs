@@ -6,6 +6,9 @@ pub(super) struct CanvasData<'a> {
     workspace_store: &'a WorkspaceStore,
     snippet_store: &'a SnippetStore,
     clipboard: &'a mut Option<ClipboardEntry>,
+    /// AI sidecar state cache: conversation titles and per-box data used to
+    /// render conversation cards inside AI boxes.
+    ai: &'a BTreeMap<ContainerId, AiBoxData>,
     /// Snap dragged cards and drop positions to the canvas grid (from settings).
     snap_to_grid: bool,
     /// Whether the dot grid is drawn on the canvas (from settings).
@@ -27,6 +30,7 @@ impl<'a> CanvasData<'a> {
         workspace_store: &'a WorkspaceStore,
         snippet_store: &'a SnippetStore,
         clipboard: &'a mut Option<ClipboardEntry>,
+        ai: &'a BTreeMap<ContainerId, AiBoxData>,
         snap_to_grid: bool,
         show_grid: bool,
         is_root: bool,
@@ -38,6 +42,7 @@ impl<'a> CanvasData<'a> {
             workspace_store,
             snippet_store,
             clipboard,
+            ai,
             snap_to_grid,
             show_grid,
             is_root,
@@ -74,9 +79,11 @@ enum DeleteDialogResult {
 impl ContainerCanvas {
     fn default_position(&self, data: &CanvasData<'_>) -> [f32; 2] {
         default_position_for(
+            &self.container_id,
             &self.items,
             data.snippets,
             data.workspace,
+            data.ai,
             &approx_text_rects(&self.texts),
         )
     }
@@ -91,6 +98,7 @@ impl HomePage {
             &self.workspace_store,
             &self.store,
             &mut self.clipboard,
+            &self.ai_boxes,
             self.settings.snap_to_grid,
             self.settings.show_grid,
             true,
@@ -219,6 +227,9 @@ impl HomePage {
                 let ok = match &target {
                     RenameTarget::Snippet { id, .. } => self.rename_snippet(id, new_title),
                     RenameTarget::Folder { id, .. } => self.rename_folder(id, new_title),
+                    RenameTarget::Conversation { ai_box, id, .. } => {
+                        self.rename_conversation(ai_box, id, new_title)
+                    }
                 };
                 if ok {
                     self.rename_dialog.pending = None;
@@ -245,6 +256,7 @@ impl HomePage {
         let target_key = match &target {
             RenameTarget::Snippet { id, .. } => format!("snippet:{}", id.as_str()),
             RenameTarget::Folder { id, .. } => format!("folder:{}", id.as_str()),
+            RenameTarget::Conversation { id, .. } => format!("conversation:{}", id.as_str()),
         };
         let mut confirmed = false;
         let mut cancelled = false;
@@ -344,6 +356,7 @@ impl HomePage {
         rename_dialog: &mut RenameDialogState,
         pending_delete: &mut Option<PendingDelete>,
         clipboard: &mut Option<ClipboardEntry>,
+        ai: &BTreeMap<ContainerId, AiBoxData>,
         snap_to_grid: bool,
         show_grid: bool,
     ) -> Vec<CanvasCommand> {
@@ -360,6 +373,7 @@ impl HomePage {
                     workspace_store,
                     snippet_store,
                     clipboard,
+                    ai,
                     snap_to_grid,
                     show_grid,
                     false,
@@ -410,6 +424,7 @@ impl HomePage {
         snippet_store: &SnippetStore,
         snippets: &mut BTreeMap<EntityId, Snippet>,
         clipboard: &mut Option<ClipboardEntry>,
+        ai: &BTreeMap<ContainerId, AiBoxData>,
         snap_to_grid: bool,
         show_grid: bool,
     ) -> Vec<CanvasCommand> {
@@ -427,6 +442,7 @@ impl HomePage {
                     workspace_store,
                     snippet_store,
                     clipboard,
+                    ai,
                     snap_to_grid,
                     show_grid,
                     false,
@@ -496,7 +512,16 @@ impl HomePage {
         let extent = canvas
             .items
             .iter()
-            .filter(|item| item_label(item, data.snippets, data.workspace).is_some())
+            .filter(|item| {
+                item_label(
+                    &canvas.container_id,
+                    item,
+                    data.snippets,
+                    data.workspace,
+                    data.ai,
+                )
+                .is_some()
+            })
             .fold(egui::Vec2::ZERO, |mut extent, item| {
                 extent.x = extent.x.max(item.position[0] + item.size.x);
                 extent.y = extent.y.max(item.position[1] + item.size.y);
@@ -542,10 +567,15 @@ impl HomePage {
             });
         }
 
+        let canvas_is_ai_box = data.workspace.is_ai_box(&canvas.container_id);
         for index in 0..canvas.items.len() {
-            let Some((title, kind)) =
-                item_label(&canvas.items[index], data.snippets, data.workspace)
-            else {
+            let Some((title, kind)) = item_label(
+                &canvas.container_id,
+                &canvas.items[index],
+                data.snippets,
+                data.workspace,
+                data.ai,
+            ) else {
                 continue;
             };
             let item = &canvas.items[index];
@@ -564,7 +594,29 @@ impl HomePage {
                 CARD_WIDTH - 2.0 * CARD_PADDING_H,
                 ui.visuals().text_color(),
             );
-            let card_size = egui::vec2(CARD_WIDTH, galley.size().y + 2.0 * CARD_MARGIN_Y);
+            // Persistent role tag inside AI boxes (`LINK · READ-ONLY` for
+            // sources, `OUTPUT` for saved answers, `CONVERSATION` for chat
+            // cards). The tag and the dashed/double outline keep the role
+            // readable without hover, per plan_ai.md §4.3.
+            let role = item.role;
+            let tag_galley = if canvas_is_ai_box {
+                let text = match role {
+                    MemberRole::Source => "LINK · READ-ONLY",
+                    MemberRole::Output => "OUTPUT",
+                    MemberRole::Conversation => "CONVERSATION",
+                    _ => "",
+                };
+                (!text.is_empty()).then(|| layout_tag(painter, text, ui.visuals()))
+            } else {
+                None
+            };
+            let tag_height = tag_galley
+                .as_ref()
+                .map_or(0.0, |tag| tag.size().y + 4.0);
+            let card_size = egui::vec2(
+                CARD_WIDTH,
+                galley.size().y + 2.0 * CARD_MARGIN_Y + tag_height,
+            );
             let rect = egui::Rect::from_min_size(
                 canvas_rect.min + egui::vec2(item.position[0], item.position[1]),
                 card_size,
@@ -607,9 +659,81 @@ impl HomePage {
 
             // Special (system) items have no context menu: they cannot be
             // linked, renamed, or deleted.
+            let is_ai_box = data.workspace.is_ai_box(&canvas.container_id);
+            let role = canvas.items[index].role;
             if kind != ItemKind::Special {
                 response.context_menu(|ui| {
                     let origin = ui.ctx().viewport_id();
+                    // Inside an AI box, member roles own the menu: read-only
+                    // sources and conversation cards never expose Link / Move /
+                    // Rename-entity / Delete-entity actions.
+                    if is_ai_box && role == MemberRole::Source {
+                        if ui.button("Open Read-only").clicked() {
+                            match &target {
+                                ReferenceTarget::Snippet(id) => commands.push(
+                                    CanvasCommand::OpenSnippetReadOnly(id.clone()),
+                                ),
+                                ReferenceTarget::Container(id) => {
+                                    commands.push(CanvasCommand::OpenFolder(id.clone()))
+                                }
+                                _ => {}
+                            }
+                            ui.close();
+                        }
+                        if let ReferenceTarget::Snippet(id) = &target
+                            && ui.button("Open Original").clicked()
+                        {
+                            commands.push(CanvasCommand::OpenSnippet(id.clone()));
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .button("Remove Source")
+                            .on_hover_text(
+                                "Removing this card does not delete the original",
+                            )
+                            .clicked()
+                        {
+                            commands.push(CanvasCommand::RemoveAiSource {
+                                ai_box: canvas.container_id.clone(),
+                                reference: reference_id.clone(),
+                            });
+                            ui.close();
+                        }
+                        return;
+                    }
+                    if is_ai_box && role == MemberRole::Conversation {
+                        if ui.button("Open").clicked() {
+                            if let ReferenceTarget::Conversation(id) = &target {
+                                commands.push(CanvasCommand::OpenConversation {
+                                    ai_box: canvas.container_id.clone(),
+                                    conversation: id.clone(),
+                                });
+                            }
+                            ui.close();
+                        }
+                        if ui.button("Rename…").clicked() {
+                            if let ReferenceTarget::Conversation(id) = &target {
+                                commands.push(CanvasCommand::RenameConversation {
+                                    ai_box: canvas.container_id.clone(),
+                                    conversation: id.clone(),
+                                    origin,
+                                });
+                            }
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Delete Conversation").clicked() {
+                            if let ReferenceTarget::Conversation(id) = &target {
+                                commands.push(CanvasCommand::DeleteConversation {
+                                    ai_box: canvas.container_id.clone(),
+                                    conversation: id.clone(),
+                                });
+                            }
+                            ui.close();
+                        }
+                        return;
+                    }
                     if ui.button("Link").clicked() {
                         *data.clipboard = Some(ClipboardEntry {
                             source_container: canvas.container_id.clone(),
@@ -645,8 +769,6 @@ impl HomePage {
                             }
                         }
                         ReferenceTarget::Special(_) => {}
-                        // Conversation cards get their own AI context menu
-                        // (open / rename / delete) in the AI workbench layer.
                         ReferenceTarget::Conversation(_) => {}
                     }
                     let last_link = reference_count(data.workspace, &target) == 1;
@@ -666,6 +788,9 @@ impl HomePage {
 
             if response.clicked() {
                 commands.push(match target {
+                    ReferenceTarget::Snippet(id) if is_ai_box && role == MemberRole::Source => {
+                        CanvasCommand::OpenSnippetReadOnly(id)
+                    }
                     ReferenceTarget::Snippet(id) => CanvasCommand::OpenSnippet(id),
                     ReferenceTarget::Container(id) => CanvasCommand::OpenFolder(id),
                     ReferenceTarget::Special(kind) => CanvasCommand::OpenSpecial(kind),
@@ -732,6 +857,8 @@ impl HomePage {
                     .as_ref()
                     .is_some_and(|drag| drag.index == index),
                 kind,
+                role,
+                tag_galley.as_ref(),
                 ui.visuals(),
             );
             // Highlight a folder card that is currently a drop target.
@@ -789,6 +916,7 @@ impl HomePage {
                 rect,
                 data.snippets,
                 data.workspace,
+                data.ai,
                 &text_layouts,
                 drop_target,
             );
@@ -935,6 +1063,37 @@ impl HomePage {
                     ui.close();
                 }
                 ui.separator();
+                let ai_box = canvas.container_id.clone();
+                let anchor = canvas.menu_anchor;
+                if data.workspace.is_ai_box(&canvas.container_id) {
+                    // Inside an AI box: create a conversation or link a source.
+                    if ui.button("New Conversation…").clicked() {
+                        commands.push(CanvasCommand::NewConversation {
+                            ai_box: ai_box.clone(),
+                            position: anchor,
+                        });
+                        ui.close();
+                    }
+                    ui.menu_button("Link Source…", |ui| {
+                        for (id, snippet) in data.snippets.iter() {
+                            if ui.button(&snippet.title).clicked() {
+                                commands.push(CanvasCommand::LinkAiSource {
+                                    ai_box: ai_box.clone(),
+                                    entity: id.clone(),
+                                    position: anchor,
+                                });
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.separator();
+                } else if ui.button("New AI Box…").clicked() {
+                    commands.push(CanvasCommand::NewAiBox {
+                        owner: canvas.container_id.clone(),
+                        position: anchor,
+                    });
+                    ui.close();
+                }
                 if let Some(entry) = data.clipboard.as_ref() {
                     let valid = clipboard_valid_for(
                         entry,
@@ -1060,6 +1219,7 @@ fn render_canvas_texts(
                 drag_rect,
                 data.snippets,
                 data.workspace,
+                data.ai,
                 text_layouts,
                 None,
             );
@@ -1155,9 +1315,11 @@ enum ItemKind {
 }
 
 fn item_label(
+    container: &ContainerId,
     item: &CanvasItem,
     snippets: &BTreeMap<EntityId, Snippet>,
     workspace: &Workspace,
+    ai: &BTreeMap<ContainerId, AiBoxData>,
 ) -> Option<(String, ItemKind)> {
     let (title, kind) = match &item.target {
         ReferenceTarget::Snippet(id) => (snippets.get(id)?.title.as_str(), ItemKind::Snippet),
@@ -1173,7 +1335,14 @@ fn item_label(
         // The conversation title is resolved from the AI sidecar store when the
         // canvas is rendered inside an AI box; the placeholder keeps the card
         // renderable even if the sidecar entry is missing.
-        ReferenceTarget::Conversation(_) => ("Conversation", ItemKind::Conversation),
+        ReferenceTarget::Conversation(id) => {
+            let title = ai
+                .get(container)
+                .and_then(|data| data.get(id))
+                .map(|conversation| conversation.title.as_str())
+                .unwrap_or("Conversation");
+            (title, ItemKind::Conversation)
+        }
     };
     (!title.is_empty()).then(|| (title.to_owned(), kind))
 }
@@ -1202,6 +1371,7 @@ fn create_snippet(
     canvas.items.push(CanvasItem {
         reference_id: reference_id.clone(),
         target: ReferenceTarget::Snippet(snippet.id.clone()),
+        role: MemberRole::Normal,
         position,
         size: egui::vec2(CARD_WIDTH, 25.0),
     });
@@ -1235,6 +1405,7 @@ fn create_folder(
     canvas.items.push(CanvasItem {
         reference_id: reference_id.clone(),
         target: ReferenceTarget::Container(container_id),
+        role: MemberRole::Normal,
         position,
         size: egui::vec2(CARD_WIDTH, 25.0),
     });
@@ -1252,9 +1423,11 @@ fn create_folder(
 /// already occupied by visible items. Shared between the canvas and the
 /// clipboard paste path.
 pub(super) fn default_position_for(
+    container: &ContainerId,
     items: &[CanvasItem],
     snippets: &BTreeMap<EntityId, Snippet>,
     workspace: &Workspace,
+    ai: &BTreeMap<ContainerId, AiBoxData>,
     text_rects: &[egui::Rect],
 ) -> [f32; 2] {
     for index in 0..640 {
@@ -1264,7 +1437,7 @@ pub(super) fn default_position_for(
             egui::vec2(CARD_WIDTH, 40.0),
         );
         let occupied = items.iter().any(|item| {
-            item_label(item, snippets, workspace).is_some()
+            item_label(container, item, snippets, workspace, ai).is_some()
                 && egui::Rect::from_min_size(
                     egui::pos2(item.position[0], item.position[1]),
                     item.size,
@@ -1472,14 +1645,19 @@ fn paint_drop_preview(
     painter.galley(label_rect.min, galley, accent);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_card(
     painter: &egui::Painter,
     rect: egui::Rect,
     galley: &std::sync::Arc<egui::Galley>,
     dragging: bool,
     kind: ItemKind,
+    role: MemberRole,
+    tag: Option<&std::sync::Arc<egui::Galley>>,
     visuals: &egui::Visuals,
 ) {
+    let source_card = role == MemberRole::Source;
+    let conversation_card = role == MemberRole::Conversation;
     let bg = if dragging {
         visuals.widgets.active.bg_fill
     } else if kind == ItemKind::Special {
@@ -1488,6 +1666,10 @@ fn paint_card(
         visuals.widgets.hovered.bg_fill.gamma_multiply(0.7)
     } else if kind == ItemKind::AiBox {
         visuals.widgets.hovered.bg_fill.gamma_multiply(0.8)
+    } else if source_card {
+        // Lighter fill than an ordinary card: a read-only source is context,
+        // not an owned object.
+        visuals.widgets.inactive.bg_fill.gamma_multiply(0.55)
     } else {
         visuals.widgets.inactive.bg_fill
     };
@@ -1499,16 +1681,71 @@ fn paint_card(
         egui::Stroke::new(1.5, visuals.selection.stroke.color.gamma_multiply(0.65))
     } else if kind == ItemKind::AiBox {
         egui::Stroke::new(1.5, visuals.selection.stroke.color.gamma_multiply(0.8))
+    } else if source_card {
+        egui::Stroke::new(1.0, visuals.weak_text_color().gamma_multiply(0.8))
     } else {
         egui::Stroke::new(1.0, visuals.widgets.inactive.bg_stroke.color)
     };
     painter.rect(rect, 2.5, bg, stroke, egui::StrokeKind::Inside);
+    if source_card && !dragging {
+        // Persistent dashed outline: read-only sources are never solid-bordered.
+        let corners = [
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom(),
+            rect.left_top(),
+        ];
+        painter.add(egui::Shape::dashed_line(
+            &corners,
+            egui::Stroke::new(1.0, visuals.weak_text_color().gamma_multiply(0.9)),
+            4.0,
+            3.0,
+        ));
+    } else if conversation_card && !dragging {
+        // Double outline: a conversation card is a distinct two-part border.
+        painter.rect_stroke(
+            rect.shrink(1.5),
+            2.0,
+            egui::Stroke::new(1.0, visuals.weak_text_color().gamma_multiply(0.7)),
+            egui::StrokeKind::Inside,
+        );
+    }
 
     painter.with_clip_rect(rect).galley(
         rect.min + egui::vec2(CARD_PADDING_H, CARD_MARGIN_Y),
         galley.clone(),
         visuals.text_color(),
     );
+    if let Some(tag) = tag {
+        let tag_pos = rect.min + egui::vec2(CARD_PADDING_H, CARD_MARGIN_Y + galley.size().y + 2.0);
+        let tag_color = if source_card {
+            visuals.weak_text_color().gamma_multiply(0.9)
+        } else {
+            visuals.selection.stroke.color.gamma_multiply(0.8)
+        };
+        painter.with_clip_rect(rect).galley(tag_pos, tag.clone(), tag_color);
+    }
+}
+
+/// Lays out the small persistent role tag inside an AI box card.
+fn layout_tag(
+    painter: &egui::Painter,
+    text: &str,
+    visuals: &egui::Visuals,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(9.0),
+            color: visuals.weak_text_color(),
+            ..Default::default()
+        },
+    );
+    job.wrap.max_width = (CARD_WIDTH - 2.0 * CARD_PADDING_H).max(10.0);
+    painter.layout_job(job)
 }
 
 const TEXT_PADDING_H: f32 = 8.0;
@@ -1636,13 +1873,14 @@ fn overlaps(
     rect: egui::Rect,
     snippets: &BTreeMap<EntityId, Snippet>,
     workspace: &Workspace,
+    ai: &BTreeMap<ContainerId, AiBoxData>,
     text_layouts: &[TextLayout],
     exclude_card: Option<usize>,
 ) -> bool {
     let card_overlap = canvas.items.iter().enumerate().any(|(index, item)| {
         Some(index) != card_index
             && Some(index) != exclude_card
-            && item_label(item, snippets, workspace).is_some()
+            && item_label(&canvas.container_id, item, snippets, workspace, ai).is_some()
             && card_rect(item).intersects(rect)
     });
     let text_overlap = text_layouts

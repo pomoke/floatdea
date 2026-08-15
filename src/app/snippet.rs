@@ -9,6 +9,11 @@ impl HomePage {
     fn mode_menu_items(ui: &mut egui::Ui, view: &View) -> Option<ViewMode> {
         // Plain labels: decorative glyphs (e.g. "✎") are not covered by the
         // installed fonts and render as tofu.
+        if view.read_only {
+            // Linked Source preview: the editor is intentionally unreachable.
+            let _ = ui.selectable_label(true, "Preview (read-only)");
+            return None;
+        }
         if ui
             .selectable_label(view.mode == ViewMode::Source, "Source")
             .clicked()
@@ -21,6 +26,19 @@ impl HomePage {
             Some(ViewMode::Preview)
         } else {
             None
+        }
+    }
+
+    /// Window title for a snippet view: read-only Linked Source previews carry
+    /// a persistent "Linked Source · Read-only" prefix; editing windows show
+    /// "[Edit]"; everything else shows the plain title.
+    fn view_title(view: &View, snippet_title: &str) -> String {
+        if view.read_only {
+            format!("Linked Source · Read-only — {snippet_title} - FloatDea")
+        } else if view.mode.is_editing() {
+            format!("[Edit] {snippet_title} - FloatDea")
+        } else {
+            format!("{snippet_title} - FloatDea")
         }
     }
 
@@ -427,11 +445,7 @@ impl HomePage {
         ui.show_viewport_immediate(
             egui::ViewportId::from_hash_of(("snippet-view", view.id)),
             egui::ViewportBuilder::default()
-                .with_title(if view.mode.is_editing() {
-                    format!("[Edit] {} - FloatDea", snippet.title)
-                } else {
-                    format!("{} - FloatDea", snippet.title)
-                })
+                .with_title(Self::view_title(view, &snippet.title))
                 .with_inner_size([480.0, 320.0]),
             |child_ui, _| {
                 let mut action = Self::render_snippet_panel(
@@ -466,11 +480,7 @@ impl HomePage {
         settings: &Settings,
     ) -> ViewAction {
         let mut open = true;
-        egui::Window::new(if view.mode.is_editing() {
-            format!("[Edit] {} - FloatDea", snippet.title)
-        } else {
-            format!("{} - FloatDea", snippet.title)
-        })
+        egui::Window::new(Self::view_title(view, &snippet.title))
         .id(egui::Id::new(("snippet-window", view.id)))
         .open(&mut open)
         .default_size([480.0, 320.0])
@@ -508,6 +518,11 @@ impl HomePage {
         settings: &Settings,
     ) -> ViewAction {
         let mut action = ViewAction::None;
+        // Linked Source previews never enter the editor (even if a stale state
+        // or menu action tried to switch modes).
+        if view.read_only {
+            view.mode = ViewMode::Preview;
+        }
         let panel = egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
