@@ -12,10 +12,9 @@ enum AiChatAction {
     Send,
     Stop,
     Retry,
-    ToggleSources,
-    DeleteConversation,
     SaveSnippet(usize),
     OpenSource(EntityId),
+    OpenFolder(ContainerId),
 }
 
 impl HomePage {
@@ -81,7 +80,6 @@ impl HomePage {
         }
         if close {
             self.ai_open = None;
-            self.ai_sources_panel = false;
         }
         self.apply_ai_chat_action(ai_box, conversation, action);
     }
@@ -89,7 +87,7 @@ impl HomePage {
     fn apply_ai_chat_action(
         &mut self,
         ai_box: ContainerId,
-        conversation: ConversationId,
+        _conversation: ConversationId,
         action: AiChatAction,
     ) {
         match action {
@@ -97,15 +95,14 @@ impl HomePage {
             AiChatAction::Send => self.ai_send(),
             AiChatAction::Stop => self.ai_stop(),
             AiChatAction::Retry => self.ai_retry(),
-            AiChatAction::ToggleSources => self.ai_sources_panel = !self.ai_sources_panel,
-            AiChatAction::DeleteConversation => {
-                self.ai_open = None;
-                self.delete_conversation(&ai_box, &conversation);
-            }
             AiChatAction::SaveSnippet(index) => self.ai_save_as_snippet(&ai_box, index),
             AiChatAction::OpenSource(id) => {
                 self.clipboard = None;
                 self.open_view(id);
+            }
+            AiChatAction::OpenFolder(id) => {
+                self.clipboard = None;
+                self.open_folder(&id);
             }
         }
     }
@@ -120,95 +117,98 @@ impl HomePage {
     ) -> AiChatAction {
         let mut action = AiChatAction::None;
         let messages = conv.messages.clone();
-        let source_count = conv.sources.len();
 
-        // ---- Header ----
-        ui.horizontal(|ui| {
-            if ui.button(format!("Sources: {source_count}")).clicked() {
-                action = AiChatAction::ToggleSources;
-            }
-            ui.separator();
-            ui.label(page.provider_label());
-            if running {
-                ui.label(
-                    egui::RichText::new("● Generating…")
-                        .color(ui.visuals().selection.stroke.color),
-                );
-            }
-            // Delete conversation: sidecar state + card only; sources and
-            // saved outputs are never touched.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Delete").clicked() {
-                    action = AiChatAction::DeleteConversation;
-                }
-            });
-        });
-        ui.separator();
-
-        // ---- Messages ----
-        let message_area_height = (ui.available_height() - 90.0).max(120.0);
-        egui::ScrollArea::vertical()
-            .id_salt(("ai-messages", conv.id.as_str()))
-            .max_height(message_area_height)
-            .auto_shrink([false, false])
-            .stick_to_bottom(running)
+        // A `CentralPanel` paints the panel background (a bare viewport would
+        // otherwise clear to near-black, making the content unreadable).
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::same(10))
+                    .fill(ui.visuals().panel_fill),
+            )
             .show(ui, |ui| {
-                for (index, message) in messages.iter().enumerate() {
-                    Self::render_chat_message(ui, page, message, index, &mut action);
-                }
-                if running {
-                    let streaming = page.ai_streaming.clone();
-                    ui.add_space(4.0);
-                    let text = if streaming.is_empty() { "…" } else { &streaming };
-                    ui.label(egui::RichText::new(text).italics());
-                }
-            });
-
-        // ---- Input row ----
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::multiline(&mut page.ai_input)
-                    .id(egui::Id::new(("ai-chat-input", conv.id.as_str())))
-                    .desired_width((ui.available_width() - 80.0).max(120.0))
-                    .hint_text("Ask from sources… (Enter to send, Shift+Enter for a newline)"),
-            );
-            if running {
-                if ui.button("Stop").clicked() {
-                    action = AiChatAction::Stop;
-                }
-            } else {
-                let ime_composing = ui.input(|input| {
-                    input.events.iter().any(|event| {
-                        matches!(
-                            event,
-                            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. })
-                                if !text.is_empty()
-                        )
-                    })
-                });
-                let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
-                let shift = ui.input(|input| input.modifiers.shift);
-                // Enter sends only when the IME is not composing (a Chinese IME
-                // uses Enter to commit the composition instead).
-                let enter_send = enter && !shift && !ime_composing;
-                if enter_send {
-                    ui.input_mut(|input| {
-                        input.consume_key(input.modifiers, egui::Key::Enter);
+                // ---- Messages ----
+                let message_area_height = (ui.available_height() - 90.0).max(120.0);
+                egui::ScrollArea::vertical()
+                    .id_salt(("ai-messages", conv.id.as_str()))
+                    .max_height(message_area_height)
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(running)
+                    .show(ui, |ui| {
+                        for (index, message) in messages.iter().enumerate() {
+                            Self::render_chat_message(ui, page, message, index, &mut action);
+                        }
+                        if running {
+                            let streaming = page.ai_streaming.clone();
+                            ui.add_space(4.0);
+                            let text = if streaming.is_empty() { "…" } else { &streaming };
+                            ui.label(egui::RichText::new(text).italics());
+                        }
                     });
-                }
-                let send = ui.button("Send").clicked() || enter_send;
-                if send && !page.ai_input.trim().is_empty() {
-                    action = AiChatAction::Send;
-                }
-            }
-        });
+
+                // ---- Input row (model + status sit next to Send/Stop) ----
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut page.ai_input)
+                            .id(egui::Id::new(("ai-chat-input", conv.id.as_str())))
+                            .desired_width((ui.available_width() - 120.0).max(120.0))
+                            .hint_text("Ask from sources… (Enter to send, Shift+Enter for a newline)"),
+                    );
+                    // The send-side column: primary action on top, model name
+                    // and the generating indicator underneath.
+                    ui.vertical(|ui| {
+                        if running {
+                            if ui.button("Stop").clicked() {
+                                action = AiChatAction::Stop;
+                            }
+                        } else {
+                            let ime_composing = ui.input(|input| {
+                                input.events.iter().any(|event| {
+                                    matches!(
+                                        event,
+                                        egui::Event::Ime(egui::ImeEvent::Preedit { text, .. })
+                                            if !text.is_empty()
+                                    )
+                                })
+                            });
+                            let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                            let shift = ui.input(|input| input.modifiers.shift);
+                            // Enter sends only when the IME is not composing (a
+                            // Chinese IME uses Enter to commit the composition).
+                            let enter_send = enter && !shift && !ime_composing;
+                            if enter_send {
+                                ui.input_mut(|input| {
+                                    input.consume_key(input.modifiers, egui::Key::Enter);
+                                });
+                            }
+                            let send = ui.button("Send").clicked() || enter_send;
+                            if send && !page.ai_input.trim().is_empty() {
+                                action = AiChatAction::Send;
+                            }
+                        }
+                        ui.label(
+                            egui::RichText::new(page.provider_label())
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        if running {
+                            ui.label(
+                                egui::RichText::new("● Generating…")
+                                    .small()
+                                    .color(ui.visuals().selection.stroke.color),
+                            );
+                        }
+                    });
+                });
+            });
 
         action
     }
 
     /// Renders one conversation message (user question or assistant answer)
-    /// with its status badge and per-answer actions.
+    /// with its status badge and per-answer actions (Copy / Retry / Save as
+    /// Snippet via right-click on the answer).
     fn render_chat_message(
         ui: &mut egui::Ui,
         page: &mut HomePage,
@@ -219,140 +219,106 @@ impl HomePage {
         match message.role {
             MessageRole::User => {
                 ui.add_space(4.0);
-                egui::Frame::NONE
-                    .inner_margin(egui::Margin::symmetric(8, 6))
-                    .corner_radius(egui::CornerRadius::same(4))
-                    .fill(ui.visuals().widgets.inactive.bg_fill.gamma_multiply(0.6))
-                    .show(ui, |ui| {
-                        ui.label(&message.content);
-                    });
+                ui.horizontal(|ui| {
+                    // A compact, left-aligned question block.
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(8, 5))
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .fill(ui.visuals().widgets.inactive.bg_fill.gamma_multiply(0.55))
+                        .show(ui, |ui| {
+                            ui.label(&message.content);
+                        });
+                });
             }
             MessageRole::Assistant => {
-                ui.add_space(4.0);
-                egui::Frame::NONE
-                    .inner_margin(egui::Margin::symmetric(4, 6))
+                ui.add_space(6.0);
+                let frame = egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(2, 4))
                     .show(ui, |ui| {
                         if message.content.is_empty() {
                             ui.label("…");
                         } else {
+                            // Turn `[1]`, `[2]`, … citations into links to the
+                            // sources actually used by this answer.
+                            let linked = citation_linked_content(message);
+                            let mut hook_urls: Vec<String> = Vec::new();
+                            for source in &message.sources {
+                                if let SourceTarget::Snippet(id) = &source.target {
+                                    let url = format!("{}.md", id.as_str());
+                                    page.ai_markdown_cache.add_link_hook(url.clone());
+                                    hook_urls.push(url);
+                                }
+                            }
                             let _ = egui_commonmark::CommonMarkViewer::new()
-                                .show(ui, &mut page.ai_markdown_cache, &message.content);
-                        }
-                        // Per-answer status badge.
-                        match message.status {
-                            MessageStatus::Completed => {}
-                            MessageStatus::Stopped => {
-                                ui.label(egui::RichText::new("STOPPED").color(ui.visuals().warn_fg_color));
-                            }
-                            MessageStatus::Failed => {
-                                ui.label(egui::RichText::new("FAILED").color(ui.visuals().error_fg_color));
-                            }
-                            MessageStatus::Stale => {
-                                ui.label(egui::RichText::new("SOURCE CHANGED").color(ui.visuals().warn_fg_color));
+                                .show(ui, &mut page.ai_markdown_cache, &linked);
+                            // A clicked citation opens its source (read-only).
+                            if let Some(url) = hook_urls.iter().find(|url| {
+                                page.ai_markdown_cache.get_link_hook(url) == Some(true)
+                            }) {
+                                let id = url.trim_end_matches(".md");
+                                *action = AiChatAction::OpenSource(EntityId::from_string(id));
                             }
                         }
-                        // This answer's actual sources (clickable, read-only).
+                        // Compact footer: status badge, then the sources
+                        // actually used by this answer (clickable, read-only).
+                        if message.status != MessageStatus::Completed {
+                            ui.add_space(4.0);
+                            let (text, color) = match message.status {
+                                MessageStatus::Stopped => ("STOPPED", ui.visuals().warn_fg_color),
+                                MessageStatus::Failed => ("FAILED", ui.visuals().error_fg_color),
+                                MessageStatus::Stale => ("SOURCE CHANGED", ui.visuals().warn_fg_color),
+                                MessageStatus::Completed => unreachable!(),
+                            };
+                            ui.label(egui::RichText::new(text).small().color(color));
+                        }
                         if !message.sources.is_empty() {
+                            ui.add_space(2.0);
                             ui.horizontal_wrapped(|ui| {
-                                ui.label(egui::RichText::new("Sources:").small());
                                 for source in &message.sources {
-                                    let label = egui::RichText::new(source.title.as_str()).small();
+                                    let label = egui::RichText::new(source.title.as_str())
+                                        .small()
+                                        .color(ui.visuals().weak_text_color());
                                     match &source.target {
                                         SourceTarget::Snippet(id) => {
-                                            if ui.button(label).clicked() {
+                                            if ui.link(label).clicked() {
                                                 *action = AiChatAction::OpenSource(id.clone());
                                             }
                                         }
-                                        SourceTarget::Container(_) => {
-                                            ui.label(label);
+                                        SourceTarget::Container(id) => {
+                                            if ui.link(label).clicked() {
+                                                *action = AiChatAction::OpenFolder(id.clone());
+                                            }
                                         }
                                     }
                                 }
                             });
                         }
-                        // Copy / Retry / Save as Snippet are hover/focus actions.
-                        ui.label("").context_menu(|ui| {
-                            if ui.button("Copy").clicked() {
-                                ui.ctx().copy_text(message.content.clone());
-                                ui.close();
-                            }
-                            if message.status != MessageStatus::Completed
-                                && ui.button("Retry").clicked()
-                            {
-                                *action = AiChatAction::Retry;
-                                ui.close();
-                            }
-                            if message.status == MessageStatus::Completed
-                                && !message.content.trim().is_empty()
-                                && ui.button("Save as Snippet").clicked()
-                            {
-                                *action = AiChatAction::SaveSnippet(index);
-                                ui.close();
-                            }
-                        });
                     });
+                // Actions live on the answer's own interaction region.
+                frame.response.context_menu(|ui| {
+                    if ui.button("Copy").clicked() {
+                        ui.ctx().copy_text(message.content.clone());
+                        ui.close();
+                    }
+                    if message.status != MessageStatus::Completed && ui.button("Retry").clicked() {
+                        *action = AiChatAction::Retry;
+                        ui.close();
+                    }
+                    if message.status == MessageStatus::Completed
+                        && !message.content.trim().is_empty()
+                        && ui.button("Save as Snippet").clicked()
+                    {
+                        *action = AiChatAction::SaveSnippet(index);
+                        ui.close();
+                    }
+                });
             }
         }
     }
 
-    /// The `Sources: N` panel: lists the conversation's bound sources with
-    /// per-source remove (future turns only).
-    pub(super) fn render_ai_sources_panel(&mut self, ctx: &egui::Context) {
-        if !self.ai_sources_panel {
-            return;
-        }
-        let Some((ai_box, conversation)) = self.ai_open.clone() else {
-            self.ai_sources_panel = false;
-            return;
-        };
-        // Resolve the source list before the window so the closure does not
-        // re-borrow `self` while the window builder borrows `ai_sources_panel`.
-        let sources: Vec<(SourceTarget, String)> = self
-            .ai_boxes
-            .get(&ai_box)
-            .and_then(|data| data.get(&conversation))
-            .map(|conv| {
-                conv.sources
-                    .iter()
-                    .filter_map(|target| {
-                        self.resolve_source_text(target, &ai_box)
-                            .map(|(title, _)| (target.clone(), title))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut remove: Option<SourceTarget> = None;
-        egui::Window::new("Sources")
-            .id(egui::Id::new((
-                "ai-sources-panel",
-                ai_box.as_str(),
-                conversation.as_str(),
-            )))
-            .default_size([320.0, 320.0])
-            .open(&mut self.ai_sources_panel)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                if sources.is_empty() {
-                    ui.label("No sources bound. Drag cards into the AI box or use Link Source… on the canvas.");
-                }
-                for (target, title) in &sources {
-                    ui.horizontal(|ui| {
-                        ui.label(title);
-                        if ui.button("Remove").clicked() {
-                            remove = Some(target.clone());
-                        }
-                    });
-                }
-                ui.add_space(6.0);
-                ui.label("Removing a source only affects future turns; past answers keep their snapshots.");
-            });
-        if let Some(target) = remove
-            && let Some(data) = self.ai_boxes.get_mut(&ai_box)
-        {
-            data.unbind_source(&conversation, &target);
-            let _ = self.ai_store.save_box(data);
-        }
-    }
+    // The `Sources: N` panel was removed for a simpler window header. Bound
+    // sources are still used to build each turn's context and are shown per
+    // answer; unbinding per-conversation sources is future work.
 
     // ---- chat actions ----
 
@@ -494,11 +460,19 @@ impl HomePage {
         if !message.sources.is_empty() {
             output.push_str("\n\n## Sources\n\n");
             for (index, source) in message.sources.iter().enumerate() {
-                let id = match &source.target {
-                    SourceTarget::Snippet(id) => id.as_str(),
-                    SourceTarget::Container(id) => id.as_str(),
-                };
-                output.push_str(&format!("{}. [{}]({id}.md)\n", index + 1, source.title));
+                // Snippet sources link with their stable `{id}.md`; container
+                // sources are listed by title (a container is not a page).
+                match &source.target {
+                    SourceTarget::Snippet(id) => output.push_str(&format!(
+                        "{}. [{}]({}.md)\n",
+                        index + 1,
+                        source.title,
+                        id.as_str()
+                    )),
+                    SourceTarget::Container(_) => {
+                        output.push_str(&format!("{}. {}\n", index + 1, source.title));
+                    }
+                }
             }
         }
         let snippet = Snippet {
@@ -664,14 +638,11 @@ impl HomePage {
         snapshots
     }
 
-    /// The provider label shown in the conversation header.
+    /// The model name shown in the conversation header (provider type stays in
+    /// Settings).
     fn provider_label(&self) -> String {
         if self.settings.ai_enabled {
-            format!(
-                "{} · {}",
-                self.settings.ai_provider.label(),
-                self.settings.ai_model
-            )
+            self.settings.ai_model.clone()
         } else {
             "AI off".to_owned()
         }
@@ -683,6 +654,52 @@ impl HomePage {
         let config = self.settings.ai_provider_config();
         build_provider(&config).ok().map(Arc::from)
     }
+}
+
+/// Rewrites `[n]` citation markers in an assistant answer into links to the
+/// `n`-th source actually used by that answer (`[{n}]({id}.md)`). Container
+/// sources and out-of-range numbers are left as plain text. Non-citation
+/// bracket pairs (markdown links, code) are untouched.
+fn citation_linked_content(message: &Message) -> String {
+    let sources = &message.sources;
+    if sources.is_empty() {
+        return message.content.clone();
+    }
+    let mut out = String::new();
+    let chars: Vec<char> = message.content.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '[' {
+            // Scan a closing `]` within a few characters.
+            let mut close = None;
+            let mut j = i + 1;
+            while j < chars.len() && j <= i + 6 {
+                if chars[j] == ']' {
+                    close = Some(j);
+                    break;
+                }
+                if !chars[j].is_ascii_digit() {
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(close_index) = close {
+                let number: String = chars[i + 1..close_index].iter().collect();
+                if let Ok(n) = number.parse::<usize>()
+                    && n >= 1
+                    && let Some(source) = sources.get(n - 1)
+                    && let SourceTarget::Snippet(id) = &source.target
+                {
+                    out.push_str(&format!("[{n}]({}.md)", id.as_str()));
+                    i = close_index + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -747,7 +764,7 @@ mod tests {
         page.process_canvas_commands(
             vec![CanvasCommand::LinkAiSource {
                 ai_box: ai_box.clone(),
-                entity: entity.clone(),
+                target: ReferenceTarget::Snippet(entity.clone()),
                 position: None,
             }],
             egui::ViewportId::ROOT,
@@ -884,5 +901,117 @@ mod tests {
         assert_eq!(conversation_data.messages[1].role, MessageRole::User);
         assert_eq!(conversation_data.messages[2].role, MessageRole::Assistant);
         assert_eq!(conversation_data.messages[2].status, MessageStatus::Completed);
+    }
+
+    #[test]
+    fn citation_links_are_built_from_this_answers_sources() {
+        let entity = EntityId::new();
+        let mut message = Message::assistant(
+            "See [1] and [2]; [3] is out of range and [text](https://example.com) is a link.",
+            TurnTaskId::new(),
+        );
+        message.sources = vec![
+            SourceRef {
+                target: SourceTarget::Snippet(entity.clone()),
+                title: "one".to_owned(),
+                content_hash: None,
+            },
+            SourceRef {
+                target: SourceTarget::Container(ContainerId::new()),
+                title: "two".to_owned(),
+                content_hash: None,
+            },
+        ];
+
+        let linked = citation_linked_content(&message);
+
+        assert!(
+            linked.contains(&format!("[1]({}.md)", entity.as_str())),
+            "snippet citations become links: {linked}"
+        );
+        assert!(
+            linked.contains("[2]"),
+            "container citations stay as plain text"
+        );
+        assert!(linked.contains("[3] is out of range"));
+        assert!(linked.contains("[text](https://example.com)"));
+    }
+
+    #[test]
+    fn linking_a_folder_brings_its_members_into_context() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let root = page.root.container_id.clone();
+        page.process_canvas_commands(
+            vec![CanvasCommand::NewAiBox {
+                owner: root.clone(),
+                position: None,
+            }],
+            egui::ViewportId::ROOT,
+        );
+        let ai_box = page
+            .workspace
+            .containers
+            .values()
+            .find(|container| container.kind == ContainerKind::AiWorkspace)
+            .expect("AI box exists")
+            .id
+            .clone();
+        let knowledge = page.workspace.create_container("Knowledge");
+        let member = first_snippet_id(&page);
+        page.workspace
+            .add_snippet_reference(&knowledge, member.clone())
+            .unwrap();
+
+        // Link the folder itself as a Source.
+        page.process_canvas_commands(
+            vec![CanvasCommand::LinkAiSource {
+                ai_box: ai_box.clone(),
+                target: ReferenceTarget::Container(knowledge.clone()),
+                position: None,
+            }],
+            egui::ViewportId::ROOT,
+        );
+        assert!(page.workspace.containers[&ai_box].members.iter().any(|reference| {
+            reference.role == MemberRole::Source
+                && matches!(&reference.target, ReferenceTarget::Container(id) if id == &knowledge)
+        }));
+
+        // A new conversation binds the folder source; the turn request embeds
+        // the folder's direct snippet members into the system prompt.
+        page.process_canvas_commands(
+            vec![CanvasCommand::NewConversation {
+                ai_box: ai_box.clone(),
+                position: None,
+            }],
+            egui::ViewportId::ROOT,
+        );
+        let conversation = page.ai_boxes[&ai_box]
+            .conversations
+            .keys()
+            .next()
+            .cloned()
+            .unwrap();
+        let request = page
+            .build_turn_request(&ai_box, &conversation)
+            .expect("a turn request builds");
+        let system = request.system.expect("system prompt");
+        assert!(system.contains("[1] Folder Knowledge"));
+        assert!(system.contains(&page.all_snippets[&member].content));
+
+        let snapshots = page.source_snapshots(&ai_box, &conversation);
+        assert_eq!(snapshots.len(), 1);
+        assert!(matches!(snapshots[0].target, SourceTarget::Container(_)));
+    }
+
+    fn first_snippet_id(page: &HomePage) -> EntityId {
+        page.root
+            .items
+            .iter()
+            .find_map(|item| match &item.target {
+                ReferenceTarget::Snippet(id) => Some(id.clone()),
+                _ => None,
+            })
+            .expect("root has a snippet card")
     }
 }

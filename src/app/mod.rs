@@ -82,8 +82,6 @@ pub(crate) struct HomePage {
     ai_open: Option<(ContainerId, ConversationId)>,
     /// Input buffer of the open conversation.
     ai_input: String,
-    /// Whether the `Sources: N` panel of the open conversation is visible.
-    ai_sources_panel: bool,
     /// The running turn (matches streaming events; one per conversation).
     ai_active_turn: Option<TurnIdentity>,
     /// Transient streaming text of the active turn.
@@ -353,10 +351,10 @@ enum CanvasCommand {
         ai_box: ContainerId,
         position: Option<[f32; 2]>,
     },
-    /// Link an existing snippet as a read-only `Source` of an AI box.
+    /// Link an existing snippet or folder as a read-only `Source` of an AI box.
     LinkAiSource {
         ai_box: ContainerId,
-        entity: EntityId,
+        target: ReferenceTarget,
         position: Option<[f32; 2]>,
     },
     /// Remove a `Source` card from an AI box (unlink only; never deletes the
@@ -548,7 +546,6 @@ impl HomePage {
             ai_events,
             ai_open: None,
             ai_input: String::new(),
-            ai_sources_panel: false,
             ai_active_turn: None,
             ai_streaming: String::new(),
             ai_snapshots: Vec::new(),
@@ -906,9 +903,9 @@ impl HomePage {
                 }
                 CanvasCommand::LinkAiSource {
                     ai_box,
-                    entity,
+                    target,
                     position,
-                } => self.link_ai_source(&ai_box, entity, position),
+                } => self.link_ai_source(&ai_box, target, position),
                 CanvasCommand::RemoveAiSource { ai_box, reference } => {
                     self.remove_ai_source(&ai_box, &reference)
                 }
@@ -1168,12 +1165,14 @@ impl HomePage {
         }
     }
 
-    /// Links an existing snippet as a read-only `Source` of an AI box.
-    fn link_ai_source(&mut self, ai_box: &ContainerId, entity: EntityId, position: Option<[f32; 2]>) {
-        let Ok(reference_id) = self
-            .workspace
-            .add_source_reference(ai_box, ReferenceTarget::Snippet(entity.clone()))
-        else {
+    /// Links an existing snippet or folder as a read-only `Source` of an AI box.
+    fn link_ai_source(
+        &mut self,
+        ai_box: &ContainerId,
+        target: ReferenceTarget,
+        position: Option<[f32; 2]>,
+    ) {
+        let Ok(reference_id) = self.workspace.add_source_reference(ai_box, target.clone()) else {
             return;
         };
         let _ = self.workspace_store.save(&self.workspace);
@@ -1199,7 +1198,7 @@ impl HomePage {
         if let Some(canvas) = target_canvas {
             canvas.items.push(CanvasItem {
                 reference_id: reference_id.clone(),
-                target: ReferenceTarget::Snippet(entity),
+                target,
                 role: MemberRole::Source,
                 position,
                 size: egui::vec2(CARD_WIDTH, 25.0),
@@ -1774,9 +1773,8 @@ impl HomePage {
         self.render_settings_window(ui.ctx());
         // The global search window.
         self.render_search_window(ui.ctx());
-        // The AI conversation window (if open) and its Sources panel.
+        // The AI conversation window (if open).
         self.render_ai_conversation_window(ui);
-        self.render_ai_sources_panel(ui.ctx());
         // Repaint while a turn is streaming so deltas appear without waiting
         // for user input (throttled: the worker event channel bounds the rate).
         if self.ai_active_turn.is_some() {
@@ -2714,7 +2712,7 @@ mod tests {
         page.process_canvas_commands(
             vec![CanvasCommand::LinkAiSource {
                 ai_box: ai_box.clone(),
-                entity: entity.clone(),
+                target: ReferenceTarget::Snippet(entity.clone()),
                 position: Some([50.0, 50.0]),
             }],
             egui::ViewportId::ROOT,
@@ -2755,7 +2753,7 @@ mod tests {
         page.process_canvas_commands(
             vec![CanvasCommand::LinkAiSource {
                 ai_box: ai_box.clone(),
-                entity: entity.clone(),
+                target: ReferenceTarget::Snippet(entity.clone()),
                 position: None,
             }],
             egui::ViewportId::ROOT,

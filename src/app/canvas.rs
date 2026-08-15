@@ -1075,11 +1075,33 @@ impl HomePage {
                         ui.close();
                     }
                     ui.menu_button("Link Source…", |ui| {
+                        ui.label(egui::RichText::new("Notes").small().weak());
                         for (id, snippet) in data.snippets.iter() {
                             if ui.button(&snippet.title).clicked() {
                                 commands.push(CanvasCommand::LinkAiSource {
                                     ai_box: ai_box.clone(),
-                                    entity: id.clone(),
+                                    target: ReferenceTarget::Snippet(id.clone()),
+                                    position: anchor,
+                                });
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        ui.label(egui::RichText::new("Folders").small().weak());
+                        // Other folders (and AI boxes) can be linked as a
+                        // container source; the AI box itself is excluded to
+                        // avoid self-reference.
+                        let self_id = canvas.container_id.clone();
+                        for (id, container) in data
+                            .workspace
+                            .containers
+                            .iter()
+                            .filter(|(id, _)| **id != self_id)
+                        {
+                            if ui.button(&container.title).clicked() {
+                                commands.push(CanvasCommand::LinkAiSource {
+                                    ai_box: ai_box.clone(),
+                                    target: ReferenceTarget::Container(id.clone()),
                                     position: anchor,
                                 });
                                 ui.close();
