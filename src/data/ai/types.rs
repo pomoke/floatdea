@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::data::{ContainerId, ConversationId, EntityId, TurnTaskId};
+use super::provider::TokenUsage;
 
 /// The stable version of the per-AI-box sidecar file.
 pub const AI_BOX_DATA_VERSION: u32 = 1;
@@ -86,6 +87,10 @@ pub struct Message {
     /// events and cancellation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_task: Option<TurnTaskId>,
+    /// Token usage reported by the provider for this answer (shown under the
+    /// answer; `None` when the provider does not report usage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
 }
 
 impl Message {
@@ -96,6 +101,7 @@ impl Message {
             sources: Vec::new(),
             status: MessageStatus::Completed,
             turn_task: None,
+            usage: None,
         }
     }
 
@@ -106,6 +112,7 @@ impl Message {
             sources: Vec::new(),
             status: MessageStatus::Completed,
             turn_task: Some(turn_task),
+            usage: None,
         }
     }
 }

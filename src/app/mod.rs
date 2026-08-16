@@ -11,7 +11,7 @@ use floatdea::data::{
     ai::{
         AiBoxData, AiErrorKind, AiStore, AiWorker, ChatMessage, ChatProvider, ChatRequest,
         Conversation, Message, MessageRole, MessageStatus, ProviderKind, SourceRef, SourceTarget,
-        TurnEvent, TurnIdentity, TurnRequest, build_provider, content_hash, now_unix,
+        TokenUsage, TurnEvent, TurnIdentity, TurnRequest, build_provider, content_hash, now_unix,
     },
     settings::{Settings, SettingsStore, ThemeSetting, WindowMode},
     storage::SnippetStore,
@@ -1801,14 +1801,20 @@ impl HomePage {
                 TurnEvent::Done {
                     identity,
                     content,
-                    usage: _,
+                    usage,
                 } => {
                     if identity != active {
                         continue;
                     }
                     self.ai_active_turn = None;
                     let snapshots = std::mem::take(&mut self.ai_snapshots);
-                    self.push_assistant(&identity, &content, MessageStatus::Completed, snapshots);
+                    self.push_assistant(
+                        &identity,
+                        &content,
+                        MessageStatus::Completed,
+                        snapshots,
+                        usage,
+                    );
                 }
                 TurnEvent::Failed { identity, error } => {
                     if identity != active {
@@ -1827,7 +1833,13 @@ impl HomePage {
                         partial
                     };
                     self.ai_active_turn = None;
-                    self.push_assistant(&identity, &content, status, snapshots);
+                    self.push_assistant(
+                        &identity,
+                        &content,
+                        status,
+                        snapshots,
+                        TokenUsage::default(),
+                    );
                 }
             }
         }

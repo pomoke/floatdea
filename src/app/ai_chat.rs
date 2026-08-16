@@ -271,6 +271,24 @@ impl HomePage {
                             };
                             ui.label(egui::RichText::new(text).small().color(color));
                         }
+                        // Token usage reported by the provider for this answer.
+                        if let Some(usage) = message.usage {
+                            let mut parts = Vec::new();
+                            if let Some(input) = usage.input_tokens {
+                                parts.push(format!("in {input}"));
+                            }
+                            if let Some(output) = usage.output_tokens {
+                                parts.push(format!("out {output}"));
+                            }
+                            if !parts.is_empty() {
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new(format!("{} tokens", parts.join(" · ")))
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            }
+                        }
                         if !message.sources.is_empty() {
                             ui.add_space(2.0);
                             ui.horizontal_wrapped(|ui| {
@@ -341,6 +359,7 @@ impl HomePage {
                 "AI is disabled. Enable it in Settings first.",
                 MessageStatus::Failed,
                 Vec::new(),
+                TokenUsage::default(),
             );
             return;
         }
@@ -350,6 +369,7 @@ impl HomePage {
                 "Configure a model in Settings before sending.",
                 MessageStatus::Failed,
                 Vec::new(),
+                TokenUsage::default(),
             );
             return;
         };
@@ -379,7 +399,13 @@ impl HomePage {
             })
             .is_err()
         {
-            self.push_assistant(&identity, "The AI worker is busy or shutting down.", MessageStatus::Failed, snapshots);
+            self.push_assistant(
+                &identity,
+                "The AI worker is busy or shutting down.",
+                MessageStatus::Failed,
+                snapshots,
+                TokenUsage::default(),
+            );
             return;
         }
         self.ai_input.clear();
@@ -396,7 +422,13 @@ impl HomePage {
         let partial = std::mem::take(&mut self.ai_streaming);
         let snapshots = std::mem::take(&mut self.ai_snapshots);
         let content = if partial.is_empty() { "(stopped)".to_owned() } else { partial };
-        self.push_assistant(&active, &content, MessageStatus::Stopped, snapshots);
+        self.push_assistant(
+            &active,
+            &content,
+            MessageStatus::Stopped,
+            snapshots,
+            TokenUsage::default(),
+        );
     }
 
     /// Retries the last turn: removes the failed/stopped assistant answer and
@@ -526,19 +558,24 @@ impl HomePage {
         }
     }
 
-    /// Appends an assistant message to the conversation sidecar.
+    /// Appends an assistant message to the conversation sidecar, including the
+    /// provider-reported token usage (when available).
     pub(super) fn push_assistant(
         &mut self,
         identity: &TurnIdentity,
         content: &str,
         status: MessageStatus,
         sources: Vec<SourceRef>,
+        usage: TokenUsage,
     ) {
         let now = now_unix();
         if let Some(data) = self.ai_boxes.get_mut(&identity.ai_box) {
             let mut message = Message::assistant(content.to_owned(), identity.task.clone());
             message.status = status;
             message.sources = sources;
+            if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
+                message.usage = Some(usage);
+            }
             data.push_message(&identity.conversation, message, now);
             let _ = self.ai_store.save_box(data);
         }
@@ -819,6 +856,12 @@ mod tests {
             "assistant content was: {:?}",
             conversation_data.messages[1].content
         );
+        // The fake provider reports usage; it is persisted on the message.
+        let usage = conversation_data.messages[1]
+            .usage
+            .expect("assistant message records token usage");
+        assert_eq!(usage.input_tokens, Some(12));
+        assert!(usage.output_tokens.is_some());
 
         // Ordinary conversations survive a restart.
         drop(page);

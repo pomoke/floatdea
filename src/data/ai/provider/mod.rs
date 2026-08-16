@@ -170,7 +170,7 @@ impl ChatRequest {
 
 /// Token usage reported by a provider when available. Missing values stay
 /// `None`; the UI must never guess costs from absent usage.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
