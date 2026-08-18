@@ -317,9 +317,30 @@ impl HomePage {
                                 }
                             });
                         }
+                        // Tool receipts are independent, visible events in the
+                        // conversation (plan_ai.md §7.5/§9.8): the tool id and a
+                        // short result summary, colored by status.
+                        if !message.tools.is_empty() {
+                            ui.add_space(2.0);
+                            for tool in &message.tools {
+                                let color = match tool.status {
+                                    ToolStatus::Succeeded => ui.visuals().weak_text_color(),
+                                    ToolStatus::Failed => ui.visuals().error_fg_color,
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "tool {}: {}",
+                                        tool.tool_id, tool.summary
+                                    ))
+                                    .small()
+                                    .color(color),
+                                );
+                            }
+                        }
                     });
-                // A model-proposed new Snippet (plan_ai.md §4.9): Apply/Reject
-                // card, or its Saved/Rejected state after the user acted.
+                // A model-proposed new Snippet (plan_ai.md §4.9), produced by the
+                // `core.create_output_proposal` tool call: Apply/Reject card, or
+                // its Saved/Rejected state after the user acted.
                 if let Some(proposal) = &message.proposal {
                     Self::render_proposal_card(ui, page, ai_box, proposal, index, action);
                 }
@@ -445,6 +466,7 @@ impl HomePage {
                 MessageStatus::Failed,
                 Vec::new(),
                 TokenUsage::default(),
+                Vec::new(),
                 None,
             );
             return;
@@ -456,6 +478,7 @@ impl HomePage {
                 MessageStatus::Failed,
                 Vec::new(),
                 TokenUsage::default(),
+                Vec::new(),
                 None,
             );
             return;
@@ -472,6 +495,16 @@ impl HomePage {
         };
         // Capture the source snapshot at send time.
         let snapshots = self.source_snapshots(&ai_box, &conversation);
+        // The bounded tool scope captured at send time (only used when tools are
+        // enabled; the model can never see anything outside this context).
+        let (tools, tool_context) = if self.settings.ai_tools_enabled {
+            (
+                self.builtin_tools(),
+                Some(self.tool_context_for(&ai_box, &conversation)),
+            )
+        } else {
+            (Vec::new(), None)
+        };
         let identity = TurnIdentity {
             ai_box: ai_box.clone(),
             conversation: conversation.clone(),
@@ -483,6 +516,8 @@ impl HomePage {
                 identity: identity.clone(),
                 request,
                 provider,
+                tools,
+                tool_context,
             })
             .is_err()
         {
@@ -492,6 +527,7 @@ impl HomePage {
                 MessageStatus::Failed,
                 snapshots,
                 TokenUsage::default(),
+                Vec::new(),
                 None,
             );
             return;
@@ -516,6 +552,7 @@ impl HomePage {
             MessageStatus::Stopped,
             snapshots,
             TokenUsage::default(),
+            Vec::new(),
             None,
         );
     }
@@ -727,7 +764,9 @@ impl HomePage {
     }
 
     /// Appends an assistant message to the conversation sidecar, including the
-    /// provider-reported token usage and an optional model-proposed snippet.
+    /// provider-reported token usage, every visible tool receipt and an
+    /// optional model-proposed snippet (from `core.create_output_proposal`).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn push_assistant(
         &mut self,
         identity: &TurnIdentity,
@@ -735,6 +774,7 @@ impl HomePage {
         status: MessageStatus,
         sources: Vec<SourceRef>,
         usage: TokenUsage,
+        tools: Vec<ToolRecord>,
         proposal: Option<SnippetProposal>,
     ) {
         let now = now_unix();
@@ -742,6 +782,7 @@ impl HomePage {
             let mut message = Message::assistant(content.to_owned(), identity.task.clone());
             message.status = status;
             message.sources = sources;
+            message.tools = tools;
             if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
                 message.usage = Some(usage);
             }
@@ -754,7 +795,8 @@ impl HomePage {
     // ---- context building ----
 
     /// Builds the bounded chat request for one turn: the conversation's recent
-    /// history plus the bound sources embedded in the system prompt.
+    /// history, the bound sources embedded in the system prompt and (when
+    /// enabled) the built-in tool definitions.
     fn build_turn_request(
         &self,
         ai_box: &ContainerId,
@@ -773,7 +815,12 @@ impl HomePage {
             }
         }
         let system = self.build_system_prompt(ai_box, &conv.sources);
-        Some(ChatRequest::new(system, messages))
+        let tools = if self.settings.ai_tools_enabled {
+            self.builtin_tools()
+        } else {
+            Vec::new()
+        };
+        Some(ChatRequest::new(system, messages).with_tools(tools))
     }
 
     fn build_system_prompt(
@@ -785,11 +832,8 @@ impl HomePage {
             "You are a knowledge assistant in FloatDea, a local-first notes app.".to_owned(),
             "Answer using ONLY the read-only sources below. Cite sources as [1], [2], … in your answer.".to_owned(),
             "Do not invent facts or sources. If the sources do not contain the answer, say so.".to_owned(),
-            "If your answer is a self-contained deliverable (a new summary, a ready-to-use note), you may propose saving it as a new Snippet. End the answer with a single JSON fenced block:".to_owned(),
-            "```json".to_owned(),
-            "{\"proposal\":{\"title\":\"The new Snippet title\",\"content\":\"The full Markdown body\"}}".to_owned(),
-            "```".to_owned(),
-            "Never modify, append to, replace or delete any existing snippet; only a brand-new Snippet can be created from your proposal.".to_owned(),
+            "When your answer is a self-contained deliverable (a new summary or a ready-to-use note), call the core.create_output_proposal tool with a title and the full Markdown body. Never embed proposal JSON in your reply.".to_owned(),
+            "Never modify, append to, replace or delete any existing snippet; core.create_output_proposal only creates a brand-new Snippet proposal that the user must confirm before it is saved.".to_owned(),
             String::new(),
         ];
         let mut count = 0;
@@ -850,6 +894,37 @@ impl HomePage {
         snapshots
     }
 
+    /// The built-in tool definitions the model may call (plan_ai.md §9.8).
+    fn builtin_tools(&self) -> Vec<ToolDef> {
+        ToolRegistry::builtins().definitions().to_vec()
+    }
+
+    /// Captures the bounded tool context at send time: only the sources bound
+    /// to this conversation, with their title, content and content hash. Tools
+    /// can never read anything outside this list.
+    fn tool_context_for(&self, ai_box: &ContainerId, conversation: &ConversationId) -> ToolContext {
+        let mut sources = Vec::new();
+        if let Some(data) = self.ai_boxes.get(ai_box)
+            && let Some(conv) = data.get(conversation)
+        {
+            let mut index = 0u32;
+            for target in &conv.sources {
+                if let Some((title, text)) = self.resolve_source_text(target, ai_box) {
+                    index += 1;
+                    let content_hash = content_hash(&text);
+                    sources.push(BoundSource {
+                        index,
+                        target: target.clone(),
+                        title,
+                        content: text,
+                        content_hash,
+                    });
+                }
+            }
+        }
+        ToolContext { sources }
+    }
+
     /// The model name shown in the conversation header (provider type stays in
     /// Settings).
     fn provider_label(&self) -> String {
@@ -861,8 +936,11 @@ impl HomePage {
     }
 
     /// Builds the configured provider (fake for tests/offline, genai for
-    /// remote/local services).
+    /// remote/local services). Tests may override it with a scripted provider.
     fn provider_arc(&self) -> Option<Arc<dyn ChatProvider>> {
+        if let Some(provider) = &self.ai_provider_override {
+            return Some(provider.clone());
+        }
         let config = self.settings.ai_provider_config();
         build_provider(&config).ok().map(Arc::from)
     }
@@ -914,167 +992,6 @@ fn citation_linked_content(message: &Message) -> String {
     out
 }
 
-/// The JSON payload the model may append to its answer to propose a new Snippet
-/// (plan_ai.md §9.8 `core.create_output_proposal`): a single fenced block
-///
-/// ```text
-/// ```json
-/// {"proposal":{"title":"...","content":"..."}}
-/// ```
-/// ```
-///
-/// The fence is stripped from the visible answer and the parsed proposal is
-/// surfaced as an Apply/Reject card. Malformed or missing blocks leave the
-/// answer untouched with `None`.
-#[derive(serde::Deserialize)]
-struct ProposalPayload {
-    proposal: SnippetProposal,
-}
-
-/// Parses a model-proposed Snippet out of an assistant answer and strips the
-/// raw JSON from the visible text. The proposal may arrive either as a fenced
-/// ` ```json {"proposal":{...}} ``` ` block (the documented format) or as a
-/// bare `{"proposal":{...}}` object anywhere in the answer. Returns the answer
-/// text with the JSON (and any surrounding fence markers) removed, plus the
-/// parsed proposal; or the unchanged text with `None` when no valid proposal is
-/// present.
-pub(super) fn parse_snippet_proposal(content: &str) -> (String, Option<SnippetProposal>) {
-    if let Some((cleaned, proposal)) = parse_fenced_proposal(content) {
-        return (cleaned, Some(proposal));
-    }
-    if let Some((cleaned, proposal)) = parse_bare_proposal(content) {
-        return (cleaned, Some(proposal));
-    }
-    (content.to_owned(), None)
-}
-
-/// Parses a ` ```json … ``` ` fenced block and removes the whole block
-/// (opener, JSON body and closer) from the answer.
-fn parse_fenced_proposal(content: &str) -> Option<(String, SnippetProposal)> {
-    let mut start_index = None;
-    for (i, line) in content.lines().enumerate() {
-        if line.trim().eq_ignore_ascii_case("```json") {
-            start_index = Some(i);
-            break;
-        }
-    }
-    let start_index = start_index?;
-    let mut end_index = None;
-    for (i, line) in content.lines().enumerate().skip(start_index + 1) {
-        if line.trim() == "```" {
-            end_index = Some(i);
-            break;
-        }
-    }
-    let end_index = end_index?;
-    let json_text: String = content
-        .lines()
-        .skip(start_index + 1)
-        .take(end_index - start_index - 1)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let payload = serde_json::from_str::<ProposalPayload>(&json_text).ok()?;
-    let cleaned = content
-        .lines()
-        .enumerate()
-        .filter(|(i, _)| *i != start_index && *i != end_index)
-        .map(|(_, line)| line)
-        .collect::<Vec<_>>()
-        .join("\n");
-    Some((cleaned.trim().to_owned(), payload.proposal))
-}
-
-/// Parses a bare `{"proposal":{...}}` object appearing anywhere in the answer
-/// and removes just that JSON region (plus any fence markers on the same line).
-fn parse_bare_proposal(content: &str) -> Option<(String, SnippetProposal)> {
-    let bytes = content.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            let mut j = i + 1;
-            while j < bytes.len()
-                && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r')
-            {
-                j += 1;
-            }
-            if content[j..].starts_with("\"proposal\"")
-                && let Some(end) = find_matching_brace(content, i)
-                && let Ok(payload) = serde_json::from_str::<ProposalPayload>(&content[i..=end])
-            {
-                let cleaned = strip_proposal_region(content, i, end);
-                return Some((cleaned.trim().to_owned(), payload.proposal));
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Returns the index of the `}` that closes the `{` at `open`, respecting
-/// nested braces and string literals.
-fn find_matching_brace(content: &str, open: usize) -> Option<usize> {
-    let bytes = content.as_bytes();
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut i = open;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-        } else {
-            match b {
-                b'"' => in_string = true,
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i);
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Removes the JSON region `[start, end]` from `content`, also swallowing a
-/// leading ` ```json ` fence and a trailing ` ``` ` fence that sit on the same
-/// line as the JSON boundaries.
-fn strip_proposal_region(content: &str, start: usize, end: usize) -> String {
-    let line_start = content[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let before = &content[line_start..start];
-    let mut remove_start = start;
-    if let Some(open) = before.rfind("```")
-        && before[open + 3..].trim().is_empty()
-    {
-        remove_start = line_start;
-    }
-    let line_end = content[end..]
-        .find('\n')
-        .map(|i| end + i)
-        .unwrap_or(content.len());
-    let after = &content[end + 1..line_end];
-    let mut remove_end = end + 1;
-    if let Some(close) = after.find("```")
-        && after[..close].trim().is_empty()
-    {
-        remove_end = line_end;
-    }
-    let mut out = String::with_capacity(content.len() - (remove_end - remove_start));
-    out.push_str(&content[..remove_start]);
-    out.push_str(&content[remove_end..]);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1084,6 +1001,7 @@ mod tests {
     };
 
     use super::*;
+    use floatdea::data::ai::provider::FakeProvider;
 
     struct TestFolder(PathBuf);
 
@@ -1384,48 +1302,86 @@ mod tests {
     }
 
     #[test]
-    fn parse_snippet_proposal_extracts_fenced_proposal() {
-        let content = "Here is the summary.\n\n```json\n{\"proposal\":{\"title\":\"New Note\",\"content\":\"# New Note\\n\\nBody text\"}}\n```\n";
-        let (cleaned, proposal) = parse_snippet_proposal(content);
-        assert!(cleaned.contains("Here is the summary."));
-        assert!(!cleaned.contains("```json"));
-        let proposal = proposal.expect("a proposal was parsed");
-        assert_eq!(proposal.title, "New Note");
-        assert!(proposal.content.contains("# New Note"));
-        assert!(proposal.created.is_none());
-        assert!(!proposal.rejected);
-    }
+    fn tool_loop_creates_a_proposal_and_records_the_tool_receipt() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        page.settings.ai_enabled = true;
+        // Script the fake provider: round 1 requests `core.create_output_proposal`,
+        // round 2 streams the final answer.
+        page.ai_provider_override = Some(Arc::from(FakeProvider::tool_proposal(
+            "Draft Note",
+            "# Draft Note\n\nDraft body",
+            "Here is the final summary.",
+        )));
+        let (ai_box, conversation, _) = open_fake_conversation(&mut page);
 
-    #[test]
-    fn parse_snippet_proposal_without_fence_leaves_content_unchanged() {
-        let content = "Just a normal answer. No proposal.";
-        let (cleaned, proposal) = parse_snippet_proposal(content);
-        assert_eq!(cleaned, content);
-        assert!(proposal.is_none());
-    }
+        page.ai_input = "Summarize the sources".to_owned();
+        page.ai_send();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while page.ai_active_turn.is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            page.drain_ai_events();
+        }
+        assert!(page.ai_active_turn.is_none(), "the tool turn completes");
 
-    #[test]
-    fn parse_snippet_proposal_malformed_block_returns_none() {
-        let content = "Answer\n```json\n{not json}\n```\n";
-        let (cleaned, proposal) = parse_snippet_proposal(content);
-        assert_eq!(cleaned, content, "malformed blocks leave the answer untouched");
-        assert!(proposal.is_none());
-    }
-
-    #[test]
-    fn parse_snippet_proposal_strips_bare_json_from_the_text() {
-        // A model may emit the proposal as a bare object instead of a fenced
-        // block; the raw JSON must never appear in the visible answer.
-        let content = "Here is the summary. {\"proposal\":{\"title\":\"Bare Note\",\"content\":\"Body\"}}";
-        let (cleaned, proposal) = parse_snippet_proposal(content);
+        let data = page.ai_boxes[&ai_box].get(&conversation).unwrap();
+        assert_eq!(data.messages.len(), 2);
+        let answer = &data.messages[1];
         assert!(
-            !cleaned.contains("proposal"),
-            "the raw JSON is stripped from the text: {cleaned}"
+            answer.content.contains("final summary"),
+            "the final answer comes from the continuation round: {:?}",
+            answer.content
         );
-        assert!(cleaned.contains("Here is the summary."));
-        let proposal = proposal.expect("a bare proposal was parsed");
-        assert_eq!(proposal.title, "Bare Note");
-        assert_eq!(proposal.content, "Body");
+        // The tool receipt is a visible, persisted event.
+        assert_eq!(answer.tools.len(), 1);
+        assert_eq!(answer.tools[0].tool_id, "core.create_output_proposal");
+        assert_eq!(answer.tools[0].status, ToolStatus::Succeeded);
+        assert!(
+            answer.tools[0].summary.contains("Draft Note"),
+            "receipt summarises the proposal: {}",
+            answer.tools[0].summary
+        );
+        // The proposal card data is attached to the answer.
+        let proposal = answer.proposal.as_ref().expect("a proposal is stored");
+        assert_eq!(proposal.title, "Draft Note");
+        assert!(proposal.content.contains("# Draft Note"));
+        assert!(proposal.created.is_none());
+        // No raw proposal JSON leaks into the visible answer.
+        assert!(!answer.content.contains("proposal"));
+    }
+
+    #[test]
+    fn tool_loop_is_skipped_when_tools_are_disabled() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        page.settings.ai_enabled = true;
+        page.settings.ai_tools_enabled = false;
+        page.ai_provider_override = Some(Arc::from(FakeProvider::tool_proposal(
+            "Draft Note",
+            "Body",
+            "Answer without tools",
+        )));
+        let (ai_box, conversation, _) = open_fake_conversation(&mut page);
+
+        page.ai_input = "Hi".to_owned();
+        page.ai_send();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while page.ai_active_turn.is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            page.drain_ai_events();
+        }
+
+        let data = page.ai_boxes[&ai_box].get(&conversation).unwrap();
+        let answer = &data.messages[1];
+        // With tools disabled the request carries no tool definitions, so the
+        // scripted fake behaves like a plain provider (no tool call, no loop).
+        assert!(answer.tools.is_empty());
+        assert!(answer.proposal.is_none());
+        assert!(
+            answer.content.contains("Fake provider"),
+            "the plain fake reply is used when tools are off: {:?}",
+            answer.content
+        );
     }
 
     #[test]

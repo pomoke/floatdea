@@ -9,9 +9,10 @@ use floatdea::data::{
     ContainerId, ContainerKind, ConversationId, EntityId, ReferenceId, Snippet, TextId,
     TurnTaskId,
     ai::{
-        AiBoxData, AiErrorKind, AiStore, AiWorker, ChatMessage, ChatProvider, ChatRequest,
-        Conversation, Message, MessageRole, MessageStatus, ProviderKind, SnippetProposal, SourceRef,
-        SourceTarget, TokenUsage, TurnEvent, TurnIdentity, TurnRequest, build_provider,
+        AiBoxData, AiErrorKind, AiStore, AiWorker, BoundSource, ChatMessage, ChatProvider,
+        ChatRequest, Conversation, Message, MessageRole, MessageStatus, ProviderKind,
+        SnippetProposal, SourceRef, SourceTarget, TokenUsage, ToolContext, ToolDef, ToolRecord,
+        ToolRegistry, ToolStatus, TurnEvent, TurnIdentity, TurnRequest, build_provider,
         content_hash, now_unix,
     },
     settings::{Settings, SettingsStore, ThemeSetting, WindowMode},
@@ -91,6 +92,9 @@ pub(crate) struct HomePage {
     ai_snapshots: Vec<SourceRef>,
     /// CommonMark cache for the open conversation's assistant answers.
     ai_markdown_cache: egui_commonmark::CommonMarkCache,
+    /// Test hook: overrides the provider built from settings so tests can script
+    /// the fake provider (tool loops, failures). Always `None` in production.
+    ai_provider_override: Option<Arc<dyn ChatProvider>>,
 }
 
 /// State of the global search window.
@@ -551,6 +555,7 @@ impl HomePage {
             ai_streaming: String::new(),
             ai_snapshots: Vec::new(),
             ai_markdown_cache: egui_commonmark::CommonMarkCache::default(),
+            ai_provider_override: None,
         }
     }
 
@@ -1803,22 +1808,24 @@ impl HomePage {
                     identity,
                     content,
                     usage,
+                    tools,
+                    proposal,
                 } => {
                     if identity != active {
                         continue;
                     }
                     self.ai_active_turn = None;
                     let snapshots = std::mem::take(&mut self.ai_snapshots);
-                    // The model may append a fenced `create_output_proposal`
-                    // JSON block (plan_ai.md §4.9/§9.8); it is stripped from the
-                    // visible answer and surfaced as a proposal card.
-                    let (content, proposal) = ai_chat::parse_snippet_proposal(&content);
+                    // Tool receipts are stored on the assistant message as
+                    // independent, visible events; a `core.create_output_proposal`
+                    // call surfaces as the Apply/Reject proposal card.
                     self.push_assistant(
                         &identity,
                         &content,
                         MessageStatus::Completed,
                         snapshots,
                         usage,
+                        tools,
                         proposal,
                     );
                 }
@@ -1845,6 +1852,7 @@ impl HomePage {
                         status,
                         snapshots,
                         TokenUsage::default(),
+                        Vec::new(),
                         None,
                     );
                 }

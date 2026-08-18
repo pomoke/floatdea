@@ -82,6 +82,12 @@ pub struct Settings {
     /// is never written to logs, markdown or audit records.
     #[serde(default)]
     pub ai_api_key: String,
+    /// Whether the model may call the bounded built-in tools
+    /// (`core.list_sources` / `read_source` / `search_sources` /
+    /// `create_output_proposal`, plan_ai.md §9.8). When off, conversations are
+    /// plain chat and no tool receipts or proposals are produced.
+    #[serde(default = "default_ai_tools_enabled")]
+    pub ai_tools_enabled: bool,
 }
 
 impl Settings {
@@ -113,12 +119,17 @@ impl Default for Settings {
             ai_model: default_ai_model(),
             ai_base_url: String::new(),
             ai_api_key: String::new(),
+            ai_tools_enabled: default_ai_tools_enabled(),
         }
     }
 }
 
 fn default_ai_model() -> String {
     "gpt-4o-mini".to_owned()
+}
+
+fn default_ai_tools_enabled() -> bool {
+    true
 }
 
 fn default_preview_font_size() -> f32 {

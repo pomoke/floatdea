@@ -194,6 +194,14 @@ impl HomePage {
             return;
         }
         ui.add_space(8.0);
+        if ui
+            .checkbox(&mut settings.ai_tools_enabled, "Allow model tool calls")
+            .on_hover_text("The model may call bounded built-in tools (list/read/search the bound sources, create an output proposal). Every call shows a visible receipt; proposals still require your confirmation before any snippet is created.")
+            .changed()
+        {
+            *changed = true;
+        }
+        ui.add_space(8.0);
         ui.label("Provider");
         egui::ComboBox::from_id_salt("settings-ai-provider")
             .selected_text(settings.ai_provider.label())

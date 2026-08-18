@@ -2,16 +2,34 @@
 //! never touches the network, so the whole app works offline with AI "off".
 
 use async_trait::async_trait;
+use serde_json::json;
 use tokio::sync::mpsc;
 
 use super::{
     AiError, AiErrorKind, CancelFlag, Capabilities, ChatProvider, ChatRequest, ChatRole,
-    StreamEvent, StreamOutcome, TokenUsage,
+    ChatToolCall, StreamEvent, StreamOutcome, TokenUsage,
 };
+use crate::data::ai::tool::{TOOL_CREATE_OUTPUT_PROPOSAL, TOOL_READ_SOURCE};
+
+/// How a scripted fake provider behaves across the tool loop.
+#[derive(Clone, Debug)]
+enum FakeScript {
+    None,
+    /// Round 1 requests `core.create_output_proposal` with the canned title and
+    /// body; the continuation round streams the canned final answer.
+    Propose {
+        title: String,
+        content: String,
+        answer: String,
+    },
+    /// Round 1 requests `core.read_source` for source #1; the continuation
+    /// round streams the canned final answer.
+    ReadSource { answer: String },
+}
 
 /// A scripted chat provider. The default instance answers deterministically
 /// from the last user message; `canned` lets tests script chunks, delays,
-/// failures and usage.
+/// failures and usage; `tool_*` constructors script a bounded tool round.
 #[derive(Clone, Debug)]
 pub struct FakeProvider {
     chunks: Vec<String>,
@@ -19,6 +37,7 @@ pub struct FakeProvider {
     delay: std::time::Duration,
     /// Fail with `Protocol` after this many chunks (None = never fail).
     fail_after: Option<usize>,
+    script: FakeScript,
 }
 
 impl Default for FakeProvider {
@@ -27,6 +46,7 @@ impl Default for FakeProvider {
             chunks: Vec::new(),
             delay: std::time::Duration::ZERO,
             fail_after: None,
+            script: FakeScript::None,
         }
     }
 }
@@ -44,6 +64,36 @@ impl FakeProvider {
             chunks: chunks.into_iter().map(str::to_owned).collect(),
             delay: std::time::Duration::from_millis(delay_ms),
             fail_after,
+            script: FakeScript::None,
+        }
+    }
+
+    /// A fake provider that exercises the bounded tool loop: the first call
+    /// requests `core.create_output_proposal` with the given title/body, the
+    /// continuation round answers with `answer`.
+    pub fn tool_proposal(title: &str, content: &str, answer: &str) -> Self {
+        Self {
+            chunks: Vec::new(),
+            delay: std::time::Duration::ZERO,
+            fail_after: None,
+            script: FakeScript::Propose {
+                title: title.to_owned(),
+                content: content.to_owned(),
+                answer: answer.to_owned(),
+            },
+        }
+    }
+
+    /// A fake provider that first calls `core.read_source` for source #1 and
+    /// answers with `answer` on the continuation round.
+    pub fn tool_read_source(answer: &str) -> Self {
+        Self {
+            chunks: Vec::new(),
+            delay: std::time::Duration::ZERO,
+            fail_after: None,
+            script: FakeScript::ReadSource {
+                answer: answer.to_owned(),
+            },
         }
     }
 
@@ -71,7 +121,10 @@ impl ChatProvider for FakeProvider {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true }
+        Capabilities {
+            streaming: true,
+            tool_calls: true,
+        }
     }
 
     async fn stream_chat(
@@ -80,19 +133,54 @@ impl ChatProvider for FakeProvider {
         events: mpsc::Sender<StreamEvent>,
         cancel: &CancelFlag,
     ) -> Result<StreamOutcome, AiError> {
-        let full = if self.chunks.is_empty() {
-            self.reply_for(&request)
-        } else {
-            self.chunks.join("")
+        // Scripted tool calls only fire when the request actually carries tool
+        // definitions (mimicking a real model that cannot call unknown tools).
+        // The first call (no tool-role messages yet) emits the scripted tool
+        // call; the continuation round streams the canned final answer.
+        let continuation = request
+            .messages
+            .iter()
+            .any(|message| message.role == ChatRole::Tool);
+        let (full, tool_calls) = match (&self.script, request.tools.is_empty(), continuation) {
+            (_, true, _) => (self.reply_for(&request), Vec::new()),
+            (FakeScript::None, _, _) => (self.reply_for(&request), Vec::new()),
+            (
+                FakeScript::Propose {
+                    title, content, ..
+                },
+                _,
+                false,
+            ) => (
+                String::new(),
+                vec![ChatToolCall {
+                    call_id: "call_propose".to_owned(),
+                    fn_name: TOOL_CREATE_OUTPUT_PROPOSAL.to_owned(),
+                    arguments: json!({ "title": title, "content": content }),
+                }],
+            ),
+            (FakeScript::ReadSource { .. }, _, false) => (
+                String::new(),
+                vec![ChatToolCall {
+                    call_id: "call_read".to_owned(),
+                    fn_name: TOOL_READ_SOURCE.to_owned(),
+                    arguments: json!({ "source": 1 }),
+                }],
+            ),
+            (FakeScript::Propose { answer, .. } | FakeScript::ReadSource { answer }, _, true) => {
+                (answer.clone(), Vec::new())
+            }
         };
         // Preserve the chunk boundaries when scripted; otherwise stream
-        // word-by-word so the UI's delta merging is exercised.
-        let chunks: Vec<String> = if self.chunks.is_empty() {
+        // word-by-word so the UI's delta merging is exercised. Tool-call rounds
+        // stream nothing (the model only emitted a tool request).
+        let chunks: Vec<String> = if tool_calls.is_empty() && !self.chunks.is_empty() {
+            self.chunks.clone()
+        } else if tool_calls.is_empty() {
             full.split(' ')
                 .map(|word| format!("{word} "))
                 .collect()
         } else {
-            self.chunks.clone()
+            Vec::new()
         };
         let mut output = String::new();
         for (index, chunk) in chunks.iter().enumerate() {
@@ -122,6 +210,7 @@ impl ChatProvider for FakeProvider {
                 input_tokens: Some(12),
                 output_tokens: Some(chunks.len() as u32),
             },
+            tool_calls,
         })
     }
 }
@@ -197,5 +286,38 @@ mod tests {
         let (_, outcome) = collect(&provider, ChatRequest::default(), &cancel).await;
         let error = outcome.expect_err("scripted failure after two chunks");
         assert_eq!(error.kind, AiErrorKind::Protocol);
+    }
+
+    #[tokio::test]
+    async fn scripted_proposal_round_requests_the_tool_then_answers() {
+        use crate::data::ai::ToolRegistry;
+        let cancel = CancelFlag::new();
+        let tools = ToolRegistry::builtins().definitions().to_vec();
+        // First call: only a tool request, no text (scripted tool calls only
+        // fire when the request actually carries tool definitions).
+        let (deltas, first) = collect(
+            &FakeProvider::tool_proposal("Draft", "# Draft\n\nBody", "Saved!"),
+            ChatRequest::default().with_tools(tools.clone()),
+            &cancel,
+        )
+        .await;
+        let first = first.expect("tool round succeeds");
+        assert!(deltas.is_empty(), "tool-call rounds stream no text");
+        assert!(first.content.is_empty());
+        assert_eq!(first.tool_calls.len(), 1);
+        assert_eq!(first.tool_calls[0].fn_name, TOOL_CREATE_OUTPUT_PROPOSAL);
+
+        // Continuation round (a tool-role message is present): final answer.
+        let mut continuation = ChatRequest::default().with_tools(tools.clone());
+        continuation.messages.push(ChatMessage::tool_result("call_propose", "ok"));
+        let (_, second) = collect(
+            &FakeProvider::tool_proposal("Draft", "# Draft\n\nBody", "Saved!"),
+            continuation,
+            &cancel,
+        )
+        .await;
+        let second = second.expect("continuation round succeeds");
+        assert!(second.tool_calls.is_empty());
+        assert!(second.content.contains("Saved!"));
     }
 }

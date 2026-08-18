@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::{ContainerId, ConversationId, EntityId, TurnTaskId};
 use super::provider::TokenUsage;
+use super::tool::ToolRecord;
 
 /// The stable version of the per-AI-box sidecar file.
 pub const AI_BOX_DATA_VERSION: u32 = 1;
@@ -114,6 +115,10 @@ pub struct Message {
     /// user messages).
     #[serde(default)]
     pub sources: Vec<SourceRef>,
+    /// Tool receipts of the turn that produced this message: every tool call is
+    /// an independent, visible event in the conversation (plan_ai.md §7.5/§9.8).
+    #[serde(default)]
+    pub tools: Vec<ToolRecord>,
     /// Turn lifecycle status.
     #[serde(default)]
     pub status: MessageStatus,
@@ -125,9 +130,10 @@ pub struct Message {
     /// answer; `None` when the provider does not report usage).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
-    /// A model-proposed new Snippet (plan_ai.md §4.9/§7.6). Unapplied
-    /// proposals are sidecar drafts; `created` records the resulting
-    /// `EntityId` once the user applies it.
+    /// A model-proposed new Snippet (plan_ai.md §4.9/§7.6), produced by the
+    /// `core.create_output_proposal` tool call. Unapplied proposals are sidecar
+    /// drafts; `created` records the resulting `EntityId` once the user applies
+    /// it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<SnippetProposal>,
 }
@@ -138,6 +144,7 @@ impl Message {
             role: MessageRole::User,
             content: content.into(),
             sources: Vec::new(),
+            tools: Vec::new(),
             status: MessageStatus::Completed,
             turn_task: None,
             usage: None,
@@ -150,6 +157,7 @@ impl Message {
             role: MessageRole::Assistant,
             content: content.into(),
             sources: Vec::new(),
+            tools: Vec::new(),
             status: MessageStatus::Completed,
             turn_task: Some(turn_task),
             usage: None,

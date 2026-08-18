@@ -18,6 +18,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use super::tool::ToolDef;
+
 pub use fake::FakeProvider;
 pub use genai_adapter::GenaiAdapter;
 
@@ -123,6 +125,20 @@ pub enum ChatRole {
     System,
     User,
     Assistant,
+    /// A tool result answering an assistant tool call (used by the continuation
+    /// round of the bounded tool loop).
+    Tool,
+}
+
+/// A tool invocation requested by the model in an assistant message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatToolCall {
+    /// Provider-assigned id used to correlate the tool result.
+    pub call_id: String,
+    /// The namespaced tool id, e.g. `core.read_source`.
+    pub fn_name: String,
+    /// JSON arguments as provided by the model.
+    pub arguments: serde_json::Value,
 }
 
 /// One message of a bounded chat request.
@@ -130,6 +146,11 @@ pub enum ChatRole {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// Assistant tool calls requested by the model (only for `Assistant`
+    /// messages in the tool loop).
+    pub tool_calls: Vec<ChatToolCall>,
+    /// For `Tool` messages: the id of the assistant call this result answers.
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -137,6 +158,8 @@ impl ChatMessage {
         Self {
             role,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -151,6 +174,26 @@ impl ChatMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::new(ChatRole::Assistant, content)
     }
+
+    /// An assistant message that only carries tool calls (no visible text).
+    pub fn tool_calls(calls: Vec<ChatToolCall>) -> Self {
+        Self {
+            role: ChatRole::Assistant,
+            content: String::new(),
+            tool_calls: calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// A tool-role message feeding one bounded tool result back to the model.
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call_id.into()),
+        }
+    }
 }
 
 /// The bounded request the conversation layer builds for one turn. It contains
@@ -160,11 +203,24 @@ impl ChatMessage {
 pub struct ChatRequest {
     pub system: Option<String>,
     pub messages: Vec<ChatMessage>,
+    /// Tool definitions the model may call this turn. Empty means tool calls
+    /// are disabled and only a plain chat request is sent.
+    pub tools: Vec<ToolDef>,
 }
 
 impl ChatRequest {
     pub fn new(system: Option<String>, messages: Vec<ChatMessage>) -> Self {
-        Self { system, messages }
+        Self {
+            system,
+            messages,
+            tools: Vec::new(),
+        }
+    }
+
+    /// Replaces the tool set (chainable).
+    pub fn with_tools(mut self, tools: Vec<ToolDef>) -> Self {
+        self.tools = tools;
+        self
     }
 }
 
@@ -187,13 +243,16 @@ pub enum StreamEvent {
 pub struct StreamOutcome {
     pub content: String,
     pub usage: TokenUsage,
+    /// Tool invocations requested by the model this round (empty = final text).
+    pub tool_calls: Vec<ChatToolCall>,
 }
 
-/// Per-provider capability matrix. MVP only needs streaming; missing features
-/// must degrade explicitly in the UI instead of being faked.
+/// Per-provider capability matrix. MVP needs streaming and bounded tool calls;
+/// missing features must degrade explicitly in the UI instead of being faked.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Capabilities {
     pub streaming: bool,
+    pub tool_calls: bool,
 }
 
 /// Shared cancellation flag for one turn task. Setting it tells the provider
@@ -226,9 +285,11 @@ pub trait ChatProvider: Send + Sync {
     fn capabilities(&self) -> Capabilities;
 
     /// Runs one bounded chat request, streaming text deltas into `events` and
-    /// returning the completed outcome. Must yield `Done`-equivalent state
-    /// exactly once (via the returned `StreamOutcome`) and must stop producing
-    /// deltas once `cancel` is set.
+    /// returning the completed outcome. Must yield a terminal `StreamOutcome`
+    /// exactly once and must stop producing deltas once `cancel` is set. When
+    /// the model requests tools, they are returned in `StreamOutcome.tool_calls`
+    /// (no text is expected for that round); the caller feeds the results back
+    /// in a continuation round.
     async fn stream_chat(
         &self,
         request: ChatRequest,

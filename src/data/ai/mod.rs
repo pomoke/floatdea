@@ -8,14 +8,20 @@
 
 pub mod provider;
 mod store;
+pub mod tool;
 mod types;
 pub mod worker;
 
 pub use provider::{
     AiError, AiErrorKind, CancelFlag, Capabilities, ChatMessage, ChatProvider, ChatRequest,
-    ChatRole, ProviderConfig, ProviderKind, StreamEvent, StreamOutcome, TokenUsage, build_provider,
+    ChatRole, ChatToolCall, ProviderConfig, ProviderKind, StreamEvent, StreamOutcome, TokenUsage,
+    build_provider,
 };
 pub use store::AiStore;
+pub use tool::{
+    BoundSource, ToolCall, ToolContext, ToolDef, ToolRecord, ToolRegistry, ToolSideEffect,
+    ToolSource, ToolStatus, execute_tool_call,
+};
 pub use types::{
     AI_BOX_DATA_VERSION, AiBoxData, Conversation, Message, MessageRole, MessageStatus,
     SnippetProposal, SourceRef, SourceTarget, content_hash, now_unix,
