@@ -19,6 +19,7 @@ pub const TOOL_LIST_SOURCES: &str = "core.list_sources";
 pub const TOOL_READ_SOURCE: &str = "core.read_source";
 pub const TOOL_SEARCH_SOURCES: &str = "core.search_sources";
 pub const TOOL_CREATE_OUTPUT_PROPOSAL: &str = "core.create_output_proposal";
+pub const TOOL_READ_FILE: &str = "core.read_file";
 
 /// Maximum characters of a proposal body accepted from the model. Bounds the
 /// sidecar payload a misbehaving model could otherwise flood.
@@ -88,6 +89,9 @@ pub struct BoundSource {
     pub content: String,
     /// FNV-1a hash of `content` at send time.
     pub content_hash: String,
+    /// Absolute file path on disk, set only for `ExternalFile` sources. Used by
+    /// `core.read_file` to read additional content beyond the initial excerpt.
+    pub file_path: Option<String>,
 }
 
 /// The bounded read scope handed to tools for one turn. It contains only the
@@ -177,6 +181,7 @@ pub fn execute_tool_call(
         TOOL_READ_SOURCE => read_source(call, def, ctx),
         TOOL_SEARCH_SOURCES => search_sources(call, def, ctx),
         TOOL_CREATE_OUTPUT_PROPOSAL => create_output_proposal(call, def),
+        TOOL_READ_FILE => read_file(call, def, ctx),
         _ => failed(call, "tool is registered but not executable"),
     }
 }
@@ -235,6 +240,65 @@ fn read_source(call: &ToolCall, def: &ToolDef, ctx: &ToolContext) -> ToolResult 
         call,
         content,
         format!("read source #{number} ({})", source.title),
+    )
+}
+
+/// `core.read_file`: reads additional content from an external file source by
+/// its 1-based source number. The file path is captured at send time and the
+/// tool reads directly from disk, so it can access content beyond the initial
+/// excerpt included in the system prompt.
+fn read_file(call: &ToolCall, def: &ToolDef, ctx: &ToolContext) -> ToolResult {
+    let Some(number) = call
+        .arguments
+        .get("source")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+    else {
+        return failed(call, "missing 'source' (a 1-based source number)");
+    };
+    let Some(source) = ctx.sources.iter().find(|source| source.index == number) else {
+        return failed(call, format!("source #{number} is not bound to this conversation"));
+    };
+    let Some(path) = &source.file_path else {
+        return failed(call, format!("source #{number} is not an external file and cannot be read directly"));
+    };
+    let offset = call
+        .arguments
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let length = call
+        .arguments
+        .get("length")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(4000)
+        .min(16_000);
+    // Read the file from disk at the requested offset.
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => return failed(call, format!("cannot read file: {e}")),
+    };
+    let content = match std::str::from_utf8(&bytes) {
+        Ok(text) => {
+            let start = offset.min(text.len());
+            let end = (start + length).min(text.len());
+            text[start..end].to_owned()
+        }
+        Err(_) => {
+            // Try PDF extraction for non-UTF-8 content (PDFs).
+            let text = pdf_extract::extract_text_from_mem(&bytes)
+                .unwrap_or_else(|_| String::new());
+            let start = offset.min(text.len());
+            let end = (start + length).min(text.len());
+            text[start..end].to_owned()
+        }
+    };
+    let truncated = truncate_chars(&content, def.max_result_bytes);
+    ok(
+        call,
+        truncated,
+        format!("read source #{number} ({} chars)", content.len()),
     )
 }
 
@@ -421,6 +485,35 @@ fn builtin_tools() -> Vec<ToolDef> {
             max_calls_per_turn: 2,
         },
         ToolDef {
+            id: TOOL_READ_FILE.to_owned(),
+            version: 1,
+            name: "Read file".to_owned(),
+            description: "Reads additional content from an external file source by its 1-based source number (as returned by core.list_sources). The initial source excerpt in the prompt is limited; use this tool to read more content, optionally at a specific offset and length. The offset defaults to 0 and the length defaults to 4000 (max 16000).".to_owned(),
+            side_effect: ToolSideEffect::ReadOnly,
+            source: ToolSource::Builtin,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "integer",
+                        "description": "1-based source number from core.list_sources"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Character offset to start reading from (default 0)"
+                    },
+                    "length": {
+                        "type": "integer",
+                        "description": "Number of characters to read (default 4000, max 16000)"
+                    }
+                },
+                "required": ["source"],
+                "additionalProperties": false
+            }),
+            max_result_bytes: 16_000,
+            max_calls_per_turn: 4,
+        },
+        ToolDef {
             id: TOOL_CREATE_OUTPUT_PROPOSAL.to_owned(),
             version: 1,
             name: "Create output proposal".to_owned(),
@@ -499,6 +592,7 @@ mod tests {
                     title: "Alpha".to_owned(),
                     content: "FloatDea is a local-first notes app.".to_owned(),
                     content_hash: "h1".to_owned(),
+                    file_path: None,
                 },
                 BoundSource {
                     index: 2,
@@ -506,6 +600,7 @@ mod tests {
                     title: "Beta".to_owned(),
                     content: "AI boxes keep their scope read-only.".to_owned(),
                     content_hash: "h2".to_owned(),
+                    file_path: None,
                 },
             ],
         }
@@ -524,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn builtins_contain_the_four_first_phase_tools() {
+    fn builtins_contain_the_five_first_phase_tools() {
         let registry = registry();
         let ids: Vec<&str> = registry
             .definitions()
@@ -537,7 +632,8 @@ mod tests {
                 TOOL_LIST_SOURCES,
                 TOOL_READ_SOURCE,
                 TOOL_SEARCH_SOURCES,
-                TOOL_CREATE_OUTPUT_PROPOSAL
+                TOOL_READ_FILE,
+                TOOL_CREATE_OUTPUT_PROPOSAL,
             ]
         );
         assert_eq!(

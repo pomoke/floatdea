@@ -570,6 +570,7 @@ mod tests {
                 title: "Alpha".to_owned(),
                 content: "Some source body".to_owned(),
                 content_hash: "h1".to_owned(),
+                file_path: None,
             }],
         });
         worker

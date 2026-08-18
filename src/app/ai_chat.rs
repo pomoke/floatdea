@@ -6,6 +6,24 @@
 use super::*;
 use floatdea::data::ai::extract_text_from_file;
 
+/// Maximum total characters across all sources in a single system prompt.
+const MAX_TOTAL_SOURCE_CHARS: usize = 32_000;
+/// Maximum characters per individual source.
+const MAX_PER_SOURCE_CHARS: usize = 8_000;
+/// Minimum characters per individual source (to avoid unusably tiny excerpts).
+const MIN_PER_SOURCE_CHARS: usize = 1_000;
+
+/// Returns the per-source character limit adapted to the number of sources so
+/// that the total across all sources stays within [`MAX_TOTAL_SOURCE_CHARS`].
+fn adaptive_source_limit(num_sources: usize) -> usize {
+    if num_sources == 0 {
+        return MAX_PER_SOURCE_CHARS;
+    }
+    MAX_TOTAL_SOURCE_CHARS
+        .div_ceil(num_sources)
+        .clamp(MIN_PER_SOURCE_CHARS, MAX_PER_SOURCE_CHARS)
+}
+
 /// Actions collected from the conversation window this frame, applied after the
 /// window closure (the "UI collects, frame end applies" pattern).
 enum AiChatAction {
@@ -853,8 +871,9 @@ impl HomePage {
         ];
         let mut count = 0;
         let total = sources.len();
+        let max_chars = adaptive_source_limit(total);
         for target in sources {
-            if let Some((title, text)) = self.resolve_source_text(target, ai_box) {
+            if let Some((title, text)) = self.resolve_source_text(target, ai_box, max_chars) {
                 count += 1;
                 parts.push(format!("[{count}] {title}\n{text}"));
             }
@@ -868,12 +887,13 @@ impl HomePage {
 
     /// Resolves a bound source to its display title and content. Containers
     /// expand to their direct snippet members (non-recursive, bounded).
-    fn resolve_source_text(&self, target: &SourceTarget, _ai_box: &ContainerId) -> Option<(String, String)> {
-        const MAX_SOURCE_CHARS: usize = 4000;
+    /// `max_chars` is the adaptive per-source limit calculated from the total
+    /// number of sources (see [`adaptive_source_limit`]).
+    fn resolve_source_text(&self, target: &SourceTarget, _ai_box: &ContainerId, max_chars: usize) -> Option<(String, String)> {
         match target {
             SourceTarget::Snippet(id) => {
                 let snippet = self.all_snippets.get(id)?;
-                let text: String = snippet.content.chars().take(MAX_SOURCE_CHARS).collect();
+                let text: String = snippet.content.chars().take(max_chars).collect();
                 Some((snippet.title.clone(), text))
             }
             SourceTarget::Container(id) => {
@@ -886,7 +906,7 @@ impl HomePage {
                         parts.push(format!("- {}:\n{}", snippet.title, snippet.content));
                     }
                 }
-                let text: String = parts.join("\n\n").chars().take(MAX_SOURCE_CHARS).collect();
+                let text: String = parts.join("\n\n").chars().take(max_chars).collect();
                 Some((format!("Folder {}", container.title), text))
             }
             SourceTarget::ExternalFile(id) => {
@@ -914,7 +934,7 @@ impl HomePage {
                         }
                     }
                 };
-                let text: String = text.chars().take(MAX_SOURCE_CHARS).collect();
+                let text: String = text.chars().take(max_chars).collect();
                 Some((file.title.clone(), text))
             }
         }
@@ -926,8 +946,9 @@ impl HomePage {
         if let Some(data) = self.ai_boxes.get(ai_box)
             && let Some(conv) = data.get(conversation)
         {
+            let max_chars = adaptive_source_limit(conv.sources.len());
             for target in &conv.sources {
-                if let Some((title, text)) = self.resolve_source_text(target, ai_box) {
+                if let Some((title, text)) = self.resolve_source_text(target, ai_box, max_chars) {
                     snapshots.push(SourceRef {
                         target: target.clone(),
                         title,
@@ -952,17 +973,27 @@ impl HomePage {
         if let Some(data) = self.ai_boxes.get(ai_box)
             && let Some(conv) = data.get(conversation)
         {
+            let max_chars = adaptive_source_limit(conv.sources.len());
             let mut index = 0u32;
             for target in &conv.sources {
-                if let Some((title, text)) = self.resolve_source_text(target, ai_box) {
+                if let Some((title, text)) = self.resolve_source_text(target, ai_box, max_chars) {
                     index += 1;
                     let content_hash = content_hash(&text);
+                    // Resolve the file path for ExternalFile sources so the
+                    // `core.read_file` tool can read additional content.
+                    let file_path = match target {
+                        SourceTarget::ExternalFile(id) => {
+                            self.find_external_file(id).map(|f| f.path.clone())
+                        }
+                        _ => None,
+                    };
                     sources.push(BoundSource {
                         index,
                         target: target.clone(),
                         title,
                         content: text,
                         content_hash,
+                        file_path,
                     });
                 }
             }
