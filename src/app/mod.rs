@@ -6,8 +6,8 @@ use eframe::{App, egui};
 use tokio::sync::mpsc;
 
 use floatdea::data::{
-    ContainerId, ContainerKind, ConversationId, EntityId, ReferenceId, Snippet, TextId,
-    TurnTaskId,
+    ContainerId, ContainerKind, ConversationId, EntityId, ExternalFileId, ReferenceId, Snippet,
+    TextId, TurnTaskId,
     ai::{
         AiBoxData, AiErrorKind, AiStore, AiWorker, BoundSource, ChatMessage, ChatProvider,
         ChatRequest, Conversation, Message, MessageRole, MessageStatus, ProviderKind,
@@ -18,8 +18,8 @@ use floatdea::data::{
     settings::{Settings, SettingsStore, ThemeSetting, WindowMode},
     storage::SnippetStore,
     workspace::{
-        CanvasText, CardLayout, ContainerLayout, MemberRole, ReferenceTarget, SpecialKind,
-        Workspace, WorkspaceStore,
+        CanvasText, CardLayout, ContainerLayout, ExternalFileRef, MemberRole, ReferenceTarget,
+        SpecialKind, Workspace, WorkspaceStore,
     },
 };
 
@@ -42,6 +42,8 @@ pub(crate) const ROOT_CANVAS_SIZE: [f32; 2] = [640.0, 480.0];
 /// The larger main-window inner size used in full-window mode to leave room for
 /// the floating snippet/folder windows.
 pub(crate) const FLOATING_MAIN_SIZE: [f32; 2] = [1280.0, 800.0];
+/// How long the "could not open external file" toast stays visible (frames).
+const EXTERNAL_OPEN_ERROR_FRAMES: u32 = 180;
 
 pub(crate) struct HomePage {
     all_snippets: BTreeMap<EntityId, Snippet>,
@@ -95,6 +97,17 @@ pub(crate) struct HomePage {
     /// Test hook: overrides the provider built from settings so tests can script
     /// the fake provider (tool loops, failures). Always `None` in production.
     ai_provider_override: Option<Arc<dyn ChatProvider>>,
+    /// State of the "Insert External File…" dialog (opened from a canvas
+    /// context menu). Like the search window it renders only on the viewport
+    /// that opened it, so the picker appears in the window that asked for it.
+    file_insert: Option<FileInsertState>,
+    /// Transient "could not open external file" toast: message, originating
+    /// viewport, and remaining frames (auto-dismissed after a short while).
+    external_open_error: Option<(String, egui::ViewportId, u32)>,
+    /// Per-frame guard so an OS-level file drop (a single frame-global
+    /// `dropped_files` event shared by every canvas of the viewport) is
+    /// consumed by exactly one canvas. Reset at the start of each frame.
+    os_file_drop_consumed: bool,
 }
 
 /// State of the global search window. Like the rename/delete dialogs, the
@@ -119,6 +132,23 @@ impl Default for SearchState {
             origin: egui::ViewportId::ROOT,
         }
     }
+}
+
+/// State of the "Insert External File…" dialog. Like the rename/delete dialogs
+/// and the search window, the dialog renders **only on the viewport that opened
+/// it** (root or a folder window), so the picker appears where the user asked
+/// for it instead of always floating on the main window.
+struct FileInsertState {
+    open: bool,
+    /// Absolute path typed by the user (or filled by the native file picker).
+    path: String,
+    /// The container whose canvas receives the new card.
+    container: ContainerId,
+    /// The viewport that opened the dialog; it is drawn only there.
+    origin: egui::ViewportId,
+    /// Canvas-local position for the new card (the right-click anchor); `None`
+    /// picks a free default slot.
+    position: Option<[f32; 2]>,
 }
 
 /// Display mode of a snippet viewport.
@@ -189,6 +219,12 @@ enum RenameTarget {
         id: ConversationId,
         origin: egui::ViewportId,
     },
+    /// Rename the display title of an external-file card (the file on disk is
+    /// never renamed).
+    ExternalFile {
+        id: ExternalFileId,
+        origin: egui::ViewportId,
+    },
 }
 
 impl RenameTarget {
@@ -196,7 +232,8 @@ impl RenameTarget {
         match self {
             RenameTarget::Snippet { origin, .. }
             | RenameTarget::Folder { origin, .. }
-            | RenameTarget::Conversation { origin, .. } => *origin,
+            | RenameTarget::Conversation { origin, .. }
+            | RenameTarget::ExternalFile { origin, .. } => *origin,
         }
     }
 }
@@ -396,6 +433,22 @@ enum CanvasCommand {
         conversation: ConversationId,
         origin: egui::ViewportId,
     },
+    /// Open the "Insert External File…" dialog on the originating viewport.
+    OpenFileDialog {
+        container: ContainerId,
+        position: Option<[f32; 2]>,
+    },
+    /// Insert an external-file card into `container` at `position` (or a free
+    /// default slot when `None`).
+    InsertExternalFile {
+        container: ContainerId,
+        file: ExternalFileRef,
+        position: Option<[f32; 2]>,
+    },
+    /// Open an external file with the system's default application.
+    OpenExternalFile(ExternalFileRef),
+    /// Open the rename dialog for an external-file card's display title.
+    RenameExternalFile(ExternalFileId),
 }
 
 impl ContainerCanvas {
@@ -571,6 +624,9 @@ impl HomePage {
             ai_snapshots: Vec::new(),
             ai_markdown_cache: egui_commonmark::CommonMarkCache::default(),
             ai_provider_override: None,
+            file_insert: None,
+            external_open_error: None,
+            os_file_drop_consumed: false,
         }
     }
 
@@ -591,10 +647,13 @@ impl HomePage {
             .filter(|reference| match &reference.target {
                 ReferenceTarget::Snippet(id) => snippets.contains_key(id),
                 ReferenceTarget::Container(id) => workspace.containers.contains_key(id),
-                // Special items and AI conversation cards always resolve (the
-                // conversation sidecar may be absent, in which case the card
-                // simply shows a placeholder title).
-                ReferenceTarget::Special(_) | ReferenceTarget::Conversation(_) => true,
+                // Special items, AI conversation cards, and external file cards
+                // always resolve (the conversation sidecar may be absent, in
+                // which case the card simply shows a placeholder title; the
+                // file itself may be missing, the card still opens it on click).
+                ReferenceTarget::Special(_)
+                | ReferenceTarget::Conversation(_)
+                | ReferenceTarget::ExternalFile(_) => true,
             })
             .enumerate()
             .map(|(index, reference)| CanvasItem {
@@ -733,6 +792,13 @@ impl HomePage {
         }) {
             self.pending_delete = None;
         }
+        if self
+            .file_insert
+            .as_ref()
+            .is_some_and(|state| &state.container == container_id)
+        {
+            self.file_insert = None;
+        }
     }
 
     fn process_canvas_commands(&mut self, commands: Vec<CanvasCommand>, origin: egui::ViewportId) {
@@ -755,7 +821,12 @@ impl HomePage {
                     reference,
                     target,
                 } => {
-                    if reference_count(&self.workspace, &target) == 1 {
+                    if matches!(target, ReferenceTarget::ExternalFile(_)) {
+                        // An external-file card is a plain reference: removing it
+                        // never touches the file on disk, so no confirmation is
+                        // needed even for the last link.
+                        self.remove_reference_only(&owner, &reference);
+                    } else if reference_count(&self.workspace, &target) == 1 {
                         self.pending_delete = Some(PendingDelete {
                             owner,
                             reference,
@@ -770,6 +841,7 @@ impl HomePage {
                     let viewport = egui::ViewportId::from_hash_of(("folder-view", id.as_str()));
                     self.clear_rename_for_viewport(viewport);
                     self.clear_search_for_viewport(viewport);
+                    self.clear_file_ui_for_viewport(viewport);
                     if self.floating_windows() {
                         self.clear_dialog_for_folder(&id);
                     }
@@ -806,6 +878,9 @@ impl HomePage {
                         RenameTarget::Folder { id, .. } => self.rename_folder(id, new_title),
                         RenameTarget::Conversation { ai_box, id, .. } => {
                             self.rename_conversation(ai_box, id, new_title)
+                        }
+                        RenameTarget::ExternalFile { id, .. } => {
+                            self.rename_external_file(id, new_title)
                         }
                     };
                     if ok {
@@ -884,6 +959,47 @@ impl HomePage {
                         self.rename_dialog.focus_requested = false;
                     }
                 }
+                CanvasCommand::OpenFileDialog { container, position } => {
+                    self.file_insert = Some(FileInsertState {
+                        open: true,
+                        path: String::new(),
+                        container,
+                        origin,
+                        position,
+                    });
+                }
+                CanvasCommand::InsertExternalFile {
+                    container,
+                    file,
+                    position,
+                } => self.insert_external_file(&container, file, position),
+                CanvasCommand::OpenExternalFile(file) => {
+                    if let Err(error) = open_path_externally(&file.path) {
+                        self.external_open_error = Some((
+                            format!("Could not open \"{}\": {error}", file.title),
+                            origin,
+                            EXTERNAL_OPEN_ERROR_FRAMES,
+                        ));
+                    }
+                }
+                CanvasCommand::RenameExternalFile(id) => {
+                    let title = self
+                        .workspace
+                        .containers
+                        .values()
+                        .flat_map(|container| &container.members)
+                        .find_map(|reference| match &reference.target {
+                            ReferenceTarget::ExternalFile(file) if file.id == id => {
+                                Some(file.title.clone())
+                            }
+                            _ => None,
+                        });
+                    if let Some(title) = title {
+                        self.rename_dialog.buffer = title;
+                        self.rename_dialog.pending = Some(RenameTarget::ExternalFile { id, origin });
+                        self.rename_dialog.focus_requested = false;
+                    }
+                }
             }
         }
     }
@@ -905,6 +1021,26 @@ impl HomePage {
     fn clear_search_for_viewport(&mut self, viewport_id: egui::ViewportId) {
         if self.search.open && self.search.origin == viewport_id {
             self.search.open = false;
+        }
+    }
+
+    /// Closes the "Insert External File…" dialog and the transient open-error
+    /// toast when the viewport that opened them is gone, so they never get
+    /// stuck in an invisible "open" state.
+    fn clear_file_ui_for_viewport(&mut self, viewport_id: egui::ViewportId) {
+        if self
+            .file_insert
+            .as_ref()
+            .is_some_and(|state| state.origin == viewport_id)
+        {
+            self.file_insert = None;
+        }
+        if self
+            .external_open_error
+            .as_ref()
+            .is_some_and(|(_, origin, _)| *origin == viewport_id)
+        {
+            self.external_open_error = None;
         }
     }
 
@@ -973,6 +1109,9 @@ impl HomePage {
             // Conversation cards are never deleted through the entity-delete
             // path; the AI conversation layer handles their removal.
             ReferenceTarget::Conversation(_) => {}
+            // External-file cards are deleted without confirmation (see the
+            // `DeleteReference` command), so the dialog never opens for them.
+            ReferenceTarget::ExternalFile(_) => {}
         }
         self.pending_delete = None;
     }
@@ -983,6 +1122,111 @@ impl HomePage {
         } else {
             self.folder_views.get(container)
         }
+    }
+
+    // ---- External file references ----
+
+    /// Inserts an external-file card into `container` at `position` (or a free
+    /// default slot when `None`), persisting the reference and the card layout.
+    /// The file on disk is untouched: FloatDea only records its path.
+    fn insert_external_file(
+        &mut self,
+        container: &ContainerId,
+        file: ExternalFileRef,
+        position: Option<[f32; 2]>,
+    ) {
+        let Ok(reference_id) = self
+            .workspace
+            .add_external_file_reference(container, file.clone())
+        else {
+            return;
+        };
+        let _ = self.workspace_store.save(&self.workspace);
+        let position = position.unwrap_or_else(|| {
+            self.canvas_for(container)
+                .map(|canvas| {
+                    canvas::default_position_for(
+                        container,
+                        &canvas.items,
+                        &self.all_snippets,
+                        &self.workspace,
+                        &self.ai_boxes,
+                        &canvas::approx_text_rects(&canvas.texts),
+                    )
+                })
+                .unwrap_or_else(|| default_card_position(0))
+        });
+        // Direct field borrow so the layout save below can also borrow
+        // `self.workspace_store` (a method like `canvas_for_mut` would borrow
+        // all of `self`).
+        let target_canvas = if container == &self.root.container_id {
+            Some(&mut self.root)
+        } else {
+            self.folder_views.get_mut(container)
+        };
+        if let Some(canvas) = target_canvas {
+            canvas.items.push(CanvasItem {
+                reference_id: reference_id.clone(),
+                target: ReferenceTarget::ExternalFile(file),
+                role: MemberRole::Normal,
+                position,
+                size: egui::vec2(CARD_WIDTH, 25.0),
+            });
+            canvas.layout.items.insert(
+                reference_id,
+                CardLayout {
+                    position,
+                    color: None,
+                },
+            );
+            canvas.save_layout(&self.workspace_store);
+        }
+    }
+
+    /// Renames the **display title** of an external-file card. The file on disk
+    /// is never renamed: only the recorded `ExternalFileRef.title` changes, in
+    /// every workspace reference and every open canvas that shares the id.
+    fn rename_external_file(&mut self, id: &ExternalFileId, new_title: String) -> bool {
+        let new_title = new_title.trim().to_owned();
+        if new_title.is_empty() {
+            return false;
+        }
+        let mut found = false;
+        for container in self.workspace.containers.values_mut() {
+            for reference in &mut container.members {
+                if let ReferenceTarget::ExternalFile(file) = &mut reference.target
+                    && &file.id == id
+                {
+                    file.title = new_title.clone();
+                    found = true;
+                }
+            }
+        }
+        // Open canvases cache a clone of the reference target; keep them in
+        // sync so the card label updates without a reload.
+        for item in &mut self.root.items {
+            if let ReferenceTarget::ExternalFile(file) = &mut item.target
+                && &file.id == id
+            {
+                file.title = new_title.clone();
+                found = true;
+            }
+        }
+        for canvas in self.folder_views.values_mut() {
+            for item in &mut canvas.items {
+                if let ReferenceTarget::ExternalFile(file) = &mut item.target
+                    && &file.id == id
+                {
+                    file.title = new_title.clone();
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            return false;
+        }
+        let _ = self.workspace_store.save(&self.workspace);
+        true
     }
 
     // ---- AI workbench operations (阶段 1: no-model workbench) ----
@@ -1299,6 +1543,18 @@ impl HomePage {
             ReferenceTarget::Special(_) => return false,
             // Conversation cards cannot be pasted into other containers.
             ReferenceTarget::Conversation(_) => return false,
+            // External files are plain references between ordinary containers;
+            // they are never valid AI sources (`clipboard_valid_for` rejects
+            // them for AI boxes), so this branch only runs for normal boxes.
+            ReferenceTarget::ExternalFile(file) => {
+                let Ok(id) = self
+                    .workspace
+                    .add_external_file_reference(container, file.clone())
+                else {
+                    return false;
+                };
+                id
+            }
         };
         let role = if is_ai_box {
             MemberRole::Source
@@ -1423,6 +1679,18 @@ impl HomePage {
             ReferenceTarget::Special(_) => return false,
             // Conversation cards cannot be dropped into other containers.
             ReferenceTarget::Conversation(_) => return false,
+            // External files are plain references between ordinary containers;
+            // they are never valid AI sources (`drop_valid_for` rejects them
+            // for AI boxes), so this branch only runs for normal boxes.
+            ReferenceTarget::ExternalFile(file) => {
+                let Ok(id) = self
+                    .workspace
+                    .add_external_file_reference(container, file.clone())
+                else {
+                    return false;
+                };
+                id
+            }
         };
         let role = if is_ai_box {
             MemberRole::Source
@@ -1638,6 +1906,149 @@ fn render_search_window(
     open_id
 }
 
+/// Renders the "Insert External File…" dialog: a path field (the user may type
+/// or paste an absolute path) plus a "Browse…" button that opens the native
+/// file picker (`rfd`). The dialog is drawn **only on the viewport that opened
+/// it** (root or a folder window), mirroring the search window.
+///
+/// Returns the confirmed insert as `(container, position, file)`; the caller
+/// applies it (as a command from a folder window, or directly from the root
+/// pass). The dialog self-dismisses on Insert / Cancel / close button.
+fn render_file_insert_dialog(
+    ui: &egui::Ui,
+    dialog: &mut FileInsertState,
+) -> Option<(ContainerId, Option<[f32; 2]>, ExternalFileRef)> {
+    if !dialog.open || ui.ctx().viewport_id() != dialog.origin {
+        return None;
+    }
+    let mut open = dialog.open;
+    let mut insert: Option<ExternalFileRef> = None;
+    let mut cancel = false;
+    egui::Window::new("Insert External File")
+        .id(egui::Id::new(("file-insert", dialog.origin)))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.label("Reference an external file (PDF, Markdown, …).");
+            ui.add_space(4.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut dialog.path)
+                    .id(egui::Id::new(("file-insert-path", dialog.origin)))
+                    .hint_text("/path/to/document.pdf"),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Browse…").clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_file()
+                {
+                    dialog.path = path.display().to_string();
+                }
+            });
+            let path = dialog.path.trim().to_owned();
+            let valid = !path.is_empty();
+            if valid {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Will show as: {}",
+                        file_stem(&path)
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                if ui.add_enabled(valid, egui::Button::new("Insert")).clicked() {
+                    let title = file_stem(&path);
+                    insert = Some(ExternalFileRef {
+                        id: ExternalFileId::new(),
+                        path,
+                        title,
+                    });
+                }
+            });
+        });
+    if let Some(file) = insert {
+        let container = dialog.container.clone();
+        let position = dialog.position;
+        dialog.open = false;
+        Some((container, position, file))
+    } else {
+        if cancel {
+            dialog.open = false;
+        } else {
+            // Reflect the close button (egui wrote back into `open`).
+            dialog.open = open;
+        }
+        None
+    }
+}
+
+/// Renders the transient "could not open external file" toast in the viewport
+/// that triggered the failed open (bottom-left, mirroring the clipboard status
+/// indicator). The countdown is driven per-frame by [`HomePage::ui_impl`].
+fn render_external_open_error(ui: &egui::Ui, state: &Option<(String, egui::ViewportId, u32)>) {
+    let Some((message, origin, _)) = state else {
+        return;
+    };
+    if ui.ctx().viewport_id() != *origin {
+        return;
+    }
+    egui::Window::new("external-open-error")
+        .id(egui::Id::new(("external-open-error", *origin)))
+        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
+        .collapsible(false)
+        .resizable(false)
+        .title_bar(false)
+        .show(ui.ctx(), |ui| {
+            ui.colored_label(ui.visuals().error_fg_color, message);
+        });
+}
+
+/// Opens `path` with the operating system's default application
+/// (`xdg-open` on Linux, `open` on macOS, `cmd /C start` on Windows).
+/// The child process is detached: FloatDea does not wait for it to exit.
+fn open_path_externally(path: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(path).spawn().map(|_| ())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", path])
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "opening external files is not supported on this platform",
+        ))
+    }
+}
+
+/// The display title of an inserted external file: the file name without its
+/// extension, falling back to the full path when the stem cannot be derived.
+fn file_stem(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| path.to_owned())
+}
+
 /// Case-insensitive substring search over all snippets. Title hits come first,
 /// then body hits; within each group the order follows `BTreeMap` (id) order.
 /// An empty/whitespace query matches nothing.
@@ -1681,6 +2092,14 @@ impl HomePage {
         // Apply worker events that arrived since the last frame (streaming
         // deltas, completed turns, failures).
         self.drain_ai_events();
+        // Count down the transient "could not open external file" toast.
+        if let Some((_, _, frames)) = &mut self.external_open_error {
+            if *frames == 0 {
+                self.external_open_error = None;
+            } else {
+                *frames -= 1;
+            }
+        }
         let root_viewport = ui.ctx().viewport_id();
         // In full-window mode all snippet/folder windows float inside the root
         // viewport, so their dialogs and clipboard entries also carry the root
@@ -1778,6 +2197,7 @@ impl HomePage {
                     &self.store,
                     &mut self.all_snippets,
                     &mut self.clipboard,
+                    &mut self.os_file_drop_consumed,
                     &self.ai_boxes,
                     self.settings.snap_to_grid,
                     self.settings.show_grid,
@@ -1795,6 +2215,9 @@ impl HomePage {
                     &mut self.pending_delete,
                     &mut self.search,
                     &mut self.clipboard,
+                    &mut self.file_insert,
+                    &self.external_open_error,
+                    &mut self.os_file_drop_consumed,
                     &self.ai_boxes,
                     self.settings.snap_to_grid,
                     self.settings.show_grid,
@@ -1821,6 +2244,28 @@ impl HomePage {
         // a folder window renders it inside its own viewport pass).
         if let Some(id) = render_search_window(ui, &mut self.search, &self.all_snippets) {
             self.open_view(id);
+        }
+        // The "Insert External File…" dialog (rendered only on its originating
+        // viewport; a folder window renders it inside its own viewport pass).
+        if let Some((container, position, file)) = self
+            .file_insert
+            .as_mut()
+            .and_then(|state| render_file_insert_dialog(ui, state))
+        {
+            self.file_insert = None;
+            self.insert_external_file(&container, file, position);
+        }
+        // The transient "could not open external file" toast.
+        render_external_open_error(ui, &self.external_open_error);
+        // Diagnostics: a frame-global OS file drop that no canvas consumed means
+        // the events arrived but were rejected (e.g. the drag did not offer
+        // `text/uri-list`), which is worth reporting to the user.
+        if ui.input(|input| !input.raw.dropped_files.is_empty())
+            && !self.os_file_drop_consumed
+        {
+            log::warn!(
+                "OS file drop received but not consumed by any canvas (drag type unsupported?)"
+            );
         }
         // The AI conversation window (if open).
         self.render_ai_conversation_window(ui);
@@ -2035,6 +2480,9 @@ mod tests {
             ReferenceTarget::Conversation(_) => {
                 panic!("clipboard entries never target conversations")
             }
+            ReferenceTarget::ExternalFile(_) => {
+                panic!("clipboard entries never target external files")
+            }
         }));
     }
 
@@ -2217,6 +2665,7 @@ mod tests {
             ReferenceTarget::Container(_) => panic!("root cards are snippets"),
             ReferenceTarget::Special(_) => panic!("root cards are snippets"),
             ReferenceTarget::Conversation(_) => panic!("root cards are snippets"),
+            ReferenceTarget::ExternalFile(_) => panic!("root cards are snippets"),
         };
         page.open_view(snippet_id);
         assert!(page.clipboard.is_none());
@@ -2496,6 +2945,7 @@ mod tests {
             ReferenceTarget::Container(_) => panic!("root cards are snippets"),
             ReferenceTarget::Special(_) => panic!("root cards are snippets"),
             ReferenceTarget::Conversation(_) => panic!("root cards are snippets"),
+            ReferenceTarget::ExternalFile(_) => panic!("root cards are snippets"),
         };
         (entity_id, page.root.items[0].reference_id.clone())
     }
@@ -2601,6 +3051,7 @@ mod tests {
         let folder = TestFolder::new();
         let mut page = HomePage::new(&folder.0);
         {
+            let mut os_file_drop_consumed = false;
             let mut data = canvas::CanvasData::new(
                 &mut page.all_snippets,
                 &mut page.workspace,
@@ -2612,6 +3063,7 @@ mod tests {
                 page.settings.show_grid,
                 true,
                 false,
+                &mut os_file_drop_consumed,
             );
             canvas::create_text(&mut page.root, &mut data, [24.0, 36.0]);
 
@@ -2632,6 +3084,7 @@ mod tests {
         let folder = TestFolder::new();
         let mut page = HomePage::new(&folder.0);
         {
+            let mut os_file_drop_consumed = false;
             let mut data = canvas::CanvasData::new(
                 &mut page.all_snippets,
                 &mut page.workspace,
@@ -2643,6 +3096,7 @@ mod tests {
                 page.settings.show_grid,
                 true,
                 false,
+                &mut os_file_drop_consumed,
             );
             canvas::create_text(&mut page.root, &mut data, [24.0, 24.0]);
             let text_id = page.root.texts[0].id.clone();
@@ -2920,5 +3374,327 @@ mod tests {
         drop(page);
         let reloaded = HomePage::new(&folder.0);
         assert!(!reloaded.ai_boxes.contains_key(&ai_box));
+    }
+
+    fn external_file(path: &str) -> ExternalFileRef {
+        ExternalFileRef {
+            id: ExternalFileId::new(),
+            path: path.to_owned(),
+            title: file_stem(path),
+        }
+    }
+
+    #[test]
+    fn insert_external_file_command_creates_reference_and_card() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let file = external_file("/tmp/notes.pdf");
+        page.process_canvas_commands(
+            vec![CanvasCommand::InsertExternalFile {
+                container: page.root.container_id.clone(),
+                file: file.clone(),
+                position: Some([64.0, 64.0]),
+            }],
+            egui::ViewportId::ROOT,
+        );
+        let target = ReferenceTarget::ExternalFile(file);
+        let card = page
+            .root
+            .items
+            .iter()
+            .find(|item| item.target == target)
+            .expect("external file card was placed");
+        assert_eq!(card.position, [64.0, 64.0]);
+        assert_eq!(card.role, MemberRole::Normal);
+        assert!(page
+            .workspace
+            .root()
+            .members
+            .iter()
+            .any(|reference| reference.target == target));
+        // The card and its reference survive a restart.
+        let reloaded = HomePage::new(&folder.0);
+        assert!(reloaded
+            .root
+            .items
+            .iter()
+            .any(|item| item.target == target));
+    }
+
+    #[test]
+    fn external_file_delete_removes_card_without_confirmation() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let file = external_file("/tmp/spec.pdf");
+        page.insert_external_file(
+            &page.root.container_id.clone(),
+            file.clone(),
+            Some([32.0, 32.0]),
+        );
+        let reference = page
+            .root
+            .items
+            .iter()
+            .find(|item| item.target == ReferenceTarget::ExternalFile(file.clone()))
+            .map(|item| item.reference_id.clone())
+            .expect("external file card exists");
+        page.process_canvas_commands(
+            vec![CanvasCommand::DeleteReference {
+                owner: page.root.container_id.clone(),
+                reference: reference.clone(),
+                target: ReferenceTarget::ExternalFile(file),
+            }],
+            egui::ViewportId::ROOT,
+        );
+        assert!(
+            page.pending_delete.is_none(),
+            "external file cards are removed without a confirmation dialog"
+        );
+        assert!(
+            page.root
+                .items
+                .iter()
+                .all(|item| item.reference_id != reference),
+            "the card is removed"
+        );
+        assert!(page
+            .workspace
+            .root()
+            .members
+            .iter()
+            .all(|member| !matches!(member.target, ReferenceTarget::ExternalFile(_))));
+    }
+
+    #[test]
+    fn rename_external_file_updates_card_titles_not_the_file() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let file = external_file("/tmp/report.md");
+        page.insert_external_file(
+            &page.root.container_id.clone(),
+            file.clone(),
+            Some([32.0, 32.0]),
+        );
+        let id = file.id.clone();
+        // Open the rename dialog via the card's command, then confirm.
+        page.process_canvas_commands(
+            vec![CanvasCommand::RenameExternalFile(id.clone())],
+            egui::ViewportId::ROOT,
+        );
+        assert!(matches!(
+            page.rename_dialog.pending,
+            Some(RenameTarget::ExternalFile { .. })
+        ));
+        page.rename_dialog.buffer = "Architecture Notes".to_owned();
+        page.process_canvas_commands(
+            vec![CanvasCommand::ApplyRename(RenameTarget::ExternalFile {
+                id: id.clone(),
+                origin: egui::ViewportId::ROOT,
+            })],
+            egui::ViewportId::ROOT,
+        );
+        assert!(page.rename_dialog.pending.is_none());
+        let target = ReferenceTarget::ExternalFile(ExternalFileRef {
+            id,
+            path: "/tmp/report.md".to_owned(),
+            title: "Architecture Notes".to_owned(),
+        });
+        assert!(page
+            .root
+            .items
+            .iter()
+            .any(|item| item.target == target));
+        assert!(page
+            .workspace
+            .root()
+            .members
+            .iter()
+            .any(|reference| reference.target == target));
+        // Only the recorded title changed: the path (and thus the on-disk
+        // file) is untouched, and the rename survives a restart.
+        let reloaded = HomePage::new(&folder.0);
+        assert!(reloaded
+            .root
+            .items
+            .iter()
+            .any(|item| item.target == target));
+    }
+
+    #[test]
+    fn external_files_can_be_pasted_into_ordinary_containers() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let file = external_file("/tmp/guide.pdf");
+        let entry = ClipboardEntry {
+            source_container: page.root.container_id.clone(),
+            reference_id: ReferenceId::new(),
+            target: ReferenceTarget::ExternalFile(file),
+            semantics: ClipboardSemantics::Link,
+            origin: egui::ViewportId::ROOT,
+        };
+        assert!(page.paste_clipboard(&folder_id, &entry));
+        assert_eq!(page.workspace.containers[&folder_id].members.len(), 1);
+    }
+
+    #[test]
+    fn external_files_cannot_enter_ai_boxes() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let ai_box = page.workspace.create_ai_box("AI Box");
+        let file = external_file("/tmp/data.pdf");
+        let entry = ClipboardEntry {
+            source_container: page.root.container_id.clone(),
+            reference_id: ReferenceId::new(),
+            target: ReferenceTarget::ExternalFile(file),
+            semantics: ClipboardSemantics::Link,
+            origin: egui::ViewportId::ROOT,
+        };
+        assert!(
+            !page.paste_clipboard(&ai_box, &entry),
+            "AI boxes only hold model-readable sources"
+        );
+        let payload = DragPayload::Reference {
+            source_container: page.root.container_id.clone(),
+            reference_id: ReferenceId::new(),
+            target: ReferenceTarget::ExternalFile(external_file("/tmp/data.pdf")),
+        };
+        assert!(
+            !page.apply_drop(&ai_box, None, &payload, false),
+            "external files cannot be dropped into AI boxes"
+        );
+        assert_eq!(page.workspace.containers[&ai_box].members.len(), 0);
+    }
+
+    #[test]
+    fn open_file_dialog_command_remembers_origin_and_container() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_viewport = egui::ViewportId::from_hash_of(("folder-view", "some-container"));
+        let container = page.root.container_id.clone();
+        page.process_canvas_commands(
+            vec![CanvasCommand::OpenFileDialog {
+                container: container.clone(),
+                position: Some([12.0, 12.0]),
+            }],
+            folder_viewport,
+        );
+        let state = page.file_insert.as_ref().expect("dialog opened");
+        assert!(state.open);
+        assert_eq!(state.origin, folder_viewport);
+        assert_eq!(state.container, container);
+        assert_eq!(state.position, Some([12.0, 12.0]));
+    }
+
+    #[test]
+    fn file_stem_derives_display_title() {
+        assert_eq!(file_stem("/home/user/docs/notes.pdf"), "notes");
+        assert_eq!(file_stem("report.md"), "report");
+        assert_eq!(file_stem("no-extension"), "no-extension");
+    }
+
+    #[test]
+    fn dropping_files_from_the_file_manager_inserts_external_file_cards() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let ctx = egui::Context::default();
+        // Settle the root canvas layout, then drop files over the canvas.
+        for _ in 0..2 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| page.ui_impl(ui));
+        }
+        let drop_pos = egui::pos2(320.0, 240.0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events: vec![egui::Event::PointerMoved(drop_pos)],
+            dropped_files: vec![
+                egui::DroppedFile {
+                    path: Some(std::path::PathBuf::from("/tmp/manual.pdf")),
+                    ..Default::default()
+                },
+                egui::DroppedFile {
+                    path: Some(std::path::PathBuf::from("/tmp/readme.md")),
+                    ..Default::default()
+                },
+                // A pathless drop (e.g. pasted content) is ignored.
+                egui::DroppedFile {
+                    name: "no-path.bin".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| page.ui_impl(ui));
+        let cards: Vec<(ExternalFileRef, [f32; 2])> = page
+            .root
+            .items
+            .iter()
+            .filter_map(|item| match &item.target {
+                ReferenceTarget::ExternalFile(file) => Some((file.clone(), item.position)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cards.len(),
+            2,
+            "path-backed drops become external-file cards, pathless ones are skipped"
+        );
+        assert!(cards.iter().any(|(file, _)| {
+            file.path == "/tmp/manual.pdf" && file.title == "manual"
+        }));
+        assert!(cards.iter().any(|(file, _)| {
+            file.path == "/tmp/readme.md" && file.title == "readme"
+        }));
+        assert_ne!(
+            cards[0].1, cards[1].1,
+            "additional files cascade below the previous one"
+        );
+        // The workspace reference (and thus persistence) is created too.
+        assert!(page.workspace.root().members.iter().any(|reference| {
+            matches!(&reference.target, ReferenceTarget::ExternalFile(_))
+        }));
+    }
+
+    #[test]
+    fn native_drop_without_a_live_pointer_is_still_consumed_once() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| page.ui_impl(ui));
+        }
+        // During a real X11 file drag the window receives no pointer motion (the
+        // source grabs the pointer), so the pointer position can be stale or
+        // absent. In native mode each viewport holds exactly one canvas, so the
+        // drop must still be consumed — landing on a free default slot — rather
+        // than being silently lost. Exactly one card is created (the per-frame
+        // guard prevents double insertion).
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            // Pointer far outside the canvas (as if no motion was received).
+            events: vec![egui::Event::PointerMoved(egui::pos2(7000.0, 7000.0))],
+            dropped_files: vec![egui::DroppedFile {
+                path: Some(std::path::PathBuf::from("/tmp/x.pdf")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| page.ui_impl(ui));
+        let cards: Vec<_> = page
+            .root
+            .items
+            .iter()
+            .filter(|item| matches!(item.target, ReferenceTarget::ExternalFile(_)))
+            .collect();
+        assert_eq!(
+            cards.len(),
+            1,
+            "the native viewport's single canvas consumes the drop exactly once"
+        );
     }
 }

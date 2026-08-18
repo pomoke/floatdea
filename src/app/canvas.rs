@@ -20,6 +20,11 @@ pub(super) struct CanvasData<'a> {
     /// Whether the app presents snippet/folder windows as floating windows
     /// inside the main window (full-window mode) instead of native OS windows.
     floating: bool,
+    /// Per-frame guard (reset by `HomePage::ui_impl`): an OS-level file drop is
+    /// a single frame-global `dropped_files` event shared by every canvas of
+    /// the viewport; exactly one canvas consumes it. Shared across canvases so
+    /// a drop aimed at one window never inserts cards in another.
+    os_file_drop_consumed: &'a mut bool,
 }
 
 impl<'a> CanvasData<'a> {
@@ -35,6 +40,7 @@ impl<'a> CanvasData<'a> {
         show_grid: bool,
         is_root: bool,
         floating: bool,
+        os_file_drop_consumed: &'a mut bool,
     ) -> Self {
         Self {
             snippets,
@@ -47,6 +53,7 @@ impl<'a> CanvasData<'a> {
             show_grid,
             is_root,
             floating,
+            os_file_drop_consumed,
         }
     }
 }
@@ -103,6 +110,7 @@ impl HomePage {
             self.settings.show_grid,
             true,
             floating,
+            &mut self.os_file_drop_consumed,
         );
         if floating {
             // Full-window mode: the root box is a normal draggable/resizable
@@ -184,6 +192,12 @@ impl HomePage {
                 *pending = None;
                 return DeleteDialogResult::None;
             }
+            // External-file cards are deleted without confirmation (the file on
+            // disk is never touched), so the dialog never opens for them.
+            ReferenceTarget::ExternalFile(_) => {
+                *pending = None;
+                return DeleteDialogResult::None;
+            }
         };
         let mut confirmed = false;
         let mut cancelled = false;
@@ -230,6 +244,9 @@ impl HomePage {
                     RenameTarget::Conversation { ai_box, id, .. } => {
                         self.rename_conversation(ai_box, id, new_title)
                     }
+                    RenameTarget::ExternalFile { id, .. } => {
+                        self.rename_external_file(id, new_title)
+                    }
                 };
                 if ok {
                     self.rename_dialog.pending = None;
@@ -257,6 +274,7 @@ impl HomePage {
             RenameTarget::Snippet { id, .. } => format!("snippet:{}", id.as_str()),
             RenameTarget::Folder { id, .. } => format!("folder:{}", id.as_str()),
             RenameTarget::Conversation { id, .. } => format!("conversation:{}", id.as_str()),
+            RenameTarget::ExternalFile { id, .. } => format!("file:{}", id.as_str()),
         };
         let mut confirmed = false;
         let mut cancelled = false;
@@ -357,6 +375,9 @@ impl HomePage {
         pending_delete: &mut Option<PendingDelete>,
         search: &mut SearchState,
         clipboard: &mut Option<ClipboardEntry>,
+        file_insert: &mut Option<FileInsertState>,
+        external_open_error: &Option<(String, egui::ViewportId, u32)>,
+        os_file_drop_consumed: &mut bool,
         ai: &BTreeMap<ContainerId, AiBoxData>,
         snap_to_grid: bool,
         show_grid: bool,
@@ -379,6 +400,7 @@ impl HomePage {
                     show_grid,
                     false,
                     false,
+                    os_file_drop_consumed,
                 );
                 let mut commands = Self::render_canvas_panel(child_ui, canvas, &mut data);
                 if child_ui.input(|input| input.viewport().close_requested()) {
@@ -413,6 +435,23 @@ impl HomePage {
                 if let Some(id) = render_search_window(child_ui, search, snippets) {
                     commands.push(CanvasCommand::OpenSnippet(id));
                 }
+                // Render the "Insert External File…" dialog inside this viewport
+                // so that it appears in the folder window that initiated it; the
+                // confirmed insert becomes a command applied at frame end.
+                if let Some((container, position, file)) = file_insert
+                    .as_mut()
+                    .and_then(|state| render_file_insert_dialog(child_ui, state))
+                {
+                    *file_insert = None;
+                    commands.push(CanvasCommand::InsertExternalFile {
+                        container,
+                        file,
+                        position,
+                    });
+                }
+                // Render the transient "could not open external file" toast in
+                // the folder window that triggered the failed open.
+                render_external_open_error(child_ui, external_open_error);
                 commands
             },
         )
@@ -432,6 +471,7 @@ impl HomePage {
         snippet_store: &SnippetStore,
         snippets: &mut BTreeMap<EntityId, Snippet>,
         clipboard: &mut Option<ClipboardEntry>,
+        os_file_drop_consumed: &mut bool,
         ai: &BTreeMap<ContainerId, AiBoxData>,
         snap_to_grid: bool,
         show_grid: bool,
@@ -455,6 +495,7 @@ impl HomePage {
                     show_grid,
                     false,
                     true,
+                    os_file_drop_consumed,
                 );
                 Self::render_canvas_panel(ui, canvas, &mut data)
             })
@@ -555,6 +596,75 @@ impl HomePage {
         }
 
         let pointer_pos = ui.input(|input| input.pointer.interact_pos());
+        // OS-level file drag-and-drop (dragged in from the system file
+        // manager): `hovered_files` is non-empty while a drag hovers over the
+        // window, `dropped_files` is non-empty only on the frame of the drop
+        // (egui-winit clears both every frame via `take_egui_input`). AI boxes
+        // reject file drops: their members must be model-readable sources.
+        //
+        // During an X11 file drag the pointer is grabbed by the source window,
+        // so the app typically receives **no pointer-motion** while the file
+        // hovers — only the `HoveredFile`/`DroppedFile` events. The drop is
+        // therefore attributed without requiring a live pointer position:
+        // in native mode each viewport holds exactly one canvas (the right one
+        // receives the event), and a per-frame shared guard (`CanvasData`)
+        // makes sure the frame-global drop is consumed exactly once.
+        let hovered_files = ui.input(|input| input.raw.hovered_files.clone());
+        let dropped_files = ui.input(|input| input.raw.dropped_files.clone());
+        let canvas_accepts_files = !data.workspace.is_ai_box(&canvas.container_id);
+        let files_hovering = !hovered_files.is_empty();
+        // `latest_pos` is the last known pointer position — stale during an X11
+        // file drag, so it only drives the drop position and the hover preview,
+        // never whether the drop is accepted.
+        let file_pointer = ui.input(|input| input.pointer.latest_pos());
+        let pointer_over_canvas = file_pointer.is_some_and(|pointer| canvas_rect.contains(pointer));
+        // Drop position only when the pointer is actually over the canvas;
+        // otherwise (stale/absent pointer during the drag) fall back to a free
+        // default slot so the card never lands off-canvas.
+        let file_drop_pos = if pointer_over_canvas {
+            file_pointer.map(|pointer| {
+                let mut position = [
+                    (pointer.x - canvas_rect.min.x).max(0.0),
+                    (pointer.y - canvas_rect.min.y).max(0.0),
+                ];
+                if data.snap_to_grid {
+                    position = snap_position(position);
+                }
+                position
+            })
+        } else {
+            None
+        };
+        if files_hovering {
+            // Keep repainting so the highlight stays visible while dragging.
+            ui.ctx().request_repaint();
+            if canvas_accepts_files && (pointer_over_canvas || !data.floating) {
+                // Highlight the drop target and preview a card near the pointer
+                // (or the canvas center when the pointer position is unknown).
+                let accent = ui.visuals().selection.stroke.color;
+                painter.rect_stroke(
+                    canvas_rect.expand(2.0),
+                    4.0,
+                    egui::Stroke::new(2.0, accent.gamma_multiply(0.9)),
+                    egui::StrokeKind::Outside,
+                );
+                let anchor = file_pointer.unwrap_or(canvas_rect.center());
+                let preview = egui::Rect::from_center_size(anchor, egui::vec2(CARD_WIDTH, 34.0));
+                painter.rect_stroke(
+                    preview,
+                    2.5,
+                    egui::Stroke::new(1.5, accent),
+                    egui::StrokeKind::Inside,
+                );
+                let galley = layout_title(painter, "Drop to insert file", 150.0, accent);
+                let label_rect =
+                    egui::Rect::from_min_size(preview.max + egui::vec2(6.0, 4.0), galley.size());
+                painter.rect_filled(label_rect.expand(3.0), 3.0, ui.visuals().panel_fill);
+                painter.galley(label_rect.min, galley, accent);
+            } else {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+            }
+        }
         // A card drag in any canvas publishes an egui drag-and-drop payload;
         // this canvas may be a drop target while the pointer is over it.
         let drag_payload =
@@ -595,6 +705,7 @@ impl HomePage {
                 // from folders (a plain text prefix keeps it font-safe).
                 ItemKind::AiBox => format!("AI {title}"),
                 ItemKind::Conversation => title,
+                ItemKind::ExternalFile => format!("📄 {title}"),
             };
             let galley = layout_title(
                 painter,
@@ -778,6 +889,16 @@ impl HomePage {
                         }
                         ReferenceTarget::Special(_) => {}
                         ReferenceTarget::Conversation(_) => {}
+                        ReferenceTarget::ExternalFile(file) => {
+                            if ui.button("Open Externally").clicked() {
+                                commands.push(CanvasCommand::OpenExternalFile(file.clone()));
+                                ui.close();
+                            }
+                            if ui.button("Rename…").clicked() {
+                                commands.push(CanvasCommand::RenameExternalFile(file.id.clone()));
+                                ui.close();
+                            }
+                        }
                     }
                     let last_link = reference_count(data.workspace, &target) == 1;
                     if ui
@@ -806,6 +927,11 @@ impl HomePage {
                         ai_box: canvas.container_id.clone(),
                         conversation: id,
                     },
+                    // A click opens the external file with the system's default
+                    // application (PDF viewer, Markdown editor, …).
+                    ReferenceTarget::ExternalFile(file) => {
+                        CanvasCommand::OpenExternalFile(file)
+                    }
                 });
             }
             // Every card (Special included) publishes a drag payload: the
@@ -1064,6 +1190,31 @@ impl HomePage {
         let pointer_over_text =
             render_canvas_texts(ui, canvas, data, canvas_rect, &text_layouts, pointer_pos);
 
+        // OS file drop: one external-file card per dropped file (files without
+        // a path, e.g. pasted content, are skipped). The frame-global
+        // `dropped_files` is consumed by exactly one canvas (the per-frame
+        // guard), attributed geometrically when the pointer is known; in native
+        // mode each viewport has a single canvas so the event can never leak
+        // into another window.
+        if canvas_accepts_files
+            && !dropped_files.is_empty()
+            && !*data.os_file_drop_consumed
+            && (pointer_over_canvas || !data.floating || file_pointer.is_none())
+        {
+            *data.os_file_drop_consumed = true;
+            let mut position = file_drop_pos;
+            for file in dropped_files {
+                let Some(path) = file.path else {
+                    continue;
+                };
+                let path = path.display().to_string();
+                log::info!("OS file drop -> inserting external file card: {path}");
+                create_external_file(canvas, data, path, position);
+                // Cascade additional files below the previous one.
+                position = position.map(|[x, y]| [x, y + 36.0]);
+            }
+        }
+
         if !pointer_over_card && !pointer_over_text {
             canvas_response.context_menu(|ui| {
                 if ui.button("Search…").clicked() {
@@ -1147,6 +1298,7 @@ impl HomePage {
                         // Conversation cards cannot be picked up to the
                         // clipboard; this arm is unreachable.
                         ReferenceTarget::Conversation(_) => "Conversation",
+                        ReferenceTarget::ExternalFile(file) => file.title.as_str(),
                     };
                     let verb = match entry.semantics {
                         ClipboardSemantics::Link => "Paste (Link)",
@@ -1175,6 +1327,13 @@ impl HomePage {
                 if ui.button("New Folder").clicked() {
                     let anchor = canvas.menu_anchor;
                     create_folder(canvas, data, anchor);
+                    ui.close();
+                }
+                if ui.button("Insert External File…").clicked() {
+                    commands.push(CanvasCommand::OpenFileDialog {
+                        container: canvas.container_id.clone(),
+                        position: canvas.menu_anchor,
+                    });
                     ui.close();
                 }
                 if ui.button("New Text").clicked() {
@@ -1342,6 +1501,8 @@ enum ItemKind {
     AiBox,
     /// An AI conversation card inside an AI box.
     Conversation,
+    /// An inserted external file (PDF, Markdown, …), opened externally on click.
+    ExternalFile,
 }
 
 fn item_label(
@@ -1362,6 +1523,9 @@ fn item_label(
             }
         }
         ReferenceTarget::Special(special) => (special.label(), ItemKind::Special),
+        // External file cards are self-contained: the title travels with the
+        // reference (renamed via the card's context menu).
+        ReferenceTarget::ExternalFile(file) => (file.title.as_str(), ItemKind::ExternalFile),
         // The conversation title is resolved from the AI sidecar store when the
         // canvas is rendered inside an AI box; the placeholder keeps the card
         // renderable even if the sidecar entry is missing.
@@ -1375,6 +1539,47 @@ fn item_label(
         }
     };
     (!title.is_empty()).then(|| (title.to_owned(), kind))
+}
+
+/// Creates an external-file card from an absolute `path` at `position` (or a
+/// free default slot when `None`), mirroring `create_snippet`: the reference is
+/// persisted to the workspace and the card to the container layout. The file on
+/// disk is never touched. Used by the OS-level file drop and shared with any
+/// future direct-insert path.
+fn create_external_file(
+    canvas: &mut ContainerCanvas,
+    data: &mut CanvasData<'_>,
+    path: String,
+    position: Option<[f32; 2]>,
+) {
+    let position = position.unwrap_or_else(|| canvas.default_position(data));
+    let file = ExternalFileRef {
+        id: ExternalFileId::new(),
+        title: file_stem(&path),
+        path,
+    };
+    let Ok(reference_id) = data
+        .workspace
+        .add_external_file_reference(&canvas.container_id, file.clone())
+    else {
+        return;
+    };
+    let _ = data.workspace_store.save(data.workspace);
+    canvas.items.push(CanvasItem {
+        reference_id: reference_id.clone(),
+        target: ReferenceTarget::ExternalFile(file),
+        role: MemberRole::Normal,
+        position,
+        size: egui::vec2(CARD_WIDTH, 25.0),
+    });
+    canvas.layout.items.insert(
+        reference_id,
+        CardLayout {
+            position,
+            color: None,
+        },
+    );
+    let _ = data.workspace_store.save_layout(&canvas.layout);
 }
 
 fn create_snippet(
@@ -1503,6 +1708,9 @@ pub(super) fn clipboard_valid_for(
         ReferenceTarget::Special(_) => false,
         // Conversation cards cannot be linked or pasted.
         ReferenceTarget::Conversation(_) => false,
+        // External files are plain references between ordinary containers; AI
+        // boxes only hold model-readable sources, so they reject file cards.
+        ReferenceTarget::ExternalFile(_) => !workspace.is_ai_box(container),
     }
 }
 
@@ -1533,6 +1741,9 @@ pub(super) fn drop_valid_for(
         ReferenceTarget::Special(_) => false,
         // Conversation cards cannot be linked or dropped into other containers.
         ReferenceTarget::Conversation(_) => false,
+        // External files are plain references between ordinary containers; AI
+        // boxes only hold model-readable sources, so they reject file cards.
+        ReferenceTarget::ExternalFile(_) => !workspace.is_ai_box(container),
     }
 }
 
@@ -1563,6 +1774,7 @@ fn render_clipboard_status(ui: &mut egui::Ui, data: &mut CanvasData<'_>) {
             .get(id)
             .map(|container| container.title.clone())
             .unwrap_or_else(|| "?".to_owned()),
+        ReferenceTarget::ExternalFile(file) => file.title.clone(),
         ReferenceTarget::Special(special) => special.label().to_owned(),
         // Conversation cards cannot be picked up to the clipboard; unreachable.
         ReferenceTarget::Conversation(_) => "Conversation".to_owned(),
@@ -1696,6 +1908,10 @@ fn paint_card(
         visuals.widgets.hovered.bg_fill.gamma_multiply(0.7)
     } else if kind == ItemKind::AiBox {
         visuals.widgets.hovered.bg_fill.gamma_multiply(0.8)
+    } else if kind == ItemKind::ExternalFile {
+        // A "reference out" tint: lighter than an ordinary card, hinting that
+        // the object lives outside the workspace.
+        visuals.widgets.hovered.bg_fill.gamma_multiply(0.6)
     } else if source_card {
         // Lighter fill than an ordinary card: a read-only source is context,
         // not an owned object.
@@ -1711,6 +1927,8 @@ fn paint_card(
         egui::Stroke::new(1.5, visuals.selection.stroke.color.gamma_multiply(0.65))
     } else if kind == ItemKind::AiBox {
         egui::Stroke::new(1.5, visuals.selection.stroke.color.gamma_multiply(0.8))
+    } else if kind == ItemKind::ExternalFile {
+        egui::Stroke::new(1.0, visuals.weak_text_color().gamma_multiply(0.9))
     } else if source_card {
         egui::Stroke::new(1.0, visuals.weak_text_color().gamma_multiply(0.8))
     } else {

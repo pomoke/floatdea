@@ -6,7 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use super::{ContainerId, ConversationId, EntityId, ReferenceId, Snippet, TextId};
+use super::{ContainerId, ConversationId, EntityId, ExternalFileId, ReferenceId, Snippet, TextId};
 
 const WORKSPACE_VERSION: u32 = 1;
 const LAYOUT_VERSION: u32 = 1;
@@ -64,6 +64,21 @@ impl SpecialKind {
     }
 }
 
+/// A reference to a file outside the workspace (PDF, Markdown, …). FloatDea
+/// records only the absolute path and a display title; the file itself is
+/// never imported or copied. Clicking the card opens it with the operating
+/// system's default application, and removing the card never deletes the file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalFileRef {
+    /// Stable identity of the file link. Cards that link the same file share
+    /// one id so renaming the display title updates every card at once.
+    pub id: ExternalFileId,
+    /// Absolute path of the file on disk.
+    pub path: String,
+    /// Display title shown on the canvas card (defaults to the file stem).
+    pub title: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum ReferenceTarget {
@@ -75,6 +90,8 @@ pub enum ReferenceTarget {
     /// keyed by `ConversationId`; the card itself is a plain member reference
     /// so it reuses the existing canvas/layout persistence.
     Conversation(ConversationId),
+    /// A card that opens an external file with the system's default app.
+    ExternalFile(ExternalFileRef),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +246,14 @@ impl Workspace {
             return Err(invalid_data("reference targets a missing container"));
         }
         self.add_reference(container, ReferenceTarget::Container(target))
+    }
+
+    pub fn add_external_file_reference(
+        &mut self,
+        container: &ContainerId,
+        file: ExternalFileRef,
+    ) -> io::Result<ReferenceId> {
+        self.add_reference(container, ReferenceTarget::ExternalFile(file))
     }
 
     pub fn remove_reference(

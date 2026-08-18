@@ -109,6 +109,9 @@ fn default_workspace() -> PathBuf {
 }
 
 fn main() -> eframe::Result {
+    // Initialize the logger (env_logger respects `RUST_LOG`; defaults to
+    // `info` so file drop diagnostics are visible without extra setup).
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let workspace = std::env::args()
         .nth(1)
         .map(PathBuf::from)
@@ -125,7 +128,11 @@ fn main() -> eframe::Result {
         ROOT_CANVAS_SIZE
     };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size(initial_size),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(initial_size)
+            // Explicitly enable OS-level file drag-and-drop (winit defaults it
+            // on for Linux, but this also covers platforms where it is opt-in).
+            .with_drag_and_drop(true),
         ..Default::default()
     };
 

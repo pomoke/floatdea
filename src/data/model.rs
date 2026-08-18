@@ -31,6 +31,12 @@ stable_id!(ContainerId);
 stable_id!(ReferenceId);
 stable_id!(TextId);
 stable_id! {
+    /// Identity of an inserted external file reference (e.g. a PDF or Markdown
+    /// document opened with the system's default application). Cards that link
+    /// the same file share one id so a rename updates every card.
+    ExternalFileId
+}
+stable_id! {
     /// Identity of an AI conversation inside an AI workspace. Conversations are
     /// sidecar state (not Markdown entities): the ID only appears in the AI
     /// box's member list (as a `Conversation` card) and in the AI sidecar store.
