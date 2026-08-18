@@ -71,6 +71,40 @@ pub enum MessageStatus {
     Stale,
 }
 
+/// A model-proposed new Snippet, awaiting user confirmation (plan_ai.md §4.9 /
+/// §7.6 / §9.8 `core.create_output_proposal`). The proposal is only ever
+/// rendered and stored in the sidecar; it never becomes a Markdown entity until
+/// the user applies it, at which point `created` records the resulting
+/// `EntityId` (the creation record).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SnippetProposal {
+    pub title: String,
+    pub content: String,
+    /// Set when the user applied the proposal: the id of the created snippet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<EntityId>,
+    /// Set when the user rejected the proposal (it no longer offers Apply).
+    #[serde(default)]
+    pub rejected: bool,
+    /// Seconds since the Unix epoch when the model proposed this.
+    #[serde(default)]
+    pub proposed_at: u64,
+}
+
+impl SnippetProposal {
+    /// Creates a fresh, unapplied proposal (the creation record `created` is
+    /// filled in later by the local commit command).
+    pub fn new(title: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            content: content.into(),
+            created: None,
+            rejected: false,
+            proposed_at: now_unix(),
+        }
+    }
+}
+
 /// A single conversation message (user question or assistant answer).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Message {
@@ -91,6 +125,11 @@ pub struct Message {
     /// answer; `None` when the provider does not report usage).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
+    /// A model-proposed new Snippet (plan_ai.md §4.9/§7.6). Unapplied
+    /// proposals are sidecar drafts; `created` records the resulting
+    /// `EntityId` once the user applies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<SnippetProposal>,
 }
 
 impl Message {
@@ -102,6 +141,7 @@ impl Message {
             status: MessageStatus::Completed,
             turn_task: None,
             usage: None,
+            proposal: None,
         }
     }
 
@@ -113,6 +153,7 @@ impl Message {
             status: MessageStatus::Completed,
             turn_task: Some(turn_task),
             usage: None,
+            proposal: None,
         }
     }
 }

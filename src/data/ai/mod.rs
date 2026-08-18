@@ -17,7 +17,7 @@ pub use provider::{
 };
 pub use store::AiStore;
 pub use types::{
-    AI_BOX_DATA_VERSION, AiBoxData, Conversation, Message, MessageRole, MessageStatus, SourceRef,
-    SourceTarget, content_hash, now_unix,
+    AI_BOX_DATA_VERSION, AiBoxData, Conversation, Message, MessageRole, MessageStatus,
+    SnippetProposal, SourceRef, SourceTarget, content_hash, now_unix,
 };
 pub use worker::{AiWorker, TurnEvent, TurnIdentity, TurnRequest};

@@ -13,6 +13,8 @@ enum AiChatAction {
     Stop,
     Retry,
     SaveSnippet(usize),
+    ApplyProposal(usize),
+    RejectProposal(usize),
     OpenSource(EntityId),
     OpenFolder(ContainerId),
 }
@@ -55,7 +57,7 @@ impl HomePage {
                 .default_size([520.0, 520.0])
                 .collapsible(false)
                 .show(ui.ctx(), |ui| {
-                    action = Self::render_ai_chat_panel(ui, self, &conv, running);
+                    action = Self::render_ai_chat_panel(ui, self, &ai_box, &conv, running);
                 });
             if !open {
                 close = true;
@@ -71,7 +73,7 @@ impl HomePage {
                     .with_title(&title)
                     .with_inner_size([520.0, 520.0]),
                 |child_ui, _| {
-                    action = Self::render_ai_chat_panel(child_ui, self, &conv, running);
+                    action = Self::render_ai_chat_panel(child_ui, self, &ai_box, &conv, running);
                     if child_ui.input(|input| input.viewport().close_requested()) {
                         close = true;
                     }
@@ -96,6 +98,8 @@ impl HomePage {
             AiChatAction::Stop => self.ai_stop(),
             AiChatAction::Retry => self.ai_retry(),
             AiChatAction::SaveSnippet(index) => self.ai_save_as_snippet(&ai_box, index),
+            AiChatAction::ApplyProposal(index) => self.apply_proposal(&ai_box, index),
+            AiChatAction::RejectProposal(index) => self.reject_proposal(&ai_box, index),
             AiChatAction::OpenSource(id) => {
                 self.clipboard = None;
                 self.open_view(id);
@@ -112,6 +116,7 @@ impl HomePage {
     fn render_ai_chat_panel(
         ui: &mut egui::Ui,
         page: &mut HomePage,
+        ai_box: &ContainerId,
         conv: &Conversation,
         running: bool,
     ) -> AiChatAction {
@@ -136,7 +141,7 @@ impl HomePage {
                     .stick_to_bottom(running)
                     .show(ui, |ui| {
                         for (index, message) in messages.iter().enumerate() {
-                            Self::render_chat_message(ui, page, message, index, &mut action);
+                            Self::render_chat_message(ui, page, ai_box, message, index, &mut action);
                         }
                         if running {
                             let streaming = page.ai_streaming.clone();
@@ -212,6 +217,7 @@ impl HomePage {
     fn render_chat_message(
         ui: &mut egui::Ui,
         page: &mut HomePage,
+        ai_box: &ContainerId,
         message: &Message,
         index: usize,
         action: &mut AiChatAction,
@@ -312,6 +318,11 @@ impl HomePage {
                             });
                         }
                     });
+                // A model-proposed new Snippet (plan_ai.md §4.9): Apply/Reject
+                // card, or its Saved/Rejected state after the user acted.
+                if let Some(proposal) = &message.proposal {
+                    Self::render_proposal_card(ui, page, ai_box, proposal, index, action);
+                }
                 // Actions live on the answer's own interaction region.
                 frame.response.context_menu(|ui| {
                     if ui.button("Copy").clicked() {
@@ -332,6 +343,80 @@ impl HomePage {
                 });
             }
         }
+    }
+
+    /// Renders a model-proposed new Snippet (plan_ai.md §4.9): the title, a
+    /// Markdown preview, the destination AI box, and Apply/Reject (or the
+    /// Saved/Rejected state after the user acted).
+    fn render_proposal_card(
+        ui: &mut egui::Ui,
+        page: &HomePage,
+        ai_box: &ContainerId,
+        proposal: &SnippetProposal,
+        index: usize,
+        action: &mut AiChatAction,
+    ) {
+        ui.add_space(4.0);
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::same(8))
+            .corner_radius(egui::CornerRadius::same(6))
+            .stroke(egui::Stroke::new(1.0, ui.visuals().selection.stroke.color))
+            .fill(ui.visuals().extreme_bg_color)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Proposed new Snippet")
+                        .small()
+                        .strong()
+                        .color(ui.visuals().selection.stroke.color),
+                );
+                ui.label(egui::RichText::new(&proposal.title).strong());
+                let total = proposal.content.chars().count();
+                if total > 0 {
+                    let preview: String = proposal.content.chars().take(200).collect();
+                    let preview = if total > 200 {
+                        format!("{preview}…")
+                    } else {
+                        preview
+                    };
+                    ui.label(egui::RichText::new(preview).small());
+                }
+                let destination = page
+                    .workspace
+                    .containers
+                    .get(ai_box)
+                    .map(|container| container.title.as_str())
+                    .unwrap_or("(deleted AI box)");
+                ui.label(
+                    egui::RichText::new(format!("Save to: {destination}"))
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+                ui.horizontal(|ui| {
+                    if let Some(created) = &proposal.created {
+                        ui.label(
+                            egui::RichText::new("Saved")
+                                .small()
+                                .color(ui.visuals().hyperlink_color),
+                        );
+                        if ui.link("Open").clicked() {
+                            *action = AiChatAction::OpenSource(created.clone());
+                        }
+                    } else if proposal.rejected {
+                        ui.label(
+                            egui::RichText::new("Rejected")
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    } else {
+                        if ui.button("Apply").clicked() {
+                            *action = AiChatAction::ApplyProposal(index);
+                        }
+                        if ui.button("Reject").clicked() {
+                            *action = AiChatAction::RejectProposal(index);
+                        }
+                    }
+                });
+            });
     }
 
     // The `Sources: N` panel was removed for a simpler window header. Bound
@@ -360,6 +445,7 @@ impl HomePage {
                 MessageStatus::Failed,
                 Vec::new(),
                 TokenUsage::default(),
+                None,
             );
             return;
         }
@@ -370,6 +456,7 @@ impl HomePage {
                 MessageStatus::Failed,
                 Vec::new(),
                 TokenUsage::default(),
+                None,
             );
             return;
         };
@@ -405,6 +492,7 @@ impl HomePage {
                 MessageStatus::Failed,
                 snapshots,
                 TokenUsage::default(),
+                None,
             );
             return;
         }
@@ -428,6 +516,7 @@ impl HomePage {
             MessageStatus::Stopped,
             snapshots,
             TokenUsage::default(),
+            None,
         );
     }
 
@@ -488,12 +577,19 @@ impl HomePage {
             .find(|line| !line.is_empty())
             .map(|line| line.chars().take(40).collect::<String>())
             .unwrap_or_else(|| "AI Output".to_owned());
+        let body = Self::output_content_with_sources(content, &message.sources);
+        let _ = self.create_output_snippet(ai_box, title, body);
+    }
+
+    /// Builds the Markdown body saved with an assistant answer: the answer text
+    /// followed by a `## Sources` section linking the sources it used. Snippet
+    /// sources link with their stable `{id}.md`; container sources are listed by
+    /// title (a container is not a page).
+    fn output_content_with_sources(content: &str, sources: &[SourceRef]) -> String {
         let mut output = content.to_owned();
-        if !message.sources.is_empty() {
+        if !sources.is_empty() {
             output.push_str("\n\n## Sources\n\n");
-            for (index, source) in message.sources.iter().enumerate() {
-                // Snippet sources link with their stable `{id}.md`; container
-                // sources are listed by title (a container is not a page).
+            for (index, source) in sources.iter().enumerate() {
                 match &source.target {
                     SourceTarget::Snippet(id) => output.push_str(&format!(
                         "{}. [{}]({}.md)\n",
@@ -507,10 +603,23 @@ impl HomePage {
                 }
             }
         }
+        output
+    }
+
+    /// Creates a new ordinary Snippet from an answer/proposal, saves it, adds an
+    /// `Output` reference inside `ai_box` and places a card on that box's
+    /// canvas. Runs on the UI thread (the unified command path, plan_ai.md
+    /// §8.5); the `EntityId` is generated locally. Returns the new id.
+    fn create_output_snippet(
+        &mut self,
+        ai_box: &ContainerId,
+        title: String,
+        content: String,
+    ) -> Option<EntityId> {
         let snippet = Snippet {
             id: EntityId::new(),
             title,
-            content: output,
+            content,
         };
         let _ = self.store.save(&snippet);
         let snippet_id = snippet.id.clone();
@@ -518,7 +627,7 @@ impl HomePage {
         // Create the `Output` reference inside the AI box.
         let Ok(reference_id) = self.workspace.add_output_reference(ai_box, snippet_id.clone())
         else {
-            return;
+            return None;
         };
         let _ = self.workspace_store.save(&self.workspace);
         let position = self
@@ -556,10 +665,69 @@ impl HomePage {
             );
             canvas.save_layout(&self.workspace_store);
         }
+        Some(snippet_id)
+    }
+
+    /// Applies a model-proposed Snippet (plan_ai.md §4.9): commits the proposal
+    /// through the unified output-creation path, then records the resulting
+    /// `EntityId` on the message (the creation record). Idempotent: a proposal
+    /// whose `created` is set is never committed twice.
+    fn apply_proposal(&mut self, ai_box: &ContainerId, message_index: usize) {
+        let Some((_, conversation)) = self.ai_open.clone() else {
+            return;
+        };
+        let (title, content) = {
+            let Some(data) = self.ai_boxes.get(ai_box) else {
+                return;
+            };
+            let Some(conv) = data.get(&conversation) else {
+                return;
+            };
+            let Some(message) = conv.messages.get(message_index) else {
+                return;
+            };
+            let Some(proposal) = &message.proposal else {
+                return;
+            };
+            if proposal.created.is_some() || proposal.rejected {
+                return;
+            }
+            (proposal.title.clone(), proposal.content.clone())
+        };
+        let Some(created) = self.create_output_snippet(ai_box, title, content) else {
+            return;
+        };
+        if let Some(data) = self.ai_boxes.get_mut(ai_box) {
+            if let Some(conv) = data.get_mut(&conversation)
+                && let Some(message) = conv.messages.get_mut(message_index)
+                && let Some(proposal) = &mut message.proposal
+            {
+                proposal.created = Some(created);
+            }
+            let _ = self.ai_store.save_box(data);
+        }
+    }
+
+    /// Rejects a model-proposed Snippet: marks the proposal as rejected so it no
+    /// longer offers Apply. Never deletes snippets (an applied proposal is not
+    /// un-created by a later reject).
+    fn reject_proposal(&mut self, ai_box: &ContainerId, message_index: usize) {
+        let Some((_, conversation)) = self.ai_open.clone() else {
+            return;
+        };
+        if let Some(data) = self.ai_boxes.get_mut(ai_box) {
+            if let Some(conv) = data.get_mut(&conversation)
+                && let Some(message) = conv.messages.get_mut(message_index)
+                && let Some(proposal) = &mut message.proposal
+            {
+                proposal.rejected = true;
+            }
+            let _ = self.ai_store.save_box(data);
+        }
     }
 
     /// Appends an assistant message to the conversation sidecar, including the
-    /// provider-reported token usage (when available).
+    /// provider-reported token usage and an optional model-proposed snippet.
     pub(super) fn push_assistant(
         &mut self,
         identity: &TurnIdentity,
@@ -567,6 +735,7 @@ impl HomePage {
         status: MessageStatus,
         sources: Vec<SourceRef>,
         usage: TokenUsage,
+        proposal: Option<SnippetProposal>,
     ) {
         let now = now_unix();
         if let Some(data) = self.ai_boxes.get_mut(&identity.ai_box) {
@@ -576,6 +745,7 @@ impl HomePage {
             if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
                 message.usage = Some(usage);
             }
+            message.proposal = proposal;
             data.push_message(&identity.conversation, message, now);
             let _ = self.ai_store.save_box(data);
         }
@@ -615,6 +785,11 @@ impl HomePage {
             "You are a knowledge assistant in FloatDea, a local-first notes app.".to_owned(),
             "Answer using ONLY the read-only sources below. Cite sources as [1], [2], … in your answer.".to_owned(),
             "Do not invent facts or sources. If the sources do not contain the answer, say so.".to_owned(),
+            "If your answer is a self-contained deliverable (a new summary, a ready-to-use note), you may propose saving it as a new Snippet. End the answer with a single JSON fenced block:".to_owned(),
+            "```json".to_owned(),
+            "{\"proposal\":{\"title\":\"The new Snippet title\",\"content\":\"The full Markdown body\"}}".to_owned(),
+            "```".to_owned(),
+            "Never modify, append to, replace or delete any existing snippet; only a brand-new Snippet can be created from your proposal.".to_owned(),
             String::new(),
         ];
         let mut count = 0;
@@ -736,6 +911,167 @@ fn citation_linked_content(message: &Message) -> String {
         out.push(chars[i]);
         i += 1;
     }
+    out
+}
+
+/// The JSON payload the model may append to its answer to propose a new Snippet
+/// (plan_ai.md §9.8 `core.create_output_proposal`): a single fenced block
+///
+/// ```text
+/// ```json
+/// {"proposal":{"title":"...","content":"..."}}
+/// ```
+/// ```
+///
+/// The fence is stripped from the visible answer and the parsed proposal is
+/// surfaced as an Apply/Reject card. Malformed or missing blocks leave the
+/// answer untouched with `None`.
+#[derive(serde::Deserialize)]
+struct ProposalPayload {
+    proposal: SnippetProposal,
+}
+
+/// Parses a model-proposed Snippet out of an assistant answer and strips the
+/// raw JSON from the visible text. The proposal may arrive either as a fenced
+/// ` ```json {"proposal":{...}} ``` ` block (the documented format) or as a
+/// bare `{"proposal":{...}}` object anywhere in the answer. Returns the answer
+/// text with the JSON (and any surrounding fence markers) removed, plus the
+/// parsed proposal; or the unchanged text with `None` when no valid proposal is
+/// present.
+pub(super) fn parse_snippet_proposal(content: &str) -> (String, Option<SnippetProposal>) {
+    if let Some((cleaned, proposal)) = parse_fenced_proposal(content) {
+        return (cleaned, Some(proposal));
+    }
+    if let Some((cleaned, proposal)) = parse_bare_proposal(content) {
+        return (cleaned, Some(proposal));
+    }
+    (content.to_owned(), None)
+}
+
+/// Parses a ` ```json … ``` ` fenced block and removes the whole block
+/// (opener, JSON body and closer) from the answer.
+fn parse_fenced_proposal(content: &str) -> Option<(String, SnippetProposal)> {
+    let mut start_index = None;
+    for (i, line) in content.lines().enumerate() {
+        if line.trim().eq_ignore_ascii_case("```json") {
+            start_index = Some(i);
+            break;
+        }
+    }
+    let start_index = start_index?;
+    let mut end_index = None;
+    for (i, line) in content.lines().enumerate().skip(start_index + 1) {
+        if line.trim() == "```" {
+            end_index = Some(i);
+            break;
+        }
+    }
+    let end_index = end_index?;
+    let json_text: String = content
+        .lines()
+        .skip(start_index + 1)
+        .take(end_index - start_index - 1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let payload = serde_json::from_str::<ProposalPayload>(&json_text).ok()?;
+    let cleaned = content
+        .lines()
+        .enumerate()
+        .filter(|(i, _)| *i != start_index && *i != end_index)
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((cleaned.trim().to_owned(), payload.proposal))
+}
+
+/// Parses a bare `{"proposal":{...}}` object appearing anywhere in the answer
+/// and removes just that JSON region (plus any fence markers on the same line).
+fn parse_bare_proposal(content: &str) -> Option<(String, SnippetProposal)> {
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            let mut j = i + 1;
+            while j < bytes.len()
+                && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r')
+            {
+                j += 1;
+            }
+            if content[j..].starts_with("\"proposal\"")
+                && let Some(end) = find_matching_brace(content, i)
+                && let Ok(payload) = serde_json::from_str::<ProposalPayload>(&content[i..=end])
+            {
+                let cleaned = strip_proposal_region(content, i, end);
+                return Some((cleaned.trim().to_owned(), payload.proposal));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Returns the index of the `}` that closes the `{` at `open`, respecting
+/// nested braces and string literals.
+fn find_matching_brace(content: &str, open: usize) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = open;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Removes the JSON region `[start, end]` from `content`, also swallowing a
+/// leading ` ```json ` fence and a trailing ` ``` ` fence that sit on the same
+/// line as the JSON boundaries.
+fn strip_proposal_region(content: &str, start: usize, end: usize) -> String {
+    let line_start = content[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let before = &content[line_start..start];
+    let mut remove_start = start;
+    if let Some(open) = before.rfind("```")
+        && before[open + 3..].trim().is_empty()
+    {
+        remove_start = line_start;
+    }
+    let line_end = content[end..]
+        .find('\n')
+        .map(|i| end + i)
+        .unwrap_or(content.len());
+    let after = &content[end + 1..line_end];
+    let mut remove_end = end + 1;
+    if let Some(close) = after.find("```")
+        && after[..close].trim().is_empty()
+    {
+        remove_end = line_end;
+    }
+    let mut out = String::with_capacity(content.len() - (remove_end - remove_start));
+    out.push_str(&content[..remove_start]);
+    out.push_str(&content[remove_end..]);
     out
 }
 
@@ -1045,6 +1381,203 @@ mod tests {
         let snapshots = page.source_snapshots(&ai_box, &conversation);
         assert_eq!(snapshots.len(), 1);
         assert!(matches!(snapshots[0].target, SourceTarget::Container(_)));
+    }
+
+    #[test]
+    fn parse_snippet_proposal_extracts_fenced_proposal() {
+        let content = "Here is the summary.\n\n```json\n{\"proposal\":{\"title\":\"New Note\",\"content\":\"# New Note\\n\\nBody text\"}}\n```\n";
+        let (cleaned, proposal) = parse_snippet_proposal(content);
+        assert!(cleaned.contains("Here is the summary."));
+        assert!(!cleaned.contains("```json"));
+        let proposal = proposal.expect("a proposal was parsed");
+        assert_eq!(proposal.title, "New Note");
+        assert!(proposal.content.contains("# New Note"));
+        assert!(proposal.created.is_none());
+        assert!(!proposal.rejected);
+    }
+
+    #[test]
+    fn parse_snippet_proposal_without_fence_leaves_content_unchanged() {
+        let content = "Just a normal answer. No proposal.";
+        let (cleaned, proposal) = parse_snippet_proposal(content);
+        assert_eq!(cleaned, content);
+        assert!(proposal.is_none());
+    }
+
+    #[test]
+    fn parse_snippet_proposal_malformed_block_returns_none() {
+        let content = "Answer\n```json\n{not json}\n```\n";
+        let (cleaned, proposal) = parse_snippet_proposal(content);
+        assert_eq!(cleaned, content, "malformed blocks leave the answer untouched");
+        assert!(proposal.is_none());
+    }
+
+    #[test]
+    fn parse_snippet_proposal_strips_bare_json_from_the_text() {
+        // A model may emit the proposal as a bare object instead of a fenced
+        // block; the raw JSON must never appear in the visible answer.
+        let content = "Here is the summary. {\"proposal\":{\"title\":\"Bare Note\",\"content\":\"Body\"}}";
+        let (cleaned, proposal) = parse_snippet_proposal(content);
+        assert!(
+            !cleaned.contains("proposal"),
+            "the raw JSON is stripped from the text: {cleaned}"
+        );
+        assert!(cleaned.contains("Here is the summary."));
+        let proposal = proposal.expect("a bare proposal was parsed");
+        assert_eq!(proposal.title, "Bare Note");
+        assert_eq!(proposal.content, "Body");
+    }
+
+    #[test]
+    fn apply_proposal_creates_an_output_snippet_and_records_creation() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let (ai_box, conversation, _) = open_fake_conversation(&mut page);
+
+        let mut message = Message::assistant("Proposal text", TurnTaskId::new());
+        message.proposal = Some(SnippetProposal::new("Draft Note", "# Draft Note\n\nDraft body"));
+        page.ai_boxes
+            .get_mut(&ai_box)
+            .unwrap()
+            .push_message(&conversation, message, now_unix());
+
+        page.apply_proposal(&ai_box, 0);
+
+        let data = page.ai_boxes[&ai_box].get(&conversation).unwrap();
+        let proposal = data.messages[0]
+            .proposal
+            .as_ref()
+            .expect("the proposal is retained on the message");
+        let created = proposal.created.clone().expect("the creation is recorded");
+        assert_eq!(page.all_snippets[&created].title, "Draft Note");
+        assert!(page.all_snippets[&created].content.contains("# Draft Note"));
+        assert!(
+            page.workspace.containers[&ai_box]
+                .members
+                .iter()
+                .any(|reference| {
+                    reference.role == MemberRole::Output
+                        && matches!(&reference.target, ReferenceTarget::Snippet(id) if id == &created)
+                }),
+            "the AI box holds an Output reference to the committed snippet"
+        );
+    }
+
+    #[test]
+    fn apply_proposal_is_idempotent() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let (ai_box, conversation, _) = open_fake_conversation(&mut page);
+
+        let mut message = Message::assistant("Proposal text", TurnTaskId::new());
+        message.proposal = Some(SnippetProposal::new("Draft Note", "Body"));
+        page.ai_boxes
+            .get_mut(&ai_box)
+            .unwrap()
+            .push_message(&conversation, message, now_unix());
+
+        page.apply_proposal(&ai_box, 0);
+        page.apply_proposal(&ai_box, 0);
+
+        let created = page.ai_boxes[&ai_box]
+            .get(&conversation)
+            .unwrap()
+            .messages[0]
+            .proposal
+            .as_ref()
+            .unwrap()
+            .created
+            .clone()
+            .expect("the creation is recorded");
+        let drafts: Vec<&Snippet> = page
+            .all_snippets
+            .values()
+            .filter(|snippet| snippet.id == created)
+            .collect();
+        assert_eq!(
+            drafts.len(),
+            1,
+            "double apply must not create a second snippet"
+        );
+    }
+
+    #[test]
+    fn reject_proposal_creates_nothing() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let (ai_box, conversation, _) = open_fake_conversation(&mut page);
+
+        let mut message = Message::assistant("Proposal text", TurnTaskId::new());
+        message.proposal = Some(SnippetProposal::new("Draft Note", "Body"));
+        page.ai_boxes
+            .get_mut(&ai_box)
+            .unwrap()
+            .push_message(&conversation, message, now_unix());
+
+        page.reject_proposal(&ai_box, 0);
+
+        let data = page.ai_boxes[&ai_box].get(&conversation).unwrap();
+        let proposal = data.messages[0].proposal.as_ref().unwrap();
+        assert!(proposal.rejected);
+        assert!(proposal.created.is_none());
+        assert!(
+            page.all_snippets
+                .values()
+                .all(|snippet| snippet.title != "Draft Note"),
+            "rejecting must not create a snippet"
+        );
+        assert!(
+            !page.workspace.containers[&ai_box]
+                .members
+                .iter()
+                .any(|reference| reference.role == MemberRole::Output),
+            "rejecting must not add an Output reference"
+        );
+    }
+
+    #[test]
+    fn applied_proposal_and_created_snippet_survive_restart() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let (ai_box, conversation, _) = open_fake_conversation(&mut page);
+
+        let mut message = Message::assistant("Proposal text", TurnTaskId::new());
+        message.proposal = Some(SnippetProposal::new("Draft Note", "Body"));
+        page.ai_boxes
+            .get_mut(&ai_box)
+            .unwrap()
+            .push_message(&conversation, message, now_unix());
+        page.apply_proposal(&ai_box, 0);
+        let created = page.ai_boxes[&ai_box]
+            .get(&conversation)
+            .unwrap()
+            .messages[0]
+            .proposal
+            .as_ref()
+            .unwrap()
+            .created
+            .clone()
+            .unwrap();
+
+        drop(page);
+        let reloaded = HomePage::new(&folder.0);
+        let data = reloaded.ai_boxes[&ai_box].get(&conversation).unwrap();
+        let proposal = data.messages[0].proposal.as_ref().unwrap();
+        assert_eq!(proposal.created.as_ref(), Some(&created));
+        assert!(
+            reloaded.all_snippets.contains_key(&created),
+            "the committed snippet is an ordinary Markdown entity after restart"
+        );
+        assert!(
+            reloaded.workspace.containers[&ai_box]
+                .members
+                .iter()
+                .any(|reference| {
+                    reference.role == MemberRole::Output
+                        && matches!(&reference.target, ReferenceTarget::Snippet(id) if id == &created)
+                }),
+            "the Output reference survives the restart"
+        );
     }
 
     fn first_snippet_id(page: &HomePage) -> EntityId {

@@ -10,8 +10,9 @@ use floatdea::data::{
     TurnTaskId,
     ai::{
         AiBoxData, AiErrorKind, AiStore, AiWorker, ChatMessage, ChatProvider, ChatRequest,
-        Conversation, Message, MessageRole, MessageStatus, ProviderKind, SourceRef, SourceTarget,
-        TokenUsage, TurnEvent, TurnIdentity, TurnRequest, build_provider, content_hash, now_unix,
+        Conversation, Message, MessageRole, MessageStatus, ProviderKind, SnippetProposal, SourceRef,
+        SourceTarget, TokenUsage, TurnEvent, TurnIdentity, TurnRequest, build_provider,
+        content_hash, now_unix,
     },
     settings::{Settings, SettingsStore, ThemeSetting, WindowMode},
     storage::SnippetStore,
@@ -1808,12 +1809,17 @@ impl HomePage {
                     }
                     self.ai_active_turn = None;
                     let snapshots = std::mem::take(&mut self.ai_snapshots);
+                    // The model may append a fenced `create_output_proposal`
+                    // JSON block (plan_ai.md §4.9/§9.8); it is stripped from the
+                    // visible answer and surfaced as a proposal card.
+                    let (content, proposal) = ai_chat::parse_snippet_proposal(&content);
                     self.push_assistant(
                         &identity,
                         &content,
                         MessageStatus::Completed,
                         snapshots,
                         usage,
+                        proposal,
                     );
                 }
                 TurnEvent::Failed { identity, error } => {
@@ -1839,6 +1845,7 @@ impl HomePage {
                         status,
                         snapshots,
                         TokenUsage::default(),
+                        None,
                     );
                 }
             }
