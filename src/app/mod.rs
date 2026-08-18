@@ -97,10 +97,6 @@ pub(crate) struct HomePage {
     /// Test hook: overrides the provider built from settings so tests can script
     /// the fake provider (tool loops, failures). Always `None` in production.
     ai_provider_override: Option<Arc<dyn ChatProvider>>,
-    /// State of the "Insert External File…" dialog (opened from a canvas
-    /// context menu). Like the search window it renders only on the viewport
-    /// that opened it, so the picker appears in the window that asked for it.
-    file_insert: Option<FileInsertState>,
     /// Transient "could not open external file" toast: message, originating
     /// viewport, and remaining frames (auto-dismissed after a short while).
     external_open_error: Option<(String, egui::ViewportId, u32)>,
@@ -108,6 +104,17 @@ pub(crate) struct HomePage {
     /// `dropped_files` event shared by every canvas of the viewport) is
     /// consumed by exactly one canvas. Reset at the start of each frame.
     os_file_drop_consumed: bool,
+    /// Pending file picker result: when the user clicks "Insert External File…",
+    /// a thread is spawned to run the blocking `rfd` file dialog. The result is
+    /// received here on the next frame and processed immediately.
+    pending_file_picker: Option<ExternalFilePending>,
+}
+
+/// State of an in-flight native file picker dialog. The blocking `rfd` call
+/// runs in a separate thread so the main event loop stays responsive.
+struct ExternalFilePending {
+    container: ContainerId,
+    rx: std::sync::mpsc::Receiver<Option<String>>,
 }
 
 /// State of the global search window. Like the rename/delete dialogs, the
@@ -134,22 +141,8 @@ impl Default for SearchState {
     }
 }
 
-/// State of the "Insert External File…" dialog. Like the rename/delete dialogs
-/// and the search window, the dialog renders **only on the viewport that opened
-/// it** (root or a folder window), so the picker appears where the user asked
-/// for it instead of always floating on the main window.
-struct FileInsertState {
-    open: bool,
-    /// Absolute path typed by the user (or filled by the native file picker).
-    path: String,
-    /// The container whose canvas receives the new card.
-    container: ContainerId,
-    /// The viewport that opened the dialog; it is drawn only there.
-    origin: egui::ViewportId,
-    /// Canvas-local position for the new card (the right-click anchor); `None`
-    /// picks a free default slot.
-    position: Option<[f32; 2]>,
-}
+
+
 
 /// Display mode of a snippet viewport.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -363,6 +356,8 @@ enum CanvasCommand {
     OpenSpecial(SpecialKind),
     /// Open the global search window.
     OpenSearch,
+    /// Open the "Insert External File" dialog for the given container.
+    OpenFileInsertDialog(ContainerId),
     /// Remove a reference from `owner`. If it is the last link to its target,
     /// a confirmation dialog is shown before the entity/container is deleted.
     DeleteReference {
@@ -432,11 +427,6 @@ enum CanvasCommand {
         ai_box: ContainerId,
         conversation: ConversationId,
         origin: egui::ViewportId,
-    },
-    /// Open the "Insert External File…" dialog on the originating viewport.
-    OpenFileDialog {
-        container: ContainerId,
-        position: Option<[f32; 2]>,
     },
     /// Insert an external-file card into `container` at `position` (or a free
     /// default slot when `None`).
@@ -624,9 +614,9 @@ impl HomePage {
             ai_snapshots: Vec::new(),
             ai_markdown_cache: egui_commonmark::CommonMarkCache::default(),
             ai_provider_override: None,
-            file_insert: None,
             external_open_error: None,
             os_file_drop_consumed: false,
+            pending_file_picker: None,
         }
     }
 
@@ -792,13 +782,6 @@ impl HomePage {
         }) {
             self.pending_delete = None;
         }
-        if self
-            .file_insert
-            .as_ref()
-            .is_some_and(|state| &state.container == container_id)
-        {
-            self.file_insert = None;
-        }
     }
 
     fn process_canvas_commands(&mut self, commands: Vec<CanvasCommand>, origin: egui::ViewportId) {
@@ -815,6 +798,14 @@ impl HomePage {
                     // it (root or a folder window), mirroring the rename dialog.
                     self.search.origin = origin;
                     self.search.focus_requested = true;
+                }
+                CanvasCommand::OpenFileInsertDialog(container) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let selected = rfd::FileDialog::new().pick_file();
+                        let _ = tx.send(selected.map(|p| p.display().to_string()));
+                    });
+                    self.pending_file_picker = Some(ExternalFilePending { container, rx });
                 }
                 CanvasCommand::DeleteReference {
                     owner,
@@ -841,7 +832,7 @@ impl HomePage {
                     let viewport = egui::ViewportId::from_hash_of(("folder-view", id.as_str()));
                     self.clear_rename_for_viewport(viewport);
                     self.clear_search_for_viewport(viewport);
-                    self.clear_file_ui_for_viewport(viewport);
+                    
                     if self.floating_windows() {
                         self.clear_dialog_for_folder(&id);
                     }
@@ -959,15 +950,6 @@ impl HomePage {
                         self.rename_dialog.focus_requested = false;
                     }
                 }
-                CanvasCommand::OpenFileDialog { container, position } => {
-                    self.file_insert = Some(FileInsertState {
-                        open: true,
-                        path: String::new(),
-                        container,
-                        origin,
-                        position,
-                    });
-                }
                 CanvasCommand::InsertExternalFile {
                     container,
                     file,
@@ -1024,25 +1006,7 @@ impl HomePage {
         }
     }
 
-    /// Closes the "Insert External File…" dialog and the transient open-error
-    /// toast when the viewport that opened them is gone, so they never get
-    /// stuck in an invisible "open" state.
-    fn clear_file_ui_for_viewport(&mut self, viewport_id: egui::ViewportId) {
-        if self
-            .file_insert
-            .as_ref()
-            .is_some_and(|state| state.origin == viewport_id)
-        {
-            self.file_insert = None;
-        }
-        if self
-            .external_open_error
-            .as_ref()
-            .is_some_and(|(_, origin, _)| *origin == viewport_id)
-        {
-            self.external_open_error = None;
-        }
-    }
+    
 
     /// Removes a single reference from `owner` without touching the underlying
     /// entity/container (used when the deleted link is not the last one).
@@ -1906,87 +1870,12 @@ fn render_search_window(
     open_id
 }
 
-/// Renders the "Insert External File…" dialog: a path field (the user may type
-/// or paste an absolute path) plus a "Browse…" button that opens the native
-/// file picker (`rfd`). The dialog is drawn **only on the viewport that opened
-/// it** (root or a folder window), mirroring the search window.
+/// Renders the "Insert External File" dialog (path text field, Browse button,
+/// and Insert button). Only renders on the viewport that opened it. The Browse
+/// button spawns a thread that calls the blocking `rfd` file picker so the main
+/// event loop stays responsive for other windows.
 ///
-/// Returns the confirmed insert as `(container, position, file)`; the caller
-/// applies it (as a command from a folder window, or directly from the root
-/// pass). The dialog self-dismisses on Insert / Cancel / close button.
-fn render_file_insert_dialog(
-    ui: &egui::Ui,
-    dialog: &mut FileInsertState,
-) -> Option<(ContainerId, Option<[f32; 2]>, ExternalFileRef)> {
-    if !dialog.open || ui.ctx().viewport_id() != dialog.origin {
-        return None;
-    }
-    let mut open = dialog.open;
-    let mut insert: Option<ExternalFileRef> = None;
-    let mut cancel = false;
-    egui::Window::new("Insert External File")
-        .id(egui::Id::new(("file-insert", dialog.origin)))
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .show(ui.ctx(), |ui| {
-            ui.label("Reference an external file (PDF, Markdown, …).");
-            ui.add_space(4.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut dialog.path)
-                    .id(egui::Id::new(("file-insert-path", dialog.origin)))
-                    .hint_text("/path/to/document.pdf"),
-            );
-            ui.horizontal(|ui| {
-                if ui.button("Browse…").clicked()
-                    && let Some(path) = rfd::FileDialog::new().pick_file()
-                {
-                    dialog.path = path.display().to_string();
-                }
-            });
-            let path = dialog.path.trim().to_owned();
-            let valid = !path.is_empty();
-            if valid {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Will show as: {}",
-                        file_stem(&path)
-                    ))
-                    .small()
-                    .weak(),
-                );
-            }
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
-                }
-                if ui.add_enabled(valid, egui::Button::new("Insert")).clicked() {
-                    let title = file_stem(&path);
-                    insert = Some(ExternalFileRef {
-                        id: ExternalFileId::new(),
-                        path,
-                        title,
-                    });
-                }
-            });
-        });
-    if let Some(file) = insert {
-        let container = dialog.container.clone();
-        let position = dialog.position;
-        dialog.open = false;
-        Some((container, position, file))
-    } else {
-        if cancel {
-            dialog.open = false;
-        } else {
-            // Reflect the close button (egui wrote back into `open`).
-            dialog.open = open;
-        }
-        None
-    }
-}
-
+/// Returns `Some((container, file, position))` when the user clicks Insert.
 /// Renders the transient "could not open external file" toast in the viewport
 /// that triggered the failed open (bottom-left, mirroring the clipboard status
 /// indicator). The countdown is driven per-frame by [`HomePage::ui_impl`].
@@ -2215,7 +2104,6 @@ impl HomePage {
                     &mut self.pending_delete,
                     &mut self.search,
                     &mut self.clipboard,
-                    &mut self.file_insert,
                     &self.external_open_error,
                     &mut self.os_file_drop_consumed,
                     &self.ai_boxes,
@@ -2245,15 +2133,22 @@ impl HomePage {
         if let Some(id) = render_search_window(ui, &mut self.search, &self.all_snippets) {
             self.open_view(id);
         }
-        // The "Insert External File…" dialog (rendered only on its originating
-        // viewport; a folder window renders it inside its own viewport pass).
-        if let Some((container, position, file)) = self
-            .file_insert
-            .as_mut()
-            .and_then(|state| render_file_insert_dialog(ui, state))
-        {
-            self.file_insert = None;
-            self.insert_external_file(&container, file, position);
+        // Poll the pending file picker result (spawned in a thread to avoid
+        // blocking the main event loop).
+        if let Some(pending) = self.pending_file_picker.as_ref() {
+            if let Ok(Some(path)) = pending.rx.try_recv() {
+                let container = pending.container.clone();
+                let file = ExternalFileRef {
+                    id: ExternalFileId::new(),
+                    title: file_stem(&path),
+                    path,
+                };
+                self.pending_file_picker = None;
+                self.insert_external_file(&container, file, None);
+            } else if pending.rx.try_recv().is_ok() {
+                // Cancelled.
+                self.pending_file_picker = None;
+            }
         }
         // The transient "could not open external file" toast.
         render_external_open_error(ui, &self.external_open_error);
@@ -3564,26 +3459,6 @@ mod tests {
             "external files cannot be dropped into AI boxes"
         );
         assert_eq!(page.workspace.containers[&ai_box].members.len(), 0);
-    }
-
-    #[test]
-    fn open_file_dialog_command_remembers_origin_and_container() {
-        let folder = TestFolder::new();
-        let mut page = HomePage::new(&folder.0);
-        let folder_viewport = egui::ViewportId::from_hash_of(("folder-view", "some-container"));
-        let container = page.root.container_id.clone();
-        page.process_canvas_commands(
-            vec![CanvasCommand::OpenFileDialog {
-                container: container.clone(),
-                position: Some([12.0, 12.0]),
-            }],
-            folder_viewport,
-        );
-        let state = page.file_insert.as_ref().expect("dialog opened");
-        assert!(state.open);
-        assert_eq!(state.origin, folder_viewport);
-        assert_eq!(state.container, container);
-        assert_eq!(state.position, Some([12.0, 12.0]));
     }
 
     #[test]

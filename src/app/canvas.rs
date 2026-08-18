@@ -375,7 +375,6 @@ impl HomePage {
         pending_delete: &mut Option<PendingDelete>,
         search: &mut SearchState,
         clipboard: &mut Option<ClipboardEntry>,
-        file_insert: &mut Option<FileInsertState>,
         external_open_error: &Option<(String, egui::ViewportId, u32)>,
         os_file_drop_consumed: &mut bool,
         ai: &BTreeMap<ContainerId, AiBoxData>,
@@ -434,20 +433,6 @@ impl HomePage {
                 // unless `search.origin` is exactly this folder window.
                 if let Some(id) = render_search_window(child_ui, search, snippets) {
                     commands.push(CanvasCommand::OpenSnippet(id));
-                }
-                // Render the "Insert External File…" dialog inside this viewport
-                // so that it appears in the folder window that initiated it; the
-                // confirmed insert becomes a command applied at frame end.
-                if let Some((container, position, file)) = file_insert
-                    .as_mut()
-                    .and_then(|state| render_file_insert_dialog(child_ui, state))
-                {
-                    *file_insert = None;
-                    commands.push(CanvasCommand::InsertExternalFile {
-                        container,
-                        file,
-                        position,
-                    });
                 }
                 // Render the transient "could not open external file" toast in
                 // the folder window that triggered the failed open.
@@ -1330,10 +1315,9 @@ impl HomePage {
                     ui.close();
                 }
                 if ui.button("Insert External File…").clicked() {
-                    commands.push(CanvasCommand::OpenFileDialog {
-                        container: canvas.container_id.clone(),
-                        position: canvas.menu_anchor,
-                    });
+                    commands.push(CanvasCommand::OpenFileInsertDialog(
+                        canvas.container_id.clone(),
+                    ));
                     ui.close();
                 }
                 if ui.button("New Text").clicked() {
