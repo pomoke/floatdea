@@ -6,12 +6,14 @@
 //! synced or exported by default. Only answers the user saves as snippets
 //! become real knowledge entities.
 
+pub mod extract;
 pub mod provider;
 mod store;
 pub mod tool;
 mod types;
 pub mod worker;
 
+pub use extract::extract_text_from_file;
 pub use provider::{
     AiError, AiErrorKind, CancelFlag, Capabilities, ChatMessage, ChatProvider, ChatRequest,
     ChatRole, ChatToolCall, ProviderConfig, ProviderKind, StreamEvent, StreamOutcome, TokenUsage,

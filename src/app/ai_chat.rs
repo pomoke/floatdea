@@ -4,6 +4,7 @@
 //! AI worker; streaming deltas arrive through `HomePage::ai_events`.
 
 use super::*;
+use floatdea::data::ai::extract_text_from_file;
 
 /// Actions collected from the conversation window this frame, applied after the
 /// window closure (the "UI collects, frame end applies" pattern).
@@ -17,6 +18,7 @@ enum AiChatAction {
     RejectProposal(usize),
     OpenSource(EntityId),
     OpenFolder(ContainerId),
+    OpenExternalFile(ExternalFileRef),
 }
 
 impl HomePage {
@@ -107,6 +109,9 @@ impl HomePage {
             AiChatAction::OpenFolder(id) => {
                 self.clipboard = None;
                 self.open_folder(&id);
+            }
+            AiChatAction::OpenExternalFile(file) => {
+                let _ = open_path_externally(&file.path);
             }
         }
     }
@@ -311,6 +316,13 @@ impl HomePage {
                                         SourceTarget::Container(id) => {
                                             if ui.link(label).clicked() {
                                                 *action = AiChatAction::OpenFolder(id.clone());
+                                            }
+                                        }
+                                        SourceTarget::ExternalFile(_) => {
+                                            if ui.link(label).clicked()
+                                                && let Some(file) = page.find_external_file_ref(&source.target)
+                                            {
+                                                *action = AiChatAction::OpenExternalFile(file.clone());
                                             }
                                         }
                                     }
@@ -637,6 +649,9 @@ impl HomePage {
                     SourceTarget::Container(_) => {
                         output.push_str(&format!("{}. {}\n", index + 1, source.title));
                     }
+                    SourceTarget::ExternalFile(_) => {
+                        output.push_str(&format!("{}. {} (external file)\n", index + 1, source.title));
+                    }
                 }
             }
         }
@@ -837,12 +852,14 @@ impl HomePage {
             String::new(),
         ];
         let mut count = 0;
+        let total = sources.len();
         for target in sources {
             if let Some((title, text)) = self.resolve_source_text(target, ai_box) {
                 count += 1;
                 parts.push(format!("[{count}] {title}\n{text}"));
             }
         }
+        log::info!("built system prompt: {count}/{total} sources resolved");
         if count == 0 {
             parts.push("(No sources are bound to this conversation yet.)".to_owned());
         }
@@ -871,6 +888,34 @@ impl HomePage {
                 }
                 let text: String = parts.join("\n\n").chars().take(MAX_SOURCE_CHARS).collect();
                 Some((format!("Folder {}", container.title), text))
+            }
+            SourceTarget::ExternalFile(id) => {
+                let Some(file) = self.find_external_file(id) else {
+                    log::warn!("ExternalFile source not found in workspace: {}", id.as_str());
+                    return None;
+                };
+                // Use the cache if available; otherwise extract synchronously
+                // and cache the result. The cache is pre-populated in the
+                // background after conversation creation (see
+                // `spawn_content_extraction`).
+                let text = if let Some(cached) = self.file_content_cache.lock().ok().and_then(|c| c.get(id).cloned()) {
+                    cached
+                } else {
+                    match extract_text_from_file(&file.path) {
+                        Some(text) => {
+                            if let Ok(mut cache) = self.file_content_cache.lock() {
+                                cache.insert(id.clone(), text.clone());
+                            }
+                            text
+                        }
+                        None => {
+                            log::warn!("could not extract content from external file: {} ({})", file.title, file.path);
+                            return Some((file.title.clone(), "[content unavailable: file could not be read]".to_owned()));
+                        }
+                    }
+                };
+                let text: String = text.chars().take(MAX_SOURCE_CHARS).collect();
+                Some((file.title.clone(), text))
             }
         }
     }
@@ -1000,7 +1045,7 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    use super::*;
+use super::*;
     use floatdea::data::ai::provider::FakeProvider;
 
     struct TestFolder(PathBuf);

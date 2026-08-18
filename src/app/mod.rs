@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use eframe::{App, egui};
 use tokio::sync::mpsc;
@@ -108,6 +108,11 @@ pub(crate) struct HomePage {
     /// a thread is spawned to run the blocking `rfd` file dialog. The result is
     /// received here on the next frame and processed immediately.
     pending_file_picker: Option<ExternalFilePending>,
+    /// Cache of extracted text content for external files, keyed by
+    /// `ExternalFileId`. Populated in the background after a conversation is
+    /// created, so PDF extraction never blocks the UI thread. Uses `Mutex` for
+    /// interior mutability so the background thread can write into it.
+    file_content_cache: Arc<Mutex<HashMap<ExternalFileId, String>>>,
 }
 
 /// State of an in-flight native file picker dialog. The blocking `rfd` call
@@ -617,6 +622,7 @@ impl HomePage {
             external_open_error: None,
             os_file_drop_consumed: false,
             pending_file_picker: None,
+            file_content_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1099,10 +1105,13 @@ impl HomePage {
         file: ExternalFileRef,
         position: Option<[f32; 2]>,
     ) {
-        let Ok(reference_id) = self
-            .workspace
-            .add_external_file_reference(container, file.clone())
-        else {
+        let is_ai_box = self.workspace.is_ai_box(container);
+        let result = if is_ai_box {
+            self.workspace.add_source_reference(container, ReferenceTarget::ExternalFile(file.clone()))
+        } else {
+            self.workspace.add_external_file_reference(container, file.clone())
+        };
+        let Ok(reference_id) = result else {
             return;
         };
         let _ = self.workspace_store.save(&self.workspace);
@@ -1129,10 +1138,11 @@ impl HomePage {
             self.folder_views.get_mut(container)
         };
         if let Some(canvas) = target_canvas {
+            let role = if is_ai_box { MemberRole::Source } else { MemberRole::Normal };
             canvas.items.push(CanvasItem {
                 reference_id: reference_id.clone(),
                 target: ReferenceTarget::ExternalFile(file),
-                role: MemberRole::Normal,
+                role,
                 position,
                 size: egui::vec2(CARD_WIDTH, 25.0),
             });
@@ -1191,6 +1201,30 @@ impl HomePage {
         }
         let _ = self.workspace_store.save(&self.workspace);
         true
+    }
+
+    /// Finds an `ExternalFileRef` by its `ExternalFileId` across all containers
+    /// in the workspace. Returns `None` if no matching reference exists.
+    fn find_external_file(&self, id: &ExternalFileId) -> Option<&ExternalFileRef> {
+        self.workspace.containers.values().flat_map(|container| &container.members).find_map(|reference| {
+            if let ReferenceTarget::ExternalFile(file) = &reference.target
+                && &file.id == id
+            {
+                Some(file)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Like [`Self::find_external_file`] but resolves the `ExternalFileId` from
+    /// a `SourceTarget::ExternalFile`. Returns `None` for non-ExternalFile
+    /// targets or when the id is not found.
+    pub(super) fn find_external_file_ref(&self, source: &SourceTarget) -> Option<&ExternalFileRef> {
+        match source {
+            SourceTarget::ExternalFile(id) => self.find_external_file(id),
+            _ => None,
+        }
     }
 
     // ---- AI workbench operations (阶段 1: no-model workbench) ----
@@ -1265,6 +1299,9 @@ impl HomePage {
                         ReferenceTarget::Container(id) => {
                             Some(SourceTarget::Container(id.clone()))
                         }
+                        ReferenceTarget::ExternalFile(file) => {
+                            Some(SourceTarget::ExternalFile(file.id.clone()))
+                        }
                         _ => None,
                     })
                     .collect()
@@ -1272,10 +1309,36 @@ impl HomePage {
             .unwrap_or_default()
     }
 
+    /// Spawns background threads to extract text content from all ExternalFile
+    /// sources in `sources`, storing results in `file_content_cache`. This way
+    /// PDF extraction never blocks the UI thread when the user sends a message.
+    fn spawn_content_extraction(&self, sources: &[SourceTarget]) {
+        for target in sources {
+            let SourceTarget::ExternalFile(id) = target else {
+                continue;
+            };
+            let Some(file) = self.find_external_file(id) else {
+                continue;
+            };
+            let path = file.path.clone();
+            let fid = file.id.clone();
+            let cache = Arc::clone(&self.file_content_cache);
+            std::thread::spawn(move || {
+                let text = floatdea::data::ai::extract::extract_text_from_file(&path);
+                if let Some(text) = text
+                    && let Ok(mut cache) = cache.lock()
+                {
+                    cache.insert(fid, text);
+                }
+            });
+        }
+    }
+
     /// Creates a conversation (sidecar state + card) inside an AI box. Initial
     /// sources are the AI box's direct `Source` references.
     fn create_conversation(&mut self, ai_box: &ContainerId, position: Option<[f32; 2]>) {
         let sources = self.initial_conversation_sources(ai_box);
+        self.spawn_content_extraction(&sources);
         let conversation = ConversationId::new();
         let data = self
             .ai_boxes
@@ -1507,14 +1570,17 @@ impl HomePage {
             ReferenceTarget::Special(_) => return false,
             // Conversation cards cannot be pasted into other containers.
             ReferenceTarget::Conversation(_) => return false,
-            // External files are plain references between ordinary containers;
-            // they are never valid AI sources (`clipboard_valid_for` rejects
-            // them for AI boxes), so this branch only runs for normal boxes.
+            // External files can now be linked into AI boxes as model-readable
+            // sources; their content is extracted at conversation time.
             ReferenceTarget::ExternalFile(file) => {
-                let Ok(id) = self
-                    .workspace
-                    .add_external_file_reference(container, file.clone())
-                else {
+                let result = if is_ai_box {
+                    self.workspace
+                        .add_source_reference(container, ReferenceTarget::ExternalFile(file.clone()))
+                } else {
+                    self.workspace
+                        .add_external_file_reference(container, file.clone())
+                };
+                let Ok(id) = result else {
                     return false;
                 };
                 id
@@ -1643,14 +1709,17 @@ impl HomePage {
             ReferenceTarget::Special(_) => return false,
             // Conversation cards cannot be dropped into other containers.
             ReferenceTarget::Conversation(_) => return false,
-            // External files are plain references between ordinary containers;
-            // they are never valid AI sources (`drop_valid_for` rejects them
-            // for AI boxes), so this branch only runs for normal boxes.
+            // External files can now be linked into AI boxes as model-readable
+            // sources; their content is extracted at conversation time.
             ReferenceTarget::ExternalFile(file) => {
-                let Ok(id) = self
-                    .workspace
-                    .add_external_file_reference(container, file.clone())
-                else {
+                let result = if is_ai_box {
+                    self.workspace
+                        .add_source_reference(container, ReferenceTarget::ExternalFile(file.clone()))
+                } else {
+                    self.workspace
+                        .add_external_file_reference(container, file.clone())
+                };
+                let Ok(id) = result else {
                     return false;
                 };
                 id
@@ -3433,7 +3502,7 @@ mod tests {
     }
 
     #[test]
-    fn external_files_cannot_enter_ai_boxes() {
+    fn external_files_can_enter_ai_boxes() {
         let folder = TestFolder::new();
         let mut page = HomePage::new(&folder.0);
         let ai_box = page.workspace.create_ai_box("AI Box");
@@ -3446,8 +3515,8 @@ mod tests {
             origin: egui::ViewportId::ROOT,
         };
         assert!(
-            !page.paste_clipboard(&ai_box, &entry),
-            "AI boxes only hold model-readable sources"
+            page.paste_clipboard(&ai_box, &entry),
+            "external files can now be pasted into AI boxes as model-readable sources"
         );
         let payload = DragPayload::Reference {
             source_container: page.root.container_id.clone(),
@@ -3455,10 +3524,53 @@ mod tests {
             target: ReferenceTarget::ExternalFile(external_file("/tmp/data.pdf")),
         };
         assert!(
-            !page.apply_drop(&ai_box, None, &payload, false),
-            "external files cannot be dropped into AI boxes"
+            page.apply_drop(&ai_box, None, &payload, false),
+            "external files can now be dropped into AI boxes"
         );
-        assert_eq!(page.workspace.containers[&ai_box].members.len(), 0);
+        assert_eq!(page.workspace.containers[&ai_box].members.len(), 2);
+    }
+
+    #[test]
+    fn external_file_shows_as_source_in_new_conversation() {
+        // Create a real file on disk so resolve_source_text can read it.
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let ai_box = create_ai_box_in_root(&mut page);
+        let file_path = folder.0.join("test-source.md");
+        std::fs::write(&file_path, "Hello from external file").unwrap();
+
+        let file = ExternalFileRef {
+            id: ExternalFileId::new(),
+            title: "Test Source".to_owned(),
+            path: file_path.to_str().unwrap().to_owned(),
+        };
+        // Link the external file as a Source into the AI box.
+        page.process_canvas_commands(
+            vec![CanvasCommand::LinkAiSource {
+                ai_box: ai_box.clone(),
+                target: ReferenceTarget::ExternalFile(file),
+                position: Some([50.0, 50.0]),
+            }],
+            egui::ViewportId::ROOT,
+        );
+        assert!(page.workspace.containers[&ai_box]
+            .members
+            .iter()
+            .any(|reference| reference.role == MemberRole::Source
+                && matches!(&reference.target, ReferenceTarget::ExternalFile(_))));
+
+        // Create a new conversation — it should pick up the ExternalFile source.
+        page.process_canvas_commands(
+            vec![CanvasCommand::NewConversation {
+                ai_box: ai_box.clone(),
+                position: Some([80.0, 80.0]),
+            }],
+            egui::ViewportId::ROOT,
+        );
+        let data = page.ai_boxes.get(&ai_box).expect("sidecar loaded");
+        let conversation = data.conversations.values().next().expect("conversation created");
+        assert_eq!(conversation.sources.len(), 1);
+        assert!(matches!(conversation.sources[0], SourceTarget::ExternalFile(_)));
     }
 
     #[test]

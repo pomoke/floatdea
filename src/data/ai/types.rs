@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::data::{ContainerId, ConversationId, EntityId, TurnTaskId};
+use crate::data::{ContainerId, ConversationId, EntityId, ExternalFileId, TurnTaskId};
 use super::provider::TokenUsage;
 use super::tool::ToolRecord;
 
@@ -21,6 +21,7 @@ pub const AI_BOX_DATA_VERSION: u32 = 1;
 pub enum SourceTarget {
     Snippet(EntityId),
     Container(ContainerId),
+    ExternalFile(ExternalFileId),
 }
 
 impl SourceTarget {
@@ -30,6 +31,7 @@ impl SourceTarget {
         match self {
             SourceTarget::Snippet(id) => format!("s:{}", id.as_str()),
             SourceTarget::Container(id) => format!("c:{}", id.as_str()),
+            SourceTarget::ExternalFile(id) => format!("e:{}", id.as_str()),
         }
     }
 }

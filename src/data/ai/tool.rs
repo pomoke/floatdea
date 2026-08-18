@@ -198,6 +198,7 @@ fn list_sources(call: &ToolCall, def: &ToolDef, ctx: &ToolContext) -> ToolResult
         let kind = match source.target {
             SourceTarget::Snippet(_) => "snippet",
             SourceTarget::Container(_) => "container",
+            SourceTarget::ExternalFile(_) => "external_file",
         };
         lines.push(format!(
             "{}. [{}] ({kind}, content hash {})",

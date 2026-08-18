@@ -772,23 +772,39 @@ impl HomePage {
                     // sources and conversation cards never expose Link / Move /
                     // Rename-entity / Delete-entity actions.
                     if is_ai_box && role == MemberRole::Source {
-                        if ui.button("Open Read-only").clicked() {
-                            match &target {
-                                ReferenceTarget::Snippet(id) => commands.push(
-                                    CanvasCommand::OpenSnippetReadOnly(id.clone()),
-                                ),
-                                ReferenceTarget::Container(id) => {
-                                    commands.push(CanvasCommand::OpenFolder(id.clone()))
+                        match &target {
+                            ReferenceTarget::ExternalFile(file) => {
+                                if ui.button("Open Externally").clicked() {
+                                    commands.push(
+                                        CanvasCommand::OpenExternalFile(file.clone()),
+                                    );
+                                    ui.close();
                                 }
-                                _ => {}
                             }
-                            ui.close();
-                        }
-                        if let ReferenceTarget::Snippet(id) = &target
-                            && ui.button("Open Original").clicked()
-                        {
-                            commands.push(CanvasCommand::OpenSnippet(id.clone()));
-                            ui.close();
+                            _ => {
+                                if ui.button("Open Read-only").clicked() {
+                                    match &target {
+                                        ReferenceTarget::Snippet(id) => commands.push(
+                                            CanvasCommand::OpenSnippetReadOnly(id.clone()),
+                                        ),
+                                        ReferenceTarget::Container(id) => {
+                                            commands.push(
+                                                CanvasCommand::OpenFolder(id.clone()),
+                                            )
+                                        }
+                                        _ => {}
+                                    }
+                                    ui.close();
+                                }
+                                if let ReferenceTarget::Snippet(id) = &target
+                                    && ui.button("Open Original").clicked()
+                                {
+                                    commands.push(
+                                        CanvasCommand::OpenSnippet(id.clone()),
+                                    );
+                                    ui.close();
+                                }
+                            }
                         }
                         ui.separator();
                         if ui
@@ -1251,6 +1267,39 @@ impl HomePage {
                                 ui.close();
                             }
                         }
+                        // Collect unique external file references from the
+                        // workspace as linkable sources.
+                        let mut seen = BTreeSet::new();
+                        let external_files: Vec<ExternalFileRef> = data
+                            .workspace
+                            .containers
+                            .values()
+                            .flat_map(|container| &container.members)
+                            .filter_map(|reference| match &reference.target {
+                                ReferenceTarget::ExternalFile(file) => {
+                                    if seen.insert(file.id.clone()) {
+                                        Some(file.clone())
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if !external_files.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new("External Files").small().weak());
+                            for file in external_files {
+                                if ui.button(&file.title).clicked() {
+                                    commands.push(CanvasCommand::LinkAiSource {
+                                        ai_box: ai_box.clone(),
+                                        target: ReferenceTarget::ExternalFile(file),
+                                        position: anchor,
+                                    });
+                                    ui.close();
+                                }
+                            }
+                        }
                     });
                     ui.separator();
                 } else if ui.button("New AI Box…").clicked() {
@@ -1542,17 +1591,21 @@ fn create_external_file(
         title: file_stem(&path),
         path,
     };
-    let Ok(reference_id) = data
-        .workspace
-        .add_external_file_reference(&canvas.container_id, file.clone())
-    else {
+    let is_ai_box = data.workspace.is_ai_box(&canvas.container_id);
+    let result = if is_ai_box {
+        data.workspace.add_source_reference(&canvas.container_id, ReferenceTarget::ExternalFile(file.clone()))
+    } else {
+        data.workspace.add_external_file_reference(&canvas.container_id, file.clone())
+    };
+    let Ok(reference_id) = result else {
         return;
     };
     let _ = data.workspace_store.save(data.workspace);
+    let role = if is_ai_box { MemberRole::Source } else { MemberRole::Normal };
     canvas.items.push(CanvasItem {
         reference_id: reference_id.clone(),
         target: ReferenceTarget::ExternalFile(file),
-        role: MemberRole::Normal,
+        role,
         position,
         size: egui::vec2(CARD_WIDTH, 25.0),
     });
@@ -1692,9 +1745,9 @@ pub(super) fn clipboard_valid_for(
         ReferenceTarget::Special(_) => false,
         // Conversation cards cannot be linked or pasted.
         ReferenceTarget::Conversation(_) => false,
-        // External files are plain references between ordinary containers; AI
-        // boxes only hold model-readable sources, so they reject file cards.
-        ReferenceTarget::ExternalFile(_) => !workspace.is_ai_box(container),
+        // External files can now be linked into AI boxes as model-readable
+        // sources; their content is extracted at conversation time.
+        ReferenceTarget::ExternalFile(_) => true,
     }
 }
 
@@ -1725,9 +1778,9 @@ pub(super) fn drop_valid_for(
         ReferenceTarget::Special(_) => false,
         // Conversation cards cannot be linked or dropped into other containers.
         ReferenceTarget::Conversation(_) => false,
-        // External files are plain references between ordinary containers; AI
-        // boxes only hold model-readable sources, so they reject file cards.
-        ReferenceTarget::ExternalFile(_) => !workspace.is_ai_box(container),
+        // External files can now be linked into AI boxes as model-readable
+        // sources; their content is extracted at conversation time.
+        ReferenceTarget::ExternalFile(_) => true,
     }
 }
 
