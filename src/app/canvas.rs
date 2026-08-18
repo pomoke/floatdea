@@ -355,6 +355,7 @@ impl HomePage {
         snippets: &mut BTreeMap<EntityId, Snippet>,
         rename_dialog: &mut RenameDialogState,
         pending_delete: &mut Option<PendingDelete>,
+        search: &mut SearchState,
         clipboard: &mut Option<ClipboardEntry>,
         ai: &BTreeMap<ContainerId, AiBoxData>,
         snap_to_grid: bool,
@@ -404,6 +405,13 @@ impl HomePage {
                         *pending_delete = None;
                     }
                     DeleteDialogResult::None | DeleteDialogResult::Open => {}
+                }
+                // Render the global search window inside this viewport so that it
+                // appears in the folder window that initiated the search. The
+                // viewport guard inside `render_search_window` skips it here
+                // unless `search.origin` is exactly this folder window.
+                if let Some(id) = render_search_window(child_ui, search, snippets) {
+                    commands.push(CanvasCommand::OpenSnippet(id));
                 }
                 commands
             },

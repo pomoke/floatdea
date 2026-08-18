@@ -97,13 +97,28 @@ pub(crate) struct HomePage {
     ai_provider_override: Option<Arc<dyn ChatProvider>>,
 }
 
-/// State of the global search window.
-#[derive(Default)]
+/// State of the global search window. Like the rename/delete dialogs, the
+/// window renders **only on the viewport that opened it** (root or a folder
+/// window), so the search box appears where the user asked for it instead of
+/// always floating on the main window.
 struct SearchState {
     open: bool,
     filter: String,
     /// Focus the filter field only on the first frame after opening (IME-safe).
     focus_requested: bool,
+    /// The viewport that opened the search; the window is drawn only there.
+    origin: egui::ViewportId,
+}
+
+impl Default for SearchState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            filter: String::new(),
+            focus_requested: false,
+            origin: egui::ViewportId::ROOT,
+        }
+    }
 }
 
 /// Display mode of a snippet viewport.
@@ -705,81 +720,6 @@ impl HomePage {
         }
     }
 
-    /// Renders the global search window: a floating filter field over all
-    /// snippets. Typing filters title/body live (title hits first); clicking a
-    /// result (or pressing Enter) opens that snippet; `Esc` or the close button
-    /// dismisses the window. Opened via `Ctrl+F`, `/` (when nothing is being
-    /// edited), or the box context menu's "Search…".
-    fn render_search_window(&mut self, ctx: &egui::Context) {
-        if !self.search.open {
-            return;
-        }
-        let mut open = self.search.open;
-        let mut open_id: Option<EntityId> = None;
-        let mut close = false;
-        egui::Window::new("Search")
-            .id(egui::Id::new("search-window"))
-            .open(&mut open)
-            .default_size([360.0, 420.0])
-            .collapsible(false)
-            .show(ctx, |ui| {
-                let filter = ui.add(
-                    egui::TextEdit::singleline(&mut self.search.filter)
-                        .id(egui::Id::new("search-filter"))
-                        .hint_text("Search snippets…"),
-                );
-                // Focus only once on open (IME-safe).
-                if self.search.focus_requested {
-                    filter.request_focus();
-                    self.search.focus_requested = false;
-                }
-                // Enter opens the first result; Esc closes the window. Both
-                // actions are deferred out of the closure (the window builder
-                // already borrows `self.search.open`).
-                if ui.input(|input| input.key_pressed(egui::Key::Enter))
-                    && let Some(id) = search_snippets(&self.search.filter, &self.all_snippets)
-                        .into_iter()
-                        .next()
-                {
-                    open_id = Some(id);
-                }
-                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-                    ui.input_mut(|input| input.consume_key(input.modifiers, egui::Key::Escape));
-                    close = true;
-                }
-                ui.add_space(6.0);
-                let list_height = (ctx.viewport_rect().height() - 180.0).clamp(80.0, 320.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("search-results")
-                    .max_height(list_height)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        let query = self.search.filter.trim();
-                        let results = search_snippets(&self.search.filter, &self.all_snippets);
-                        if query.is_empty() {
-                            ui.label("Type to search all snippets");
-                        } else if results.is_empty() {
-                            ui.label("(no matches)");
-                        }
-                        for id in results {
-                            let title = &self.all_snippets[&id].title;
-                            if ui.selectable_label(false, title).clicked() {
-                                open_id = Some(id);
-                            }
-                        }
-                    });
-            });
-        if open_id.is_some() || close {
-            self.search.open = false;
-        } else {
-            // Reflect the close button (egui wrote back into `open`).
-            self.search.open = open;
-        }
-        if let Some(id) = open_id {
-            self.open_view(id);
-        }
-    }
-
     /// In floating-window mode every dialog carries the root viewport origin,
     /// so closing a folder window must clear dialogs by their target id.
     fn clear_dialog_for_folder(&mut self, container_id: &ContainerId) {
@@ -805,6 +745,9 @@ impl HomePage {
                 },
                 CanvasCommand::OpenSearch => {
                     self.search.open = true;
+                    // The search window renders only on the viewport that opened
+                    // it (root or a folder window), mirroring the rename dialog.
+                    self.search.origin = origin;
                     self.search.focus_requested = true;
                 }
                 CanvasCommand::DeleteReference {
@@ -826,6 +769,7 @@ impl HomePage {
                 CanvasCommand::CloseFolder(id) => {
                     let viewport = egui::ViewportId::from_hash_of(("folder-view", id.as_str()));
                     self.clear_rename_for_viewport(viewport);
+                    self.clear_search_for_viewport(viewport);
                     if self.floating_windows() {
                         self.clear_dialog_for_folder(&id);
                     }
@@ -955,6 +899,15 @@ impl HomePage {
         }
     }
 
+    /// Closes the global search window when the viewport that opened it is gone
+    /// (e.g. the folder window that initiated the search was closed), so the
+    /// window never gets stuck in an invisible "open" state.
+    fn clear_search_for_viewport(&mut self, viewport_id: egui::ViewportId) {
+        if self.search.open && self.search.origin == viewport_id {
+            self.search.open = false;
+        }
+    }
+
     /// Removes a single reference from `owner` without touching the underlying
     /// entity/container (used when the deleted link is not the last one).
     fn remove_reference_only(&mut self, owner: &ContainerId, reference: &ReferenceId) {
@@ -1006,6 +959,10 @@ impl HomePage {
                     canvas.remove_reference(&pending.reference, &self.workspace_store);
                 }
                 self.clear_rename_for_viewport(egui::ViewportId::from_hash_of((
+                    "folder-view",
+                    container_id.as_str(),
+                )));
+                self.clear_search_for_viewport(egui::ViewportId::from_hash_of((
                     "folder-view",
                     container_id.as_str(),
                 )));
@@ -1599,6 +1556,88 @@ fn reference_count(workspace: &Workspace, target: &ReferenceTarget) -> usize {
         .count()
 }
 
+/// Renders the global search window: a floating filter field over all
+/// snippets. Typing filters title/body live (title hits first); clicking a
+/// result (or pressing Enter) opens that snippet; `Esc` or the close button
+/// dismisses the window. Opened via `Ctrl+F`, `/` (when nothing is being
+/// edited), or the box context menu's "Search…".
+///
+/// The window is drawn **only on the viewport that opened it** (`search.origin`,
+/// root or a folder window), mirroring the rename/delete dialogs, so the search
+/// box appears on the window that initiated it. Returns the snippet the user
+/// chose to open, if any (the caller applies it as a command).
+fn render_search_window(
+    ui: &egui::Ui,
+    search: &mut SearchState,
+    snippets: &BTreeMap<EntityId, Snippet>,
+) -> Option<EntityId> {
+    if !search.open || ui.ctx().viewport_id() != search.origin {
+        return None;
+    }
+    let mut open = search.open;
+    let mut open_id: Option<EntityId> = None;
+    let mut close = false;
+    egui::Window::new("Search")
+        .id(egui::Id::new(("search-window", search.origin)))
+        .open(&mut open)
+        .default_size([360.0, 420.0])
+        .collapsible(false)
+        .show(ui.ctx(), |ui| {
+            let filter = ui.add(
+                egui::TextEdit::singleline(&mut search.filter)
+                    .id(egui::Id::new(("search-filter", search.origin)))
+                    .hint_text("Search snippets…"),
+            );
+            // Focus only once on open (IME-safe).
+            if search.focus_requested {
+                filter.request_focus();
+                search.focus_requested = false;
+            }
+            // Enter opens the first result; Esc closes the window. Both actions
+            // are deferred out of the closure (the window builder already
+            // borrows `search.open`).
+            if ui.input(|input| input.key_pressed(egui::Key::Enter))
+                && let Some(id) = search_snippets(&search.filter, snippets)
+                    .into_iter()
+                    .next()
+            {
+                open_id = Some(id);
+            }
+            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                ui.input_mut(|input| input.consume_key(input.modifiers, egui::Key::Escape));
+                close = true;
+            }
+            ui.add_space(6.0);
+            let list_height = (ui.ctx().viewport_rect().height() - 180.0).clamp(80.0, 320.0);
+            egui::ScrollArea::vertical()
+                .id_salt(("search-results", search.origin))
+                .max_height(list_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    let query = search.filter.trim();
+                    let results = search_snippets(&search.filter, snippets);
+                    if query.is_empty() {
+                        ui.label("Type to search all snippets");
+                    } else if results.is_empty() {
+                        ui.label("(no matches)");
+                    }
+                    for id in results {
+                        let title = &snippets[&id].title;
+                        if ui.selectable_label(false, title).clicked() {
+                            open_id = Some(id);
+                        }
+                    }
+                });
+        });
+    if open_id.is_some() || close {
+        search.open = false;
+    } else {
+        // Reflect the close button (egui wrote back into `open`).
+        search.open = open;
+    }
+    open_id
+}
+
 /// Case-insensitive substring search over all snippets. Title hits come first,
 /// then body hits; within each group the order follows `BTreeMap` (id) order.
 /// An empty/whitespace query matches nothing.
@@ -1754,6 +1793,7 @@ impl HomePage {
                     &mut self.all_snippets,
                     &mut self.rename_dialog,
                     &mut self.pending_delete,
+                    &mut self.search,
                     &mut self.clipboard,
                     &self.ai_boxes,
                     self.settings.snap_to_grid,
@@ -1777,8 +1817,11 @@ impl HomePage {
         self.finalize_drops(ui.ctx());
         // The system settings window floats above the root canvas.
         self.render_settings_window(ui.ctx());
-        // The global search window.
-        self.render_search_window(ui.ctx());
+        // The global search window (rendered only on its originating viewport;
+        // a folder window renders it inside its own viewport pass).
+        if let Some(id) = render_search_window(ui, &mut self.search, &self.all_snippets) {
+            self.open_view(id);
+        }
         // The AI conversation window (if open).
         self.render_ai_conversation_window(ui);
         // Repaint while a turn is streaming so deltas appear without waiting
@@ -2239,13 +2282,40 @@ mod tests {
     }
 
     #[test]
-    fn open_search_command_opens_the_search_window() {
+    fn open_search_command_opens_the_search_window_on_the_originating_viewport() {
         let folder = TestFolder::new();
         let mut page = HomePage::new(&folder.0);
         assert!(!page.search.open);
-        page.process_canvas_commands(vec![CanvasCommand::OpenSearch], egui::ViewportId::ROOT);
+        let folder_viewport = egui::ViewportId::from_hash_of(("folder-view", "some-container"));
+        page.process_canvas_commands(
+            vec![CanvasCommand::OpenSearch],
+            folder_viewport,
+        );
         assert!(page.search.open);
         assert!(page.search.focus_requested);
+        assert_eq!(
+            page.search.origin, folder_viewport,
+            "the search window remembers the viewport that opened it"
+        );
+    }
+
+    #[test]
+    fn closing_the_originating_viewport_closes_the_search_window() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_viewport = egui::ViewportId::from_hash_of(("folder-view", "some-container"));
+        page.process_canvas_commands(vec![CanvasCommand::OpenSearch], folder_viewport);
+        assert!(page.search.open);
+
+        // Closing the folder window that opened the search dismisses it; other
+        // viewports leave it untouched.
+        page.clear_search_for_viewport(folder_viewport);
+        assert!(!page.search.open);
+
+        page.process_canvas_commands(vec![CanvasCommand::OpenSearch], folder_viewport);
+        assert!(page.search.open);
+        page.clear_search_for_viewport(egui::ViewportId::ROOT);
+        assert!(page.search.open, "unrelated viewport closes leave search open");
     }
 
     #[test]
