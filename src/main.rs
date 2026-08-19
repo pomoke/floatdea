@@ -137,7 +137,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "floatdea",
+        "FloatDea",
         options,
         Box::new(|cc| {
             #[cfg(not(target_arch = "wasm32"))]
