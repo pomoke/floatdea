@@ -25,6 +25,9 @@ pub(super) struct CanvasData<'a> {
     /// the viewport; exactly one canvas consumes it. Shared across canvases so
     /// a drop aimed at one window never inserts cards in another.
     os_file_drop_consumed: &'a mut bool,
+    /// Hover-to-preview state, shared across all canvases (only one preview
+    /// is active at a time).
+    hover_preview: &'a mut HoverPreview,
 }
 
 impl<'a> CanvasData<'a> {
@@ -41,6 +44,7 @@ impl<'a> CanvasData<'a> {
         is_root: bool,
         floating: bool,
         os_file_drop_consumed: &'a mut bool,
+        hover_preview: &'a mut HoverPreview,
     ) -> Self {
         Self {
             snippets,
@@ -54,6 +58,7 @@ impl<'a> CanvasData<'a> {
             is_root,
             floating,
             os_file_drop_consumed,
+            hover_preview,
         }
     }
 }
@@ -111,6 +116,7 @@ impl HomePage {
             true,
             floating,
             &mut self.os_file_drop_consumed,
+            &mut self.hover_preview,
         );
         if floating {
             // Full-window mode: the root box is a normal draggable/resizable
@@ -380,6 +386,7 @@ impl HomePage {
         ai: &BTreeMap<ContainerId, AiBoxData>,
         snap_to_grid: bool,
         show_grid: bool,
+        hover_preview: &mut HoverPreview,
     ) -> Vec<CanvasCommand> {
         let container_id = canvas.container_id.clone();
         ui.show_viewport_immediate(
@@ -400,6 +407,7 @@ impl HomePage {
                     false,
                     false,
                     os_file_drop_consumed,
+                    hover_preview,
                 );
                 let mut commands = Self::render_canvas_panel(child_ui, canvas, &mut data);
                 if child_ui.input(|input| input.viewport().close_requested()) {
@@ -460,6 +468,7 @@ impl HomePage {
         ai: &BTreeMap<ContainerId, AiBoxData>,
         snap_to_grid: bool,
         show_grid: bool,
+        hover_preview: &mut HoverPreview,
     ) -> Vec<CanvasCommand> {
         let container_id = canvas.container_id.clone();
         let mut open = true;
@@ -481,6 +490,7 @@ impl HomePage {
                     false,
                     true,
                     os_file_drop_consumed,
+                    hover_preview,
                 );
                 Self::render_canvas_panel(ui, canvas, &mut data)
             })
@@ -671,6 +681,7 @@ impl HomePage {
         }
 
         let canvas_is_ai_box = data.workspace.is_ai_box(&canvas.container_id);
+        let mut hovered_preview: Option<(PreviewTarget, egui::Rect)> = None;
         for index in 0..canvas.items.len() {
             let Some((title, kind)) = item_label(
                 &canvas.container_id,
@@ -682,6 +693,7 @@ impl HomePage {
                 continue;
             };
             let item = &canvas.items[index];
+            let preview_target_for_hover = item.target.clone();
             let label = match kind {
                 ItemKind::Folder => format!("📁 {title}"),
                 ItemKind::Special => format!("⚙ {title}"),
@@ -727,6 +739,35 @@ impl HomePage {
             );
             canvas.items[index].size = card_size;
             pointer_over_card |= pointer_pos.is_some_and(|position| rect.contains(position));
+
+            // Track hover for preview popup (not during drag operations).
+            if let Some(pos) = pointer_pos
+                && rect.contains(pos)
+                && drag_payload.is_none()
+                && canvas.dragging.is_none()
+                && kind != ItemKind::Special
+            {
+                let preview_target = match &preview_target_for_hover {
+                    ReferenceTarget::Snippet(id) => Some(PreviewTarget::Snippet(id.clone())),
+                    ReferenceTarget::Container(id) => {
+                        if data.workspace.is_ai_box(id) {
+                            Some(PreviewTarget::AiBox(id.clone()))
+                        } else {
+                            Some(PreviewTarget::Folder(id.clone()))
+                        }
+                    }
+                    ReferenceTarget::Conversation(id) => {
+                        Some(PreviewTarget::Conversation(id.clone()))
+                    }
+                    ReferenceTarget::ExternalFile(file) => {
+                        Some(PreviewTarget::ExternalFile(file.id.clone()))
+                    }
+                    ReferenceTarget::Special(_) => None,
+                };
+                if let Some(t) = preview_target {
+                    hovered_preview = Some((t, rect));
+                }
+            }
 
             let response = ui.interact(
                 rect,
@@ -1008,6 +1049,63 @@ impl HomePage {
                     egui::StrokeKind::Outside,
                 );
             }
+        }
+
+        // ---- Hover preview ----
+        {
+            let preview = &mut *data.hover_preview;
+            let now = Instant::now();
+            let alt_held = ui.input(|i| i.modifiers.alt);
+
+            if let Some((target, rect)) = &hovered_preview {
+                // Pointer is over a previewable card in this canvas.
+                if preview.target.as_ref() != Some(target) {
+                    // New card: claim ownership.
+                    *preview = HoverPreview {
+                        target: Some(target.clone()),
+                        canvas_id: Some(canvas.container_id.clone()),
+                        hover_start: Some(now),
+                        visible: alt_held,
+                        anchor_rect: Some(*rect),
+                        popup_rect: None,
+                    };
+                } else if preview.canvas_id == Some(canvas.container_id.clone()) {
+                    // Same card, still owned by this canvas. Refresh the anchor
+                    // rect so the popup tracks the card if the canvas scrolls.
+                    preview.anchor_rect = Some(*rect);
+                    if !preview.visible {
+                        let timer_elapsed = preview.hover_start.is_some_and(|start| {
+                            now.duration_since(start).as_millis() >= PREVIEW_DELAY_MS as u128
+                        });
+                        // Alt modifier gives an immediate preview, no timer.
+                        preview.visible = alt_held || timer_elapsed;
+                    }
+                    // Popup position is derived from the anchor rect in
+                    // render_float_preview, so no need to store it here.
+                }
+            } else if preview.canvas_id == Some(canvas.container_id.clone()) {
+                // Pointer is not over any card in the owning canvas. Keep the
+                // popup open only while the pointer is still over it.
+                let ctx_pos = ui.ctx().input(|i| i.pointer.interact_pos());
+                let over_popup = preview
+                    .visible
+                    && preview
+                        .popup_rect
+                        .zip(ctx_pos)
+                        .is_some_and(|(popup_rect, pos)| popup_rect.contains(pos));
+                if !over_popup {
+                    // Pointer left both card and popup: dismiss.
+                    *preview = HoverPreview::default();
+                }
+            }
+            // Non-owning canvases: never touch the preview state.
+        }
+
+        // Render the hover preview popup (only in the owning canvas).
+        if data.hover_preview.visible
+            && data.hover_preview.canvas_id == Some(canvas.container_id.clone())
+        {
+            render_float_preview(ui.ctx(), data);
         }
 
         if let Some(index) = dragged {
@@ -1389,6 +1487,359 @@ impl HomePage {
     }
 }
 
+/// Scale factor applied to the mini-canvas shown inside a folder/AI-box hover
+/// preview: card sizes, positions, and margins are all multiplied by this.
+const PREVIEW_SCALE: f32 = 0.8;
+
+/// Items inside a folder or AI box, rendered as mini cards in the preview.
+pub(super) struct PreviewCard {
+    pub(super) label: String,
+    pub(super) kind: ItemKind,
+    pub(super) role: MemberRole,
+    /// Position from the container layout (canvas coordinates).
+    pub(super) position: [f32; 2],
+    /// Canvas-space height of the card. When scaled by [`PREVIEW_SCALE`] it
+    /// exactly fits the title/role-tag galleys the preview renders.
+    pub(super) height: f32,
+}
+
+/// Measures the rendered height of a text laid out with `font_id` at
+/// `max_width` (without a painter; used to size mini preview cards the same
+/// way the real canvas sizes them).
+fn text_height(ctx: &egui::Context, text: &str, font_id: egui::FontId, max_width: f32) -> f32 {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id,
+            color: egui::Color32::WHITE,
+            ..Default::default()
+        },
+    );
+    job.wrap.max_width = max_width.max(10.0);
+    let painter = ctx.layer_painter(egui::LayerId::debug());
+    painter.layout_job(job).size().y
+}
+
+/// Builds the mini cards shown in a folder/AI-box hover preview, mirroring
+/// exactly how the real canvas resolves members: unresolved targets are
+/// dropped, and members without a saved layout position fall back to the same
+/// default grid slot the real canvas would use.
+pub(super) fn container_preview_cards(
+    ctx: &egui::Context,
+    container: &Container,
+    layout: &ContainerLayout,
+    data: &CanvasData<'_>,
+) -> (Vec<PreviewCard>, usize) {
+    let members: Vec<&Reference> = container
+        .members
+        .iter()
+        .filter(|r| match &r.target {
+            ReferenceTarget::Snippet(id) => data.snippets.contains_key(id),
+            ReferenceTarget::Container(id) => data.workspace.containers.contains_key(id),
+            ReferenceTarget::Special(_)
+            | ReferenceTarget::Conversation(_)
+            | ReferenceTarget::ExternalFile(_) => true,
+        })
+        .collect();
+    let cards: Vec<PreviewCard> = members
+        .iter()
+        .enumerate()
+        .filter_map(|(index, r)| {
+            let item = CanvasItem {
+                reference_id: r.id.clone(),
+                target: r.target.clone(),
+                role: r.role,
+                position: [0.0, 0.0],
+                size: egui::vec2(CARD_WIDTH, 25.0),
+            };
+            let (label, kind) =
+                item_label(&container.id, &item, data.snippets, data.workspace, data.ai)?;
+            let role = r.role;
+            let tag_text = match role {
+                MemberRole::Source => "LINK · READ-ONLY",
+                MemberRole::Output => "OUTPUT",
+                MemberRole::Conversation => "CONVERSATION",
+                _ => "",
+            };
+            // Measure at the same (scaled) width the preview uses to lay out
+            // the galleys, so `height * PREVIEW_SCALE` exactly fits them.
+            let title_w = (CARD_WIDTH - 2.0 * CARD_PADDING_H) * PREVIEW_SCALE;
+            let title_height = text_height(
+                ctx,
+                &label,
+                egui::FontId::proportional(14.0),
+                title_w,
+            );
+            let tag_height = if tag_text.is_empty() {
+                0.0
+            } else {
+                text_height(
+                    ctx,
+                    tag_text,
+                    egui::FontId::proportional(9.0),
+                    title_w,
+                ) + 2.0
+            };
+            let position = layout
+                .items
+                .get(&r.id)
+                .map(|l| l.position)
+                .unwrap_or_else(|| default_card_position(index));
+            Some(PreviewCard {
+                label,
+                kind,
+                role,
+                position,
+                height: (CARD_MARGIN_Y + title_height + tag_height + 2.0) / PREVIEW_SCALE,
+            })
+        })
+        .collect();
+    let total = cards.len();
+    (cards, total)
+}
+
+/// Renders the hover-preview popup for a canvas card. Called after the card
+/// loop when the timer has expired and the pointer is still over the card.
+fn render_float_preview(ctx: &egui::Context, data: &mut CanvasData<'_>) {
+    let Some(target) = &data.hover_preview.target else {
+        return;
+    };
+
+    // Popup anchor: use the hovered card's rect (viewport coordinates) so the
+    // popup stays next to the card while the pointer moves inside it, instead
+    // of sliding around following the cursor. Falls back to the pointer only
+    // if no card rect was captured.
+    let popup_pos = data
+        .hover_preview
+        .anchor_rect
+        .map(|anchor| egui::pos2(anchor.right() + 8.0, anchor.top()))
+        .or_else(|| ctx.input(|i| i.pointer.interact_pos()).map(|p| p + egui::vec2(12.0, -8.0)))
+        .unwrap_or(egui::pos2(100.0, 100.0));
+
+    enum PreviewBody {
+        Text(String),
+        /// Mini cards rendered at their actual canvas positions (offset by
+        /// the bounding-box origin so they fit in the popup).
+        Cards {
+            cards: Vec<PreviewCard>,
+            bbox_min: egui::Vec2,
+            bbox_max: egui::Vec2,
+            total: usize,
+        },
+    }
+    struct PreviewData {
+        body: PreviewBody,
+    }
+
+    let preview: Option<PreviewData> = match target {
+        PreviewTarget::Snippet(id) => data.snippets.get(id).map(|s| {
+            let lines: Vec<&str> = s.content.lines().take(30).collect();
+            PreviewData {
+                body: PreviewBody::Text(lines.join("\n")),
+            }
+        }),
+        PreviewTarget::Folder(id) | PreviewTarget::AiBox(id) => {
+            let layout = data
+                .workspace_store
+                .load_layout(id)
+                .unwrap_or_else(|_| ContainerLayout::empty(id.clone()));
+            data.workspace.containers.get(id).map(|c| {
+                let (cards, total) = container_preview_cards(ctx, c, &layout, data);
+                let bbox_min = cards.iter().fold(egui::Vec2::splat(f32::MAX), |m, c| {
+                    egui::vec2(m.x.min(c.position[0]), m.y.min(c.position[1]))
+                });
+                let bbox_max = cards.iter().fold(egui::Vec2::splat(f32::MIN), |m, c| {
+                    egui::vec2(
+                        m.x.max(c.position[0] + CARD_WIDTH),
+                        m.y.max(c.position[1] + c.height),
+                    )
+                });
+                PreviewData {
+                    body: PreviewBody::Cards {
+                        cards,
+                        bbox_min,
+                        bbox_max,
+                        total,
+                    },
+                }
+            })
+        }
+        PreviewTarget::Conversation(id) => {
+            data.ai.values().find_map(|box_data| {
+                box_data.get(id).map(|conv| {
+                    let source_count = conv.sources.len();
+                    PreviewData {
+                        body: PreviewBody::Text(format!(
+                            "{source_count} sources · {} messages",
+                            conv.messages.len()
+                        )),
+                    }
+                })
+            })
+        }
+        PreviewTarget::ExternalFile(id) => {
+            let mut found: Option<PreviewData> = None;
+            for container in data.workspace.containers.values() {
+                for r in &container.members {
+                    if let ReferenceTarget::ExternalFile(file) = &r.target
+                        && file.id == *id
+                    {
+                        found = Some(PreviewData {
+                            body: PreviewBody::Text(file.path.clone()),
+                        });
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            found
+        }
+    };
+
+    let Some(preview) = preview else {
+        data.hover_preview.target = None;
+        data.hover_preview.visible = false;
+        return;
+    };
+
+    let screen = ctx.input(|i| i.raw.screen_rect).unwrap_or(egui::Rect::from_min_max(
+        egui::pos2(0.0, 0.0),
+        egui::pos2(1920.0, 1080.0),
+    ));
+
+    let popup_size = match &preview.body {
+        PreviewBody::Cards { bbox_min, bbox_max, .. } => {
+            let w = ((bbox_max.x - bbox_min.x) * 0.8 + 60.0).clamp(200.0, 440.0);
+            let h = ((bbox_max.y - bbox_min.y) * 0.8 + 80.0).clamp(80.0, 320.0);
+            egui::vec2(w, h)
+        }
+        PreviewBody::Text(_) => egui::vec2(360.0, 240.0),
+    };
+
+    let clamped_pos = egui::pos2(
+        popup_pos
+            .x
+            .clamp(screen.left() + 8.0, screen.right() - popup_size.x - 8.0),
+        popup_pos
+            .y
+            .clamp(screen.top() + 8.0, screen.bottom() - popup_size.y - 8.0),
+    );
+
+    let area_id = egui::Id::new("float-preview");
+    let area = egui::Area::new(area_id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(clamped_pos);
+
+    let response = area.show(ctx, |ui| {
+        egui::Frame::popup(ui.style()).show(ui, |ui| {
+            ui.set_min_size(popup_size);
+            ui.set_max_size(popup_size);
+            match &preview.body {
+                PreviewBody::Text(content) => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("float-preview-scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.label(content.as_str());
+                        });
+                }
+                PreviewBody::Cards {
+                    cards,
+                    bbox_min,
+                    bbox_max,
+                    total,
+                } => {
+                    if cards.is_empty() {
+                        ui.add_space(20.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label("(empty)");
+                        });
+                    } else {
+                        let card_w = CARD_WIDTH * PREVIEW_SCALE;
+                        let margin = 16.0 * PREVIEW_SCALE;
+                        let canvas_w = ((bbox_max.x - bbox_min.x) * PREVIEW_SCALE + margin * 2.0)
+                            .max(60.0);
+                        let canvas_h = ((bbox_max.y - bbox_min.y) * PREVIEW_SCALE + margin * 2.0)
+                            .max(40.0);
+                        egui::ScrollArea::both()
+                            .id_salt("float-preview-canvas")
+                            .auto_shrink([false, false])
+                            .max_height(popup_size.y - 8.0)
+                            .show(ui, |ui| {
+                                let (response, painter) = ui.allocate_painter(
+                                    egui::vec2(canvas_w, canvas_h),
+                                    egui::Sense::hover(),
+                                );
+                                // Painter shapes are in absolute screen
+                                // coordinates clipped to the allocated rect, so
+                                // the canvas-local card positions must be
+                                // offset by the mini-canvas origin.
+                                let origin = response.rect.min;
+                                let painter = &painter;
+                                for card in cards {
+                                    let x = origin.x
+                                        + (card.position[0] - bbox_min.x) * PREVIEW_SCALE
+                                        + margin;
+                                    let y = origin.y
+                                        + (card.position[1] - bbox_min.y) * PREVIEW_SCALE
+                                        + margin;
+                                    let rect = egui::Rect::from_min_size(
+                                        egui::pos2(x, y),
+                                        egui::vec2(card_w, card.height * PREVIEW_SCALE),
+                                    );
+                                    let galley = layout_title(
+                                        painter,
+                                        &card.label,
+                                        card_w - 2.0 * CARD_PADDING_H * PREVIEW_SCALE,
+                                        ui.visuals().text_color(),
+                                    );
+                                    let tag_galley = match card.role {
+                                        MemberRole::Source
+                                        | MemberRole::Output
+                                        | MemberRole::Conversation => {
+                                            let text = match card.role {
+                                                MemberRole::Source => "LINK · READ-ONLY",
+                                                MemberRole::Output => "OUTPUT",
+                                                MemberRole::Conversation => "CONVERSATION",
+                                                _ => "",
+                                            };
+                                            Some(layout_tag(painter, text, ui.visuals()))
+                                        }
+                                        _ => None,
+                                    };
+                                    paint_card(
+                                        painter,
+                                        rect,
+                                        &galley,
+                                        false,
+                                        card.kind,
+                                        card.role,
+                                        tag_galley.as_ref(),
+                                        ui.visuals(),
+                                    );
+                                }
+                            });
+                        if *total > cards.len() {
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!("… and {} more", total - cards.len()))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    });
+
+    data.hover_preview.popup_rect = Some(response.response.rect);
+}
+
 /// Renders the canvas texts (interaction, drag, context menu, editing) on top
 /// of the cards. Returns whether the pointer is over any text.
 fn render_canvas_texts(
@@ -1526,7 +1977,7 @@ fn render_canvas_texts(
 /// The visual kind of a canvas card, used to pick the label prefix, card
 /// styling, and interaction rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ItemKind {
+pub(super) enum ItemKind {
     Snippet,
     Folder,
     Special,
@@ -1538,7 +1989,7 @@ enum ItemKind {
     ExternalFile,
 }
 
-fn item_label(
+pub(super) fn item_label(
     container: &ContainerId,
     item: &CanvasItem,
     snippets: &BTreeMap<EntityId, Snippet>,

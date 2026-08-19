@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use eframe::{App, egui};
 use tokio::sync::mpsc;
@@ -18,8 +19,8 @@ use floatdea::data::{
     settings::{Settings, SettingsStore, ThemeSetting, WindowMode},
     storage::SnippetStore,
     workspace::{
-        CanvasText, CardLayout, ContainerLayout, ExternalFileRef, MemberRole, ReferenceTarget,
-        SpecialKind, Workspace, WorkspaceStore,
+        CanvasText, CardLayout, Container, ContainerLayout, ExternalFileRef, MemberRole,
+        Reference, ReferenceTarget, SpecialKind, Workspace, WorkspaceStore,
     },
 };
 
@@ -113,6 +114,8 @@ pub(crate) struct HomePage {
     /// created, so PDF extraction never blocks the UI thread. Uses `Mutex` for
     /// interior mutability so the background thread can write into it.
     file_content_cache: Arc<Mutex<HashMap<ExternalFileId, String>>>,
+    /// Hover-to-preview state for canvas cards.
+    hover_preview: HoverPreview,
 }
 
 /// State of an in-flight native file picker dialog. The blocking `rfd` call
@@ -146,8 +149,39 @@ impl Default for SearchState {
     }
 }
 
+/// Delay before showing a hover preview popup (milliseconds).
+const PREVIEW_DELAY_MS: u64 = 800;
 
+/// The kind of item being hover-previewed on a canvas.
+#[derive(Clone, Debug, PartialEq)]
+enum PreviewTarget {
+    Snippet(EntityId),
+    Folder(ContainerId),
+    AiBox(ContainerId),
+    Conversation(ConversationId),
+    ExternalFile(ExternalFileId),
+}
 
+/// State of the hover-to-preview feature: when the user hovers over a card
+/// for ~800ms, a floating popup shows the card's content.
+#[derive(Clone, Debug, Default)]
+struct HoverPreview {
+    target: Option<PreviewTarget>,
+    /// The container that owns the hovered card (used to check if the preview
+    /// belongs to the current canvas).
+    canvas_id: Option<ContainerId>,
+    /// When the hover started (monotonic clock).
+    hover_start: Option<Instant>,
+    /// Whether the preview is currently visible (timer elapsed).
+    visible: bool,
+    /// The rect of the hovered card in viewport coordinates. The popup is
+    /// anchored to this rect so it stays next to the card while the pointer
+    /// moves inside it, instead of sliding around following the cursor.
+    anchor_rect: Option<egui::Rect>,
+    /// The rect of the popup (screen coordinates), used for hit-testing to
+    /// keep the popup open while the pointer is over it.
+    popup_rect: Option<egui::Rect>,
+}
 
 /// Display mode of a snippet viewport.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -623,6 +657,7 @@ impl HomePage {
             os_file_drop_consumed: false,
             pending_file_picker: None,
             file_content_cache: Arc::new(Mutex::new(HashMap::new())),
+            hover_preview: HoverPreview::default(),
         }
     }
 
@@ -2159,6 +2194,7 @@ impl HomePage {
                     &self.ai_boxes,
                     self.settings.snap_to_grid,
                     self.settings.show_grid,
+                    &mut self.hover_preview,
                 )
             } else {
                 Self::render_folder_viewport(
@@ -2178,6 +2214,7 @@ impl HomePage {
                     &self.ai_boxes,
                     self.settings.snap_to_grid,
                     self.settings.show_grid,
+                    &mut self.hover_preview,
                 )
             };
             let viewport_id = if floating {
@@ -3106,6 +3143,7 @@ mod tests {
         let mut page = HomePage::new(&folder.0);
         {
             let mut os_file_drop_consumed = false;
+            let mut hover_preview = HoverPreview::default();
             let mut data = canvas::CanvasData::new(
                 &mut page.all_snippets,
                 &mut page.workspace,
@@ -3118,6 +3156,7 @@ mod tests {
                 true,
                 false,
                 &mut os_file_drop_consumed,
+                &mut hover_preview,
             );
             canvas::create_text(&mut page.root, &mut data, [24.0, 36.0]);
 
@@ -3139,6 +3178,7 @@ mod tests {
         let mut page = HomePage::new(&folder.0);
         {
             let mut os_file_drop_consumed = false;
+            let mut hover_preview = HoverPreview::default();
             let mut data = canvas::CanvasData::new(
                 &mut page.all_snippets,
                 &mut page.workspace,
@@ -3151,6 +3191,7 @@ mod tests {
                 true,
                 false,
                 &mut os_file_drop_consumed,
+                &mut hover_preview,
             );
             canvas::create_text(&mut page.root, &mut data, [24.0, 24.0]);
             let text_id = page.root.texts[0].id.clone();
@@ -3249,6 +3290,284 @@ mod tests {
         ));
         // Link semantics: the source card stays in the root box.
         assert_eq!(page.root.items.len(), root_card_count);
+    }
+
+    #[test]
+    fn hover_preview_anchors_to_the_card_not_the_pointer() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let first = &page.root.items[0];
+        // Root canvas starts at the central-panel inset (8) inside the main
+        // window; a card at `position` renders at canvas_rect.min + position.
+        let card_min = egui::pos2(8.0 + first.position[0], 8.0 + first.position[1]);
+        let inside = card_min + egui::vec2(20.0, 12.0);
+        let still_inside = card_min + egui::vec2(40.0, 8.0);
+        let far_away = egui::pos2(1500.0, 900.0);
+
+        let ctx = egui::Context::default();
+        // Alt+hover shows the preview immediately (no 800 ms timer to wait for).
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let mut frame = pointer_frame(inside, None);
+        frame.modifiers = alt;
+        let _ = ctx.run_ui(frame, |ui| page.ui_impl(ui));
+        assert!(
+            page.hover_preview.visible,
+            "Alt+hover triggers the preview immediately"
+        );
+        let first_rect = page.hover_preview.popup_rect.expect("popup rendered");
+
+        // Moving the pointer within the same card must NOT move the popup: it
+        // stays anchored to the card instead of sliding after the cursor.
+        let mut frame = pointer_frame(still_inside, None);
+        frame.modifiers = alt;
+        let _ = ctx.run_ui(frame, |ui| page.ui_impl(ui));
+        assert!(page.hover_preview.visible, "preview stays visible on the card");
+        let second_rect = page.hover_preview.popup_rect.expect("popup rendered");
+        assert_eq!(
+            first_rect, second_rect,
+            "popup is anchored to the card, not the moving pointer"
+        );
+
+        // Leaving the card (and the popup) dismisses the preview.
+        let _ = ctx.run_ui(pointer_frame(far_away, None), |ui| page.ui_impl(ui));
+        assert!(!page.hover_preview.visible, "preview dismissed when pointer leaves");
+        assert!(page.hover_preview.target.is_none());
+    }
+
+    #[test]
+    fn hover_preview_folder_shows_its_members() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        // Create a folder with a snippet member and place its card on root.
+        let folder_id = page.workspace.create_container("Folder");
+        let (s1, _) = root_first_snippet(&page);
+        let _ = page.workspace.add_snippet_reference(&folder_id, s1.clone()).unwrap();
+        let _ = page.workspace.add_container_to_root(folder_id.clone());
+        page.workspace_store.save(&page.workspace).unwrap();
+        page.root = HomePage::load_container_canvas(
+            &page.workspace,
+            &page.workspace_store,
+            &page.all_snippets,
+            page.root.container_id.clone(),
+        );
+
+        let ctx = egui::Context::default();
+        let folder_item = page
+            .root
+            .items
+            .iter()
+            .find(|i| matches!(&i.target, ReferenceTarget::Container(id) if id == &folder_id))
+            .expect("folder card on root");
+        let card_min = egui::pos2(8.0 + folder_item.position[0], 8.0 + folder_item.position[1]);
+        let inside = card_min + egui::vec2(20.0, 12.0);
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let mut frame = pointer_frame(inside, None);
+        frame.modifiers = alt;
+        let _ = ctx.run_ui(frame, |ui| page.ui_impl(ui));
+        assert!(page.hover_preview.visible, "folder preview visible");
+        assert!(page.hover_preview.target.is_some());
+        let rect = page.hover_preview.popup_rect.expect("popup rendered");
+        assert!(rect.width() > 0.0 && rect.height() > 0.0, "popup has size");
+        // The preview must show the folder's member card, not "(empty)".
+        let cards = {
+            let container = page.workspace.containers[&folder_id].clone();
+            let layout = page.workspace_store.load_layout(&folder_id).unwrap_or_else(|_| {
+                ContainerLayout::empty(folder_id.clone())
+            });
+            let mut os_file_drop_consumed = false;
+            let mut hover_preview = HoverPreview::default();
+            let data = canvas::CanvasData::new(
+                &mut page.all_snippets,
+                &mut page.workspace,
+                &page.workspace_store,
+                &page.store,
+                &mut page.clipboard,
+                &page.ai_boxes,
+                true,
+                true,
+                false,
+                false,
+                &mut os_file_drop_consumed,
+                &mut hover_preview,
+            );
+            let (cards, _) = canvas::container_preview_cards(&ctx, &container, &layout, &data);
+            cards
+        };
+        assert_eq!(cards.len(), 1, "folder preview shows its member card");
+        assert_eq!(cards[0].label, "hello");
+    }
+
+    #[test]
+    fn folder_preview_paints_cards_inside_the_popup() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let (s1, _) = root_first_snippet(&page);
+        let _ = page.workspace.add_snippet_reference(&folder_id, s1.clone()).unwrap();
+        let _ = page.workspace.add_container_to_root(folder_id.clone());
+        page.workspace_store.save(&page.workspace).unwrap();
+        page.root = HomePage::load_container_canvas(
+            &page.workspace,
+            &page.workspace_store,
+            &page.all_snippets,
+            page.root.container_id.clone(),
+        );
+
+        let ctx = egui::Context::default();
+        let folder_item = page
+            .root
+            .items
+            .iter()
+            .find(|i| matches!(&i.target, ReferenceTarget::Container(id) if id == &folder_id))
+            .expect("folder card on root");
+        let card_min = egui::pos2(8.0 + folder_item.position[0], 8.0 + folder_item.position[1]);
+        let inside = card_min + egui::vec2(20.0, 12.0);
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let mut frame = pointer_frame(inside, None);
+        frame.modifiers = alt;
+        let _ = ctx.run_ui(frame, |ui| page.ui_impl(ui));
+        assert!(page.hover_preview.visible, "folder preview visible");
+        // Let the popup's fade-in animation complete (egui Areas fade in over
+        // the first few frames; during the fade its shapes are Noops).
+        let mut full = egui::FullOutput::default();
+        for _ in 0..12 {
+            let mut frame = pointer_frame(inside, None);
+            frame.modifiers = alt;
+            full = ctx.run_ui(frame, |ui| page.ui_impl(ui));
+        }
+        let popup_rect = page.hover_preview.popup_rect.expect("popup rendered");
+
+        // The mini-cards must be painted inside the popup. Regression: cards
+        // were painted in canvas-local coordinates interpreted as absolute
+        // screen coordinates, landing near (0,0) where the popup's clip rect
+        // clipped them away entirely (popup frame showed, cards did not).
+// The mini-cards must be painted inside the popup. Regression: cards
+        // were painted in canvas-local coordinates interpreted as absolute
+        // screen coordinates, landing near (0,0) where the popup's clip rect
+        // clipped them away entirely (popup frame showed, cards did not).
+        let card_shapes: Vec<egui::Rect> = full
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rs)
+                    if (100.0..150.0).contains(&rs.rect.width())
+                        && popup_rect.intersects(rs.rect) =>
+                {
+                    Some(rs.rect)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !card_shapes.is_empty(),
+            "expected at least one mini-card rectangle painted inside the popup {popup_rect:?}"
+        );
+        for rect in &card_shapes {
+            assert!(
+                rect.min.x >= popup_rect.min.x && rect.min.y >= popup_rect.min.y,
+                "card {rect:?} must be positioned inside the popup {popup_rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_preview_cards_match_the_real_canvas() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        let (s1, _) = root_first_snippet(&page);
+        let s2 = {
+            let snippet = Snippet {
+                id: EntityId::new(),
+                title: "second".to_owned(),
+                content: "content".to_owned(),
+            };
+            page.store.save(&snippet).unwrap();
+            page.all_snippets.insert(snippet.id.clone(), snippet.clone());
+            snippet.id
+        };
+        let r1 = page.workspace.add_snippet_reference(&folder_id, s1.clone()).unwrap();
+        let _r2 = page.workspace.add_snippet_reference(&folder_id, s2.clone()).unwrap();
+        // Only the first member has a saved position; the second must fall back
+        // to the same default grid slot the real canvas would pick.
+        let mut layout = ContainerLayout::empty(folder_id.clone());
+        layout.items.insert(
+            r1.clone(),
+            CardLayout {
+                position: [10.0, 20.0],
+                color: None,
+            },
+        );
+        page.workspace_store.save_layout(&layout).unwrap();
+        page.workspace_store.save(&page.workspace).unwrap();
+
+        let ctx = egui::Context::default();
+        // Initialize the font atlas before measuring text.
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = ui;
+        });
+        let container = page.workspace.containers[&folder_id].clone();
+        let canvas = HomePage::load_container_canvas(
+            &page.workspace,
+            &page.workspace_store,
+            &page.all_snippets,
+            folder_id.clone(),
+        );
+        let expected: Vec<(String, canvas::ItemKind)> = canvas
+            .items
+            .iter()
+            .map(|item| {
+                canvas::item_label(
+                    &folder_id,
+                    item,
+                    &page.all_snippets,
+                    &page.workspace,
+                    &page.ai_boxes,
+                )
+                .expect("real canvas renders this item")
+            })
+            .collect();
+        let mut os_file_drop_consumed = false;
+        let mut hover_preview = HoverPreview::default();
+        let cards = {
+            let data = canvas::CanvasData::new(
+                &mut page.all_snippets,
+                &mut page.workspace,
+                &page.workspace_store,
+                &page.store,
+                &mut page.clipboard,
+                &page.ai_boxes,
+                true,
+                true,
+                false,
+                false,
+                &mut os_file_drop_consumed,
+                &mut hover_preview,
+            );
+            let (cards, _) = canvas::container_preview_cards(&ctx, &container, &layout, &data);
+            cards
+        };
+
+        // Same membership: every card the real canvas renders appears in the
+        // preview, at the exact same position and label.
+        assert_eq!(cards.len(), canvas.items.len());
+        for (card, (item, (label, kind))) in
+            cards.iter().zip(canvas.items.iter().zip(expected))
+        {
+            assert_eq!(card.position, item.position);
+            assert_eq!(card.role, item.role);
+            assert_eq!(card.label, label);
+            assert_eq!(card.kind, kind);
+        }
     }
 
     /// Creates a fresh AI box in the root canvas via the `NewAiBox` command.
