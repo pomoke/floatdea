@@ -520,17 +520,24 @@ impl HomePage {
             data.push_message(&conversation, Message::user(text.clone()), now);
             let _ = self.ai_store.save_box(data);
         }
-        let Some(request) = self.build_turn_request(&ai_box, &conversation) else {
+        // Filter sources by spatial proximity to the conversation card.
+        let sources = self
+            .ai_boxes
+            .get(&ai_box)
+            .and_then(|data| data.get(&conversation))
+            .map(|conv| self.sources_near_conversation(&ai_box, &conversation, &conv.sources))
+            .unwrap_or_default();
+        let Some(request) = self.build_turn_request(&ai_box, &conversation, &sources) else {
             return;
         };
         // Capture the source snapshot at send time.
-        let snapshots = self.source_snapshots(&ai_box, &conversation);
+        let snapshots = self.source_snapshots(&ai_box, &sources);
         // The bounded tool scope captured at send time (only used when tools are
         // enabled; the model can never see anything outside this context).
         let (tools, tool_context) = if self.settings.ai_tools_enabled {
             (
                 self.builtin_tools(),
-                Some(self.tool_context_for(&ai_box, &conversation)),
+                Some(self.tool_context_for(&ai_box, &sources)),
             )
         } else {
             (Vec::new(), None)
@@ -825,15 +832,81 @@ impl HomePage {
         }
     }
 
+    // ---- spatial source filtering ----
+
+    /// Filters sources by spatial proximity to the conversation card on the AI
+    /// box canvas. Returns the top 32 closest sources (by Euclidean distance).
+    /// Falls back to the full list when the layout is not spatial, the
+    /// conversation card is missing from the layout, or there are ≤ 32 sources.
+    fn sources_near_conversation(
+        &self,
+        ai_box: &ContainerId,
+        conversation: &ConversationId,
+        sources: &[SourceTarget],
+    ) -> Vec<SourceTarget> {
+        if sources.len() <= 32 {
+            return sources.to_vec();
+        }
+        let Ok(layout) = self.workspace_store.load_layout(ai_box) else {
+            return sources.to_vec();
+        };
+        let has_arranged = layout.items.values().any(|card| card.position != [0.0, 0.0]);
+        if !has_arranged {
+            return sources.to_vec();
+        }
+        let Some(container) = self.workspace.containers.get(ai_box) else {
+            return sources.to_vec();
+        };
+        let conversation_ref = container.members.iter().find(|member| {
+            matches!(&member.target, ReferenceTarget::Conversation(id) if id == conversation)
+                && member.role == MemberRole::Conversation
+        });
+        let Some(conversation_ref) = conversation_ref else {
+            return sources.to_vec();
+        };
+        let Some(&conv_pos) = layout.items.get(&conversation_ref.id).map(|c| &c.position) else {
+            return sources.to_vec();
+        };
+        let mut positioned: Vec<(SourceTarget, [f32; 2])> = Vec::new();
+        for source in sources {
+            let pos = container.members.iter().find_map(|member| {
+                if member.role != MemberRole::Source {
+                    return None;
+                }
+                let matched = match (source, &member.target) {
+                    (SourceTarget::Snippet(id), ReferenceTarget::Snippet(mid)) => id == mid,
+                    (SourceTarget::Container(id), ReferenceTarget::Container(mid)) => id == mid,
+                    (SourceTarget::ExternalFile(id), ReferenceTarget::ExternalFile(file)) => {
+                        id == &file.id
+                    }
+                    _ => false,
+                };
+                if matched {
+                    layout.items.get(&member.id).map(|c| c.position)
+                } else {
+                    None
+                }
+            });
+            positioned.push((source.clone(), pos.unwrap_or([0.0, 0.0])));
+        }
+        positioned.sort_by(|a, b| {
+            let da = (a.1[0] - conv_pos[0]).powi(2) + (a.1[1] - conv_pos[1]).powi(2);
+            let db = (b.1[0] - conv_pos[0]).powi(2) + (b.1[1] - conv_pos[1]).powi(2);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        positioned.into_iter().take(32).map(|(s, _)| s).collect()
+    }
+
     // ---- context building ----
 
     /// Builds the bounded chat request for one turn: the conversation's recent
-    /// history, the bound sources embedded in the system prompt and (when
+    /// history, the given sources embedded in the system prompt and (when
     /// enabled) the built-in tool definitions.
     fn build_turn_request(
         &self,
         ai_box: &ContainerId,
         conversation: &ConversationId,
+        sources: &[SourceTarget],
     ) -> Option<ChatRequest> {
         let conv = self.ai_boxes.get(ai_box)?.get(conversation)?;
         let mut messages = Vec::new();
@@ -847,13 +920,21 @@ impl HomePage {
                 MessageRole::Assistant => {}
             }
         }
-        let system = self.build_system_prompt(ai_box, &conv.sources);
+        let system = self.build_system_prompt(ai_box, sources);
         let tools = if self.settings.ai_tools_enabled {
             self.builtin_tools()
         } else {
             Vec::new()
         };
-        Some(ChatRequest::new(system, messages).with_tools(tools))
+        let mut request = ChatRequest::new(system, messages).with_tools(tools);
+        if sources.len() < conv.sources.len() {
+            request = request.with_system_note(format!(
+                "(Selected {} of {} sources based on spatial proximity to this conversation.)",
+                sources.len(),
+                conv.sources.len(),
+            ));
+        }
+        Some(request)
     }
 
     fn build_system_prompt(
@@ -941,20 +1022,16 @@ impl HomePage {
     }
 
     /// Captures the actual sources (target, title, content hash) at send time.
-    fn source_snapshots(&self, ai_box: &ContainerId, conversation: &ConversationId) -> Vec<SourceRef> {
+    fn source_snapshots(&self, ai_box: &ContainerId, sources: &[SourceTarget]) -> Vec<SourceRef> {
         let mut snapshots = Vec::new();
-        if let Some(data) = self.ai_boxes.get(ai_box)
-            && let Some(conv) = data.get(conversation)
-        {
-            let max_chars = adaptive_source_limit(conv.sources.len());
-            for target in &conv.sources {
-                if let Some((title, text)) = self.resolve_source_text(target, ai_box, max_chars) {
-                    snapshots.push(SourceRef {
-                        target: target.clone(),
-                        title,
-                        content_hash: Some(content_hash(&text)),
-                    });
-                }
+        let max_chars = adaptive_source_limit(sources.len());
+        for target in sources {
+            if let Some((title, text)) = self.resolve_source_text(target, ai_box, max_chars) {
+                snapshots.push(SourceRef {
+                    target: target.clone(),
+                    title,
+                    content_hash: Some(content_hash(&text)),
+                });
             }
         }
         snapshots
@@ -965,40 +1042,34 @@ impl HomePage {
         ToolRegistry::builtins().definitions().to_vec()
     }
 
-    /// Captures the bounded tool context at send time: only the sources bound
-    /// to this conversation, with their title, content and content hash. Tools
-    /// can never read anything outside this list.
-    fn tool_context_for(&self, ai_box: &ContainerId, conversation: &ConversationId) -> ToolContext {
-        let mut sources = Vec::new();
-        if let Some(data) = self.ai_boxes.get(ai_box)
-            && let Some(conv) = data.get(conversation)
-        {
-            let max_chars = adaptive_source_limit(conv.sources.len());
-            let mut index = 0u32;
-            for target in &conv.sources {
-                if let Some((title, text)) = self.resolve_source_text(target, ai_box, max_chars) {
-                    index += 1;
-                    let content_hash = content_hash(&text);
-                    // Resolve the file path for ExternalFile sources so the
-                    // `core.read_file` tool can read additional content.
-                    let file_path = match target {
-                        SourceTarget::ExternalFile(id) => {
-                            self.find_external_file(id).map(|f| f.path.clone())
-                        }
-                        _ => None,
-                    };
-                    sources.push(BoundSource {
-                        index,
-                        target: target.clone(),
-                        title,
-                        content: text,
-                        content_hash,
-                        file_path,
-                    });
-                }
+    /// Captures the bounded tool context at send time: only the sources given,
+    /// with their title, content and content hash. Tools can never read anything
+    /// outside this list.
+    fn tool_context_for(&self, ai_box: &ContainerId, sources: &[SourceTarget]) -> ToolContext {
+        let mut context = Vec::new();
+        let max_chars = adaptive_source_limit(sources.len());
+        let mut index = 0u32;
+        for target in sources {
+            if let Some((title, text)) = self.resolve_source_text(target, ai_box, max_chars) {
+                index += 1;
+                let content_hash = content_hash(&text);
+                let file_path = match target {
+                    SourceTarget::ExternalFile(id) => {
+                        self.find_external_file(id).map(|f| f.path.clone())
+                    }
+                    _ => None,
+                };
+                context.push(BoundSource {
+                    index,
+                    target: target.clone(),
+                    title,
+                    content: text,
+                    content_hash,
+                    file_path,
+                });
             }
         }
-        ToolContext { sources }
+        ToolContext { sources: context }
     }
 
     /// The model name shown in the conversation header (provider type stays in
@@ -1365,14 +1436,15 @@ use super::*;
             .next()
             .cloned()
             .unwrap();
+        let sources = &page.ai_boxes[&ai_box].get(&conversation).unwrap().sources;
         let request = page
-            .build_turn_request(&ai_box, &conversation)
+            .build_turn_request(&ai_box, &conversation, sources)
             .expect("a turn request builds");
         let system = request.system.expect("system prompt");
         assert!(system.contains("[1] Folder Knowledge"));
         assert!(system.contains(&page.all_snippets[&member].content));
 
-        let snapshots = page.source_snapshots(&ai_box, &conversation);
+        let snapshots = page.source_snapshots(&ai_box, sources);
         assert_eq!(snapshots.len(), 1);
         assert!(matches!(snapshots[0].target, SourceTarget::Container(_)));
     }
@@ -1621,5 +1693,197 @@ use super::*;
                 _ => None,
             })
             .expect("root has a snippet card")
+    }
+
+    #[test]
+    fn spatial_filter_selects_sources_near_conversation() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let root = page.root.container_id.clone();
+
+        page.process_canvas_commands(
+            vec![CanvasCommand::NewAiBox {
+                owner: root,
+                position: None,
+            }],
+            egui::ViewportId::ROOT,
+        );
+        let ai_box = page
+            .workspace
+            .containers
+            .values()
+            .find(|container| container.kind == ContainerKind::AiWorkspace)
+            .expect("AI box exists")
+            .id
+            .clone();
+
+        // Open the AI box canvas so card positions are tracked.
+        page.open_folder(&ai_box);
+
+        // Create 33 snippets and link them all as sources.
+        let mut source_ids = Vec::new();
+        for i in 0..33 {
+            let snippet = Snippet {
+                id: EntityId::new(),
+                title: format!("source_{i}"),
+                content: format!("content_{i}"),
+            };
+            let sid = snippet.id.clone();
+            let _ = page.store.save(&snippet);
+            page.all_snippets.insert(sid.clone(), snippet);
+            page.workspace.add_snippet_to_root(sid.clone());
+            page.process_canvas_commands(
+                vec![CanvasCommand::LinkAiSource {
+                    ai_box: ai_box.clone(),
+                    target: ReferenceTarget::Snippet(sid.clone()),
+                    position: None,
+                }],
+                egui::ViewportId::ROOT,
+            );
+            source_ids.push(sid);
+        }
+
+        // Create the conversation (captures all 33 sources).
+        page.process_canvas_commands(
+            vec![CanvasCommand::NewConversation {
+                ai_box: ai_box.clone(),
+                position: None,
+            }],
+            egui::ViewportId::ROOT,
+        );
+        let conversation = page.ai_boxes[&ai_box]
+            .conversations
+            .keys()
+            .next()
+            .cloned()
+            .expect("conversation created");
+
+        // Set positions on the AI box canvas: conversation at (0,0), first 16
+        // sources nearby (position.y < 200), last 17 far away (position.y > 1000).
+        let canvas = page.folder_views.get_mut(&ai_box).expect("AI box canvas");
+        for (i, item) in canvas.items.iter_mut().enumerate() {
+            if item.role == MemberRole::Conversation {
+                item.position = [0.0, 0.0];
+            } else if i < 16 + 1 {
+                // Skip the conversation card at index 0; sources 1..17 are near.
+                item.position = [0.0, 50.0 * i as f32];
+            } else {
+                item.position = [0.0, 1000.0 + 50.0 * i as f32];
+            }
+        }
+        canvas.save_layout(&page.workspace_store);
+
+        let near_ids: std::collections::HashSet<EntityId> =
+            source_ids.iter().take(16).cloned().collect();
+        let sources: Vec<SourceTarget> = source_ids
+            .into_iter()
+            .map(SourceTarget::Snippet)
+            .collect();
+        let filtered = page.sources_near_conversation(&ai_box, &conversation, &sources);
+
+        assert_eq!(filtered.len(), 32, "filters to 32 sources");
+        // The first 16 sources (indices 0..15) are positioned near the
+        // conversation (y < 800); the remaining 17 are far (y > 1800).
+        // The 32 closest should include all 16 near ones.
+        for source in filtered.iter().take(16) {
+            let SourceTarget::Snippet(id) = source else {
+                panic!("expected snippet source");
+            };
+            assert!(
+                near_ids.contains(id),
+                "filtered source should be among the near ones: got {}",
+                id.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn spatial_filter_falls_back_when_positions_are_all_zero() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let root = page.root.container_id.clone();
+
+        page.process_canvas_commands(
+            vec![CanvasCommand::NewAiBox {
+                owner: root,
+                position: None,
+            }],
+            egui::ViewportId::ROOT,
+        );
+        let ai_box = page
+            .workspace
+            .containers
+            .values()
+            .find(|container| container.kind == ContainerKind::AiWorkspace)
+            .expect("AI box exists")
+            .id
+            .clone();
+
+        page.open_folder(&ai_box);
+
+        // Create 33 sources but never set any position (all default to 0,0).
+        let mut sources = Vec::new();
+        for i in 0..33 {
+            let snippet = Snippet {
+                id: EntityId::new(),
+                title: format!("s{i}"),
+                content: format!("c{i}"),
+            };
+            let sid = snippet.id.clone();
+            let _ = page.store.save(&snippet);
+            page.all_snippets.insert(sid.clone(), snippet);
+            page.workspace.add_snippet_to_root(sid.clone());
+            page.process_canvas_commands(
+                vec![CanvasCommand::LinkAiSource {
+                    ai_box: ai_box.clone(),
+                    target: ReferenceTarget::Snippet(sid.clone()),
+                    position: None,
+                }],
+                egui::ViewportId::ROOT,
+            );
+            sources.push(SourceTarget::Snippet(sid));
+        }
+
+        page.process_canvas_commands(
+            vec![CanvasCommand::NewConversation {
+                ai_box: ai_box.clone(),
+                position: None,
+            }],
+            egui::ViewportId::ROOT,
+        );
+        let conversation = page.ai_boxes[&ai_box]
+            .conversations
+            .keys()
+            .next()
+            .cloned()
+            .expect("conversation created");
+
+        // Force all layout positions to (0,0).
+        if let Some(canvas) = page.folder_views.get_mut(&ai_box) {
+            for item in &mut canvas.items {
+                item.position = [0.0, 0.0];
+            }
+            canvas.save_layout(&page.workspace_store);
+        }
+
+        let filtered = page.sources_near_conversation(&ai_box, &conversation, &sources);
+        assert_eq!(filtered.len(), 33, "all sources returned when positions are all zero");
+    }
+
+    #[test]
+    fn spatial_filter_falls_back_when_32_or_fewer_sources() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let (ai_box, conversation, _) = open_fake_conversation(&mut page);
+
+        let sources = page.ai_boxes[&ai_box]
+            .get(&conversation)
+            .unwrap()
+            .sources
+            .clone();
+        // Only 1 source, so no filtering.
+        let filtered = page.sources_near_conversation(&ai_box, &conversation, &sources);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0], sources[0]);
     }
 }

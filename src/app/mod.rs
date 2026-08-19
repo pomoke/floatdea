@@ -2246,12 +2246,29 @@ impl HomePage {
     /// never land in the wrong conversation).
     fn drain_ai_events(&mut self) {
         while let Ok(event) = self.ai_events.try_recv() {
-            let Some(active) = self.ai_active_turn.clone() else {
-                continue;
-            };
             match event {
+                TurnEvent::TitleGenerated { identity, title } => {
+                    let title = title.trim().to_owned();
+                    if !title.is_empty()
+                        && self
+                            .ai_boxes
+                            .get(&identity.ai_box)
+                            .and_then(|data| data.get(&identity.conversation))
+                            .map(|c| c.title == "New Conversation")
+                            .unwrap_or(false)
+                    {
+                        self.rename_conversation(
+                            &identity.ai_box,
+                            &identity.conversation,
+                            title,
+                        );
+                    }
+                }
                 TurnEvent::Delta { identity, delta } => {
-                    if identity != active {
+                    let Some(ref active) = self.ai_active_turn else {
+                        continue;
+                    };
+                    if identity != *active {
                         continue;
                     }
                     self.ai_streaming.push_str(&delta);
@@ -2263,7 +2280,10 @@ impl HomePage {
                     tools,
                     proposal,
                 } => {
-                    if identity != active {
+                    let Some(ref active) = self.ai_active_turn else {
+                        continue;
+                    };
+                    if identity != *active {
                         continue;
                     }
                     self.ai_active_turn = None;
@@ -2280,9 +2300,16 @@ impl HomePage {
                         tools,
                         proposal,
                     );
+                    // Auto-generate a title after the first turn completes.
+                    if self.should_generate_title(&identity.ai_box, &identity.conversation) {
+                        self.submit_title_generation(&identity.ai_box, &identity.conversation);
+                    }
                 }
                 TurnEvent::Failed { identity, error } => {
-                    if identity != active {
+                    let Some(ref active) = self.ai_active_turn else {
+                        continue;
+                    };
+                    if identity != *active {
                         continue;
                     }
                     let partial = std::mem::take(&mut self.ai_streaming);
@@ -2310,6 +2337,69 @@ impl HomePage {
                 }
             }
         }
+    }
+
+    /// Returns true when the conversation still has the default title and has
+    /// at least one message (meaning the first turn just completed).
+    fn should_generate_title(&self, ai_box: &ContainerId, conversation: &ConversationId) -> bool {
+        let Some(data) = self.ai_boxes.get(ai_box) else {
+            return false;
+        };
+        let Some(conv) = data.get(conversation) else {
+            return false;
+        };
+        conv.title == "New Conversation" && !conv.messages.is_empty()
+    }
+
+    /// Submits a lightweight title-generation task to the AI worker. Uses the
+    /// summarizer model when configured, falls back to the main model.
+    fn submit_title_generation(
+        &mut self,
+        ai_box: &ContainerId,
+        conversation: &ConversationId,
+    ) {
+        let Some(data) = self.ai_boxes.get(ai_box) else {
+            return;
+        };
+        let Some(conv) = data.get(conversation) else {
+            return;
+        };
+        let Some(first_user) = conv
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::User)
+        else {
+            return;
+        };
+        let Some(provider) = self.summarizer_provider_arc() else {
+            return;
+        };
+        let system = "Generate a concise title (4-6 words) for this conversation \
+            based on the user's first message. Respond with ONLY the title, \
+            no quotes, no punctuation, no explanation.";
+        let request = ChatRequest::new(
+            Some(system.to_owned()),
+            vec![ChatMessage::user(first_user.content.clone())],
+        );
+        let identity = TurnIdentity {
+            ai_box: ai_box.clone(),
+            conversation: conversation.clone(),
+            task: TurnTaskId::new(),
+        };
+        let _ = self.ai_worker.generate_title(identity, request, provider);
+    }
+
+    /// Builds a provider configured for the summarizer model (falls back to
+    /// the main model when `summarizer_model` is blank in settings).
+    fn summarizer_provider_arc(&self) -> Option<Arc<dyn ChatProvider>> {
+        if let Some(provider) = &self.ai_provider_override {
+            return Some(provider.clone());
+        }
+        if !self.settings.ai_enabled {
+            return None;
+        }
+        let config = self.settings.summarizer_provider_config();
+        build_provider(&config).ok().map(Arc::from)
     }
 }
 

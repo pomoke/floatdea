@@ -88,6 +88,11 @@ pub struct Settings {
     /// plain chat and no tool receipts or proposals are produced.
     #[serde(default = "default_ai_tools_enabled")]
     pub ai_tools_enabled: bool,
+    /// Optional model name for lightweight auxiliary tasks (title generation,
+    /// summarization, etc.). When empty the main `ai_model` is used instead.
+    /// Uses the same provider, base URL and API key as the main model.
+    #[serde(default)]
+    pub summarizer_model: String,
 }
 
 impl Settings {
@@ -96,6 +101,24 @@ impl Settings {
         ProviderConfig {
             kind: self.ai_provider,
             model: self.ai_model.clone(),
+            base_url: (!self.ai_base_url.trim().is_empty())
+                .then(|| self.ai_base_url.trim().to_owned()),
+            api_key: (!self.ai_api_key.trim().is_empty())
+                .then(|| self.ai_api_key.trim().to_owned()),
+        }
+    }
+
+    /// Provider config for the summarizer model (used for lightweight tasks
+    /// such as auto-generating conversation titles). Falls back to the main
+    /// conversation model when `summarizer_model` is blank.
+    pub fn summarizer_provider_config(&self) -> ProviderConfig {
+        let model = self.summarizer_model.trim();
+        if model.is_empty() {
+            return self.ai_provider_config();
+        }
+        ProviderConfig {
+            kind: self.ai_provider,
+            model: model.to_owned(),
             base_url: (!self.ai_base_url.trim().is_empty())
                 .then(|| self.ai_base_url.trim().to_owned()),
             api_key: (!self.ai_api_key.trim().is_empty())
@@ -120,6 +143,7 @@ impl Default for Settings {
             ai_base_url: String::new(),
             ai_api_key: String::new(),
             ai_tools_enabled: default_ai_tools_enabled(),
+            summarizer_model: String::new(),
         }
     }
 }

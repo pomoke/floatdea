@@ -80,12 +80,26 @@ pub enum TurnEvent {
         identity: TurnIdentity,
         error: AiError,
     },
+    /// A lightweight title-generation task completed (triggered automatically
+    /// after the first turn of a conversation). The UI applies it only when
+    /// the conversation title is still the default.
+    TitleGenerated {
+        identity: TurnIdentity,
+        title: String,
+    },
 }
 
 /// Commands the UI sends to the worker thread.
 enum WorkerCommand {
     Run(TurnRequest),
     Cancel { task: TurnTaskId },
+    /// A lightweight, fire-and-forget title-generation task. The worker makes
+    /// a single streaming call and sends back `TurnEvent::TitleGenerated`.
+    GenerateTitle {
+        identity: TurnIdentity,
+        request: ChatRequest,
+        provider: Arc<dyn ChatProvider>,
+    },
     Shutdown,
 }
 
@@ -94,11 +108,10 @@ const EVENT_CAPACITY: usize = 256;
 /// Per-provider delta queue; the provider never blocks the worker thread on
 /// backpressure beyond this (the forwarder drains it concurrently).
 const DELTA_CAPACITY: usize = 32;
-/// Maximum model continuation rounds after a tool call (plan_ai.md §9.8:
-/// "默认最多两次模型续轮").
-const MAX_TOOL_ROUNDS: u32 = 2;
-/// Maximum tool invocations per turn (plan_ai.md §9.8: "四次工具调用").
-const MAX_TOOL_CALLS: u32 = 4;
+/// Maximum model continuation rounds after a tool call.
+const MAX_TOOL_ROUNDS: u32 = 6;
+/// Maximum tool invocations per turn.
+const MAX_TOOL_CALLS: u32 = 12;
 
 /// UI-side handle of the shared AI worker. Dropping it shuts the worker down.
 pub struct AiWorker {
@@ -128,6 +141,30 @@ impl AiWorker {
     pub fn submit(&self, request: TurnRequest) -> Result<(), AiError> {
         self.commands
             .try_send(WorkerCommand::Run(request))
+            .map_err(|_| {
+                AiError::new(
+                    AiErrorKind::ProviderUnavailable,
+                    "AI worker is busy or shutting down",
+                )
+            })
+    }
+
+    /// Submits a lightweight title-generation task. The worker makes a single
+    /// streaming call with the given request and sends back
+    /// `TurnEvent::TitleGenerated`. This is fire-and-forget: the UI does not
+    /// track it as an active turn and failures are silently ignored.
+    pub fn generate_title(
+        &self,
+        identity: TurnIdentity,
+        request: ChatRequest,
+        provider: Arc<dyn ChatProvider>,
+    ) -> Result<(), AiError> {
+        self.commands
+            .try_send(WorkerCommand::GenerateTitle {
+                identity,
+                request,
+                provider,
+            })
             .map_err(|_| {
                 AiError::new(
                     AiErrorKind::ProviderUnavailable,
@@ -194,6 +231,16 @@ fn run_worker(
                     run_turn(request, events, &task_flag).await;
                 });
                 tasks.insert(identity.task.clone(), (identity, flag, handle));
+            }
+            WorkerCommand::GenerateTitle {
+                identity,
+                request,
+                provider,
+            } => {
+                let events = events.clone();
+                runtime.spawn(async move {
+                    run_title_generation(identity, request, provider, events).await;
+                });
             }
             WorkerCommand::Cancel { task } => {
                 if let Some((identity, flag, handle)) = tasks.remove(&task) {
@@ -349,6 +396,33 @@ async fn run_turn(request: TurnRequest, events: mpsc::Sender<TurnEvent>, cancel:
         current.messages.extend(continuation);
         round += 1;
     }
+}
+
+/// Runs a single, lightweight title-generation call. Makes one streaming
+/// request, collects the full response, trims it and sends back
+/// `TurnEvent::TitleGenerated`. Failures are silently dropped so they never
+/// disturb the UI.
+async fn run_title_generation(
+    identity: TurnIdentity,
+    request: ChatRequest,
+    provider: Arc<dyn ChatProvider>,
+    events: mpsc::Sender<TurnEvent>,
+) {
+    let (deltas, mut delta_rx) = mpsc::channel::<StreamEvent>(DELTA_CAPACITY);
+    let cancel = CancelFlag::new();
+    let result = provider.stream_chat(request, deltas, &cancel).await;
+    // Drain any remaining deltas so the channel is closed.
+    while delta_rx.recv().await.is_some() {}
+    let title = match result {
+        Ok(outcome) => outcome.content.trim().to_owned(),
+        Err(_) => return,
+    };
+    if title.is_empty() {
+        return;
+    }
+    let _ = events
+        .send(TurnEvent::TitleGenerated { identity, title })
+        .await;
 }
 
 /// Counts how many receipts exist for one tool id in the current turn.

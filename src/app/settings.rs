@@ -231,6 +231,27 @@ impl HomePage {
         {
             *changed = true;
         }
+        // Summarizer (auxiliary) model: a lighter/cheaper model for
+        // automatic title generation and other lightweight tasks.
+        ui.add_space(10.0);
+        ui.label("Summarizer model (optional)");
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut settings.summarizer_model)
+                    .id(egui::Id::new("settings-summarizer-model"))
+                    .hint_text("leave blank to use the main model"),
+            )
+            .changed()
+        {
+            *changed = true;
+        }
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("Used for auto-generating conversation titles and other lightweight tasks.")
+                .small()
+                .color(ui.visuals().weak_text_color()),
+        );
+
         if settings.ai_provider != ProviderKind::Fake {
             ui.add_space(8.0);
             ui.label("Base URL (optional)");

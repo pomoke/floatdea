@@ -222,6 +222,19 @@ impl ChatRequest {
         self.tools = tools;
         self
     }
+
+    /// Appends a note to the system prompt (chainable). When there is no system
+    /// prompt yet, the note becomes the entire system prompt.
+    pub fn with_system_note(mut self, note: String) -> Self {
+        match &mut self.system {
+            Some(system) => {
+                system.push_str("\n\n");
+                system.push_str(&note);
+            }
+            None => self.system = Some(note),
+        }
+        self
+    }
 }
 
 /// Token usage reported by a provider when available. Missing values stay
