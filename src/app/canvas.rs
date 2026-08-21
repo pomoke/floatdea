@@ -380,6 +380,7 @@ impl HomePage {
         rename_dialog: &mut RenameDialogState,
         pending_delete: &mut Option<PendingDelete>,
         search: &mut SearchState,
+        link_source: &mut LinkSourceState,
         clipboard: &mut Option<ClipboardEntry>,
         external_open_error: &Option<(String, egui::ViewportId, u32)>,
         os_file_drop_consumed: &mut bool,
@@ -441,6 +442,20 @@ impl HomePage {
                 // unless `search.origin` is exactly this folder window.
                 if let Some(id) = render_search_window(child_ui, search, snippets) {
                     commands.push(CanvasCommand::OpenSnippet(id));
+                }
+                // Render the AI "Link Source" picker inside this viewport; the
+                // viewport guard skips it unless `link_source.origin` matches.
+                if let Some((target, position)) = render_link_source_window(
+                    child_ui,
+                    link_source,
+                    snippets,
+                    workspace,
+                ) {
+                    commands.push(CanvasCommand::LinkAiSource {
+                        ai_box: link_source.ai_box.clone(),
+                        target,
+                        position: Some(position),
+                    });
                 }
                 // Render the transient "could not open external file" toast in
                 // the folder window that triggered the failed open.
@@ -1333,73 +1348,15 @@ impl HomePage {
                         });
                         ui.close();
                     }
-                    ui.menu_button("Link Source…", |ui| {
-                        ui.label(egui::RichText::new("Notes").small().weak());
-                        for (id, snippet) in data.snippets.iter() {
-                            if ui.button(&snippet.title).clicked() {
-                                commands.push(CanvasCommand::LinkAiSource {
-                                    ai_box: ai_box.clone(),
-                                    target: ReferenceTarget::Snippet(id.clone()),
-                                    position: anchor,
-                                });
-                                ui.close();
-                            }
-                        }
-                        ui.separator();
-                        ui.label(egui::RichText::new("Folders").small().weak());
-                        // Other folders (and AI boxes) can be linked as a
-                        // container source; the AI box itself is excluded to
-                        // avoid self-reference.
-                        let self_id = canvas.container_id.clone();
-                        for (id, container) in data
-                            .workspace
-                            .containers
-                            .iter()
-                            .filter(|(id, _)| **id != self_id)
-                        {
-                            if ui.button(&container.title).clicked() {
-                                commands.push(CanvasCommand::LinkAiSource {
-                                    ai_box: ai_box.clone(),
-                                    target: ReferenceTarget::Container(id.clone()),
-                                    position: anchor,
-                                });
-                                ui.close();
-                            }
-                        }
-                        // Collect unique external file references from the
-                        // workspace as linkable sources.
-                        let mut seen = BTreeSet::new();
-                        let external_files: Vec<ExternalFileRef> = data
-                            .workspace
-                            .containers
-                            .values()
-                            .flat_map(|container| &container.members)
-                            .filter_map(|reference| match &reference.target {
-                                ReferenceTarget::ExternalFile(file) => {
-                                    if seen.insert(file.id.clone()) {
-                                        Some(file.clone())
-                                    } else {
-                                        None
-                                    }
-                                }
-                                _ => None,
-                            })
-                            .collect();
-                        if !external_files.is_empty() {
-                            ui.separator();
-                            ui.label(egui::RichText::new("External Files").small().weak());
-                            for file in external_files {
-                                if ui.button(&file.title).clicked() {
-                                    commands.push(CanvasCommand::LinkAiSource {
-                                        ai_box: ai_box.clone(),
-                                        target: ReferenceTarget::ExternalFile(file),
-                                        position: anchor,
-                                    });
-                                    ui.close();
-                                }
-                            }
-                        }
-                    });
+                    // Link a source through a popup window (lists every note,
+                    // folder, and external file) instead of a nested submenu.
+                    if ui.button("Link Source…").clicked() {
+                        commands.push(CanvasCommand::OpenLinkSource {
+                            ai_box: ai_box.clone(),
+                            position: anchor.unwrap_or_default(),
+                        });
+                        ui.close();
+                    }
                     ui.separator();
                 } else if ui.button("New AI Box…").clicked() {
                     commands.push(CanvasCommand::NewAiBox {

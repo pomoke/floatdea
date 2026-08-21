@@ -60,6 +60,9 @@ pub(crate) struct HomePage {
     /// Global search over all snippets (opened by `Ctrl+F`, `/`, or the box
     /// context menu).
     search: SearchState,
+    /// "Link Source" picker for an AI box (a popup window listing linkable
+    /// sources), rendered on the viewport that opened it.
+    link_source: LinkSourceState,
     clipboard: Option<ClipboardEntry>,
     /// Shared local TeX-to-SVG renderer for previews and document embeds.
     math_renderer: MathRenderer,
@@ -149,6 +152,37 @@ impl Default for SearchState {
     }
 }
 
+/// State of the "Link Source" picker for an AI box. Rendered as a floating
+/// popup window **on the viewport that opened it** (mirroring the search
+/// window), listing the notes/folders/external files that can be linked as a
+/// read-only `Source`. Selecting one issues `LinkAiSource`.
+struct LinkSourceState {
+    open: bool,
+    /// The AI box container the picked source is linked into.
+    ai_box: ContainerId,
+    /// The canvas slot where the new source card lands.
+    position: [f32; 2],
+    /// Substring filter over the source titles.
+    filter: String,
+    /// Focus the filter field only on the first frame after opening (IME-safe).
+    focus_requested: bool,
+    /// The viewport that opened the picker; the window is drawn only there.
+    origin: egui::ViewportId,
+}
+
+impl Default for LinkSourceState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            ai_box: ContainerId::new(),
+            position: [0.0, 0.0],
+            filter: String::new(),
+            focus_requested: false,
+            origin: egui::ViewportId::ROOT,
+        }
+    }
+}
+
 /// Delay before showing a hover preview popup (milliseconds).
 const PREVIEW_DELAY_MS: u64 = 800;
 
@@ -213,6 +247,7 @@ struct LinkPicker {
     embed: bool,
 }
 
+/// Display mode of a snippet viewport.
 #[derive(Debug)]
 struct View {
     id: u64,
@@ -448,6 +483,11 @@ enum CanvasCommand {
         target: ReferenceTarget,
         position: Option<[f32; 2]>,
     },
+    /// Open the "Link Source" picker popup for an AI box.
+    OpenLinkSource {
+        ai_box: ContainerId,
+        position: [f32; 2],
+    },
     /// Remove a `Source` card from an AI box (unlink only; never deletes the
     /// source entity).
     RemoveAiSource {
@@ -642,6 +682,7 @@ impl HomePage {
             settings_open: false,
             root_exit_pending: false,
             search: SearchState::default(),
+            link_source: LinkSourceState::default(),
             ai_store,
             ai_boxes,
             ai_worker,
@@ -963,6 +1004,16 @@ impl HomePage {
                     target,
                     position,
                 } => self.link_ai_source(&ai_box, target, position),
+                CanvasCommand::OpenLinkSource { ai_box, position } => {
+                    self.link_source = LinkSourceState {
+                        open: true,
+                        ai_box,
+                        position,
+                        filter: String::new(),
+                        focus_requested: true,
+                        origin,
+                    };
+                }
                 CanvasCommand::RemoveAiSource { ai_box, reference } => {
                     self.remove_ai_source(&ai_box, &reference)
                 }
@@ -1974,6 +2025,131 @@ fn render_search_window(
     open_id
 }
 
+/// Renders the "Link Source" picker for an AI box: a popup window listing the
+/// notes, folders, and external files that can be linked as a read-only
+/// `Source`. Only renders on the viewport that opened it (mirroring the search
+/// window). Returns `Some((target, position))` when a source is picked.
+fn render_link_source_window(
+    ui: &egui::Ui,
+    state: &mut LinkSourceState,
+    snippets: &BTreeMap<EntityId, Snippet>,
+    workspace: &Workspace,
+) -> Option<(ReferenceTarget, [f32; 2])> {
+    if !state.open || ui.ctx().viewport_id() != state.origin {
+        return None;
+    }
+    let mut open = state.open;
+    let mut picked: Option<(ReferenceTarget, [f32; 2])> = None;
+    let mut close = false;
+    let ai_box = state.ai_box.clone();
+    let position = state.position;
+    egui::Window::new("Link Source")
+        .id(egui::Id::new(("link-source-window", state.origin)))
+        .open(&mut open)
+        .default_size([320.0, 380.0])
+        .collapsible(false)
+        .show(ui.ctx(), |ui| {
+            let filter = ui.add(
+                egui::TextEdit::singleline(&mut state.filter)
+                    .id(egui::Id::new(("link-source-filter", state.origin)))
+                    .hint_text("Filter…"),
+            );
+            if state.focus_requested {
+                filter.request_focus();
+                state.focus_requested = false;
+            }
+            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                ui.input_mut(|input| input.consume_key(input.modifiers, egui::Key::Escape));
+                close = true;
+            }
+            ui.add_space(6.0);
+            let filter = state.filter.to_lowercase();
+            let list_height = (ui.ctx().viewport_rect().height() - 180.0).clamp(80.0, 300.0);
+            egui::ScrollArea::vertical()
+                .id_salt(("link-source-list", state.origin))
+                .max_height(list_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    let mut shown = 0;
+                    ui.label(egui::RichText::new("Notes").small().weak());
+                    for (id, snippet) in snippets.iter() {
+                        if !filter.is_empty() && !snippet.title.to_lowercase().contains(&filter) {
+                            continue;
+                        }
+                        shown += 1;
+                        if ui.selectable_label(false, &snippet.title).clicked() {
+                            picked = Some((
+                                ReferenceTarget::Snippet(id.clone()),
+                                position,
+                            ));
+                        }
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("Folders").small().weak());
+                    for (id, container) in workspace
+                        .containers
+                        .iter()
+                        .filter(|(id, _)| **id != ai_box)
+                    {
+                        if !filter.is_empty()
+                            && !container.title.to_lowercase().contains(&filter)
+                        {
+                            continue;
+                        }
+                        shown += 1;
+                        if ui.selectable_label(false, &container.title).clicked() {
+                            picked = Some((
+                                ReferenceTarget::Container(id.clone()),
+                                position,
+                            ));
+                        }
+                    }
+                    // Collect unique external file references as linkable sources.
+                    let mut seen = BTreeSet::new();
+                    let external_files: Vec<&ExternalFileRef> = workspace
+                        .containers
+                        .values()
+                        .flat_map(|container| &container.members)
+                        .filter_map(|reference| match &reference.target {
+                            ReferenceTarget::ExternalFile(file) => {
+                                if seen.insert(file.id.clone()) {
+                                    Some(file)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if !external_files.is_empty() {
+                        ui.separator();
+                        ui.label(egui::RichText::new("External Files").small().weak());
+                        for file in external_files {
+                            if !filter.is_empty() && !file.title.to_lowercase().contains(&filter) {
+                                continue;
+                            }
+                            shown += 1;
+                            if ui.selectable_label(false, &file.title).clicked() {
+                                picked = Some((
+                                    ReferenceTarget::ExternalFile(file.clone()),
+                                    position,
+                                ));
+                            }
+                        }
+                    }
+                    if shown == 0 {
+                        ui.label("(no matches)");
+                    }
+                });
+        });
+    if picked.is_some() || close {
+        state.open = false;
+    } else {
+        state.open = open;
+    }
+    picked
+}
+
 /// Renders the "Insert External File" dialog (path text field, Browse button,
 /// and Insert button). Only renders on the viewport that opened it. The Browse
 /// button spawns a thread that calls the blocking `rfd` file picker so the main
@@ -2208,6 +2384,7 @@ impl HomePage {
                     &mut self.rename_dialog,
                     &mut self.pending_delete,
                     &mut self.search,
+                    &mut self.link_source,
                     &mut self.clipboard,
                     &self.external_open_error,
                     &mut self.os_file_drop_consumed,
@@ -2238,6 +2415,17 @@ impl HomePage {
         // a folder window renders it inside its own viewport pass).
         if let Some(id) = render_search_window(ui, &mut self.search, &self.all_snippets) {
             self.open_view(id);
+        }
+        // The AI "Link Source" picker (rendered only on its originating
+        // viewport; a folder window renders it inside its own viewport pass).
+        if let Some((target, position)) = render_link_source_window(
+            ui,
+            &mut self.link_source,
+            &self.all_snippets,
+            &self.workspace,
+        ) {
+            let ai_box = self.link_source.ai_box.clone();
+            self.link_ai_source(&ai_box, target, Some(position));
         }
         // Poll the pending file picker result (spawned in a thread to avoid
         // blocking the main event loop).
@@ -3817,6 +4005,31 @@ let ctx = egui::Context::default();
         drop(page);
         let reloaded = HomePage::new(&folder.0);
         assert_eq!(reloaded.ai_boxes[&ai_box].conversations.len(), 1);
+    }
+
+    #[test]
+    fn open_link_source_opens_picker_on_the_originating_viewport() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let ai_box = create_ai_box_in_root(&mut page);
+
+        page.process_canvas_commands(
+            vec![CanvasCommand::OpenLinkSource {
+                ai_box: ai_box.clone(),
+                position: [120.0, 90.0],
+            }],
+            egui::ViewportId::ROOT,
+        );
+
+        assert!(page.link_source.open, "picker is open");
+        assert_eq!(page.link_source.ai_box, ai_box);
+        assert_eq!(page.link_source.position, [120.0, 90.0]);
+        assert_eq!(page.link_source.origin, egui::ViewportId::ROOT);
+        assert!(page.link_source.focus_requested);
+        assert!(
+            page.link_source.filter.is_empty(),
+            "filter starts empty so all sources are listed"
+        );
     }
 
     #[test]
