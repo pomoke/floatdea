@@ -651,7 +651,7 @@ impl HomePage {
                     egui::Stroke::new(1.5, accent),
                     egui::StrokeKind::Inside,
                 );
-                let galley = layout_title(painter, "Drop to insert file", 150.0, accent);
+                let galley = layout_title(painter, "Drop to insert file", 150.0, accent, 14.0);
                 let label_rect =
                     egui::Rect::from_min_size(preview.max + egui::vec2(6.0, 4.0), galley.size());
                 painter.rect_filled(label_rect.expand(3.0), 3.0, ui.visuals().panel_fill);
@@ -709,6 +709,7 @@ impl HomePage {
                 &label,
                 CARD_WIDTH - 2.0 * CARD_PADDING_H,
                 ui.visuals().text_color(),
+                14.0,
             );
             // Persistent role tag inside AI boxes (`LINK · READ-ONLY` for
             // sources, `OUTPUT` for saved answers, `CONVERSATION` for chat
@@ -722,7 +723,7 @@ impl HomePage {
                     MemberRole::Conversation => "CONVERSATION",
                     _ => "",
                 };
-                (!text.is_empty()).then(|| layout_tag(painter, text, ui.visuals()))
+                (!text.is_empty()).then(|| layout_tag(painter, text, ui.visuals(), 9.0))
             } else {
                 None
             };
@@ -1498,15 +1499,21 @@ pub(super) struct PreviewCard {
     pub(super) role: MemberRole,
     /// Position from the container layout (canvas coordinates).
     pub(super) position: [f32; 2],
-    /// Canvas-space height of the card. When scaled by [`PREVIEW_SCALE`] it
-    /// exactly fits the title/role-tag galleys the preview renders.
+    /// Canvas-space height of the card (title galley + margins + role tag),
+    /// matching how the real canvas sizes its cards; the preview scales it
+    /// by [`PREVIEW_SCALE`] and renders the galleys at scaled font sizes.
     pub(super) height: f32,
 }
 
 /// Measures the rendered height of a text laid out with `font_id` at
-/// `max_width` (without a painter; used to size mini preview cards the same
-/// way the real canvas sizes them).
-fn text_height(ctx: &egui::Context, text: &str, font_id: egui::FontId, max_width: f32) -> f32 {
+/// `max_width` (used to size mini preview cards the same way the real canvas
+/// sizes them).
+pub(super) fn text_height(
+    ctx: &egui::Context,
+    text: &str,
+    font_id: egui::FontId,
+    max_width: f32,
+) -> f32 {
     let mut job = egui::text::LayoutJob::default();
     job.append(
         text,
@@ -1518,8 +1525,7 @@ fn text_height(ctx: &egui::Context, text: &str, font_id: egui::FontId, max_width
         },
     );
     job.wrap.max_width = max_width.max(10.0);
-    let painter = ctx.layer_painter(egui::LayerId::debug());
-    painter.layout_job(job).size().y
+    ctx.fonts_mut(|f| f.layout_job(job)).size().y
 }
 
 /// Builds the mini cards shown in a folder/AI-box hover preview, mirroring
@@ -1563,14 +1569,15 @@ pub(super) fn container_preview_cards(
                 MemberRole::Conversation => "CONVERSATION",
                 _ => "",
             };
-            // Measure at the same (scaled) width the preview uses to lay out
-            // the galleys, so `height * PREVIEW_SCALE` exactly fits them.
-            let title_w = (CARD_WIDTH - 2.0 * CARD_PADDING_H) * PREVIEW_SCALE;
+            // Measure at full canvas size: the preview renders the title/tag
+            // with the same fonts scaled by `PREVIEW_SCALE`, so a card sized
+            // like the real canvas (`height * PREVIEW_SCALE`) fits its scaled
+            // galleys exactly and keeps the real layout (no fake overlaps).
             let title_height = text_height(
                 ctx,
                 &label,
                 egui::FontId::proportional(14.0),
-                title_w,
+                CARD_WIDTH - 2.0 * CARD_PADDING_H,
             );
             let tag_height = if tag_text.is_empty() {
                 0.0
@@ -1579,8 +1586,8 @@ pub(super) fn container_preview_cards(
                     ctx,
                     tag_text,
                     egui::FontId::proportional(9.0),
-                    title_w,
-                ) + 2.0
+                    CARD_WIDTH - 2.0 * CARD_PADDING_H,
+                ) + 4.0
             };
             let position = layout
                 .items
@@ -1592,7 +1599,7 @@ pub(super) fn container_preview_cards(
                 kind,
                 role,
                 position,
-                height: (CARD_MARGIN_Y + title_height + tag_height + 2.0) / PREVIEW_SCALE,
+                height: title_height + 2.0 * CARD_MARGIN_Y + tag_height,
             })
         })
         .collect();
@@ -1743,6 +1750,7 @@ fn render_float_preview(ctx: &egui::Context, data: &mut CanvasData<'_>) {
                     egui::ScrollArea::vertical()
                         .id_salt("float-preview-scroll")
                         .auto_shrink([false, false])
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
                             ui.label(content.as_str());
                         });
@@ -1768,6 +1776,7 @@ fn render_float_preview(ctx: &egui::Context, data: &mut CanvasData<'_>) {
                         egui::ScrollArea::both()
                             .id_salt("float-preview-canvas")
                             .auto_shrink([false, false])
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                             .max_height(popup_size.y - 8.0)
                             .show(ui, |ui| {
                                 let (response, painter) = ui.allocate_painter(
@@ -1796,6 +1805,7 @@ fn render_float_preview(ctx: &egui::Context, data: &mut CanvasData<'_>) {
                                         &card.label,
                                         card_w - 2.0 * CARD_PADDING_H * PREVIEW_SCALE,
                                         ui.visuals().text_color(),
+                                        14.0 * PREVIEW_SCALE,
                                     );
                                     let tag_galley = match card.role {
                                         MemberRole::Source
@@ -1807,7 +1817,12 @@ fn render_float_preview(ctx: &egui::Context, data: &mut CanvasData<'_>) {
                                                 MemberRole::Conversation => "CONVERSATION",
                                                 _ => "",
                                             };
-                                            Some(layout_tag(painter, text, ui.visuals()))
+                                            Some(layout_tag(
+                                                painter,
+                                                text,
+                                                ui.visuals(),
+                                                9.0 * PREVIEW_SCALE,
+                                            ))
                                         }
                                         _ => None,
                                     };
@@ -2330,13 +2345,14 @@ fn layout_title(
     text: &str,
     max_width: f32,
     color: egui::Color32,
+    font_size: f32,
 ) -> std::sync::Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::default();
     job.append(
         text,
         0.0,
         egui::TextFormat {
-            font_id: egui::FontId::proportional(14.0),
+            font_id: egui::FontId::proportional(font_size),
             color,
             ..Default::default()
         },
@@ -2369,7 +2385,7 @@ fn paint_drop_preview(
         egui::StrokeKind::Inside,
     );
     let label = if move_semantics { "Move" } else { "Link" };
-    let galley = layout_title(painter, label, 60.0, accent);
+    let galley = layout_title(painter, label, 60.0, accent, 14.0);
     let label_rect = egui::Rect::from_min_size(preview.max + egui::vec2(6.0, 4.0), galley.size());
     painter.rect_filled(label_rect.expand(3.0), 3.0, visuals.panel_fill);
     painter.galley(label_rect.min, galley, accent);
@@ -2469,13 +2485,14 @@ fn layout_tag(
     painter: &egui::Painter,
     text: &str,
     visuals: &egui::Visuals,
+    font_size: f32,
 ) -> std::sync::Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::default();
     job.append(
         text,
         0.0,
         egui::TextFormat {
-            font_id: egui::FontId::proportional(9.0),
+            font_id: egui::FontId::proportional(font_size),
             color: visuals.weak_text_color(),
             ..Default::default()
         },

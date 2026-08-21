@@ -3239,6 +3239,46 @@ mod tests {
         }
     }
 
+    /// Installs the built-in egui fonts so text measurement in headless tests
+    /// matches the real app (which loads system fonts in `main.rs`).
+    fn install_test_fonts(ctx: &egui::Context) {
+        use epaint_default_fonts::{EMOJI_ICON, HACK_REGULAR, NOTO_EMOJI_REGULAR, UBUNTU_LIGHT};
+        let mut fonts = egui::FontDefinitions::empty();
+        fonts.font_data.insert(
+            "Hack".to_owned(),
+            Arc::new(egui::FontData::from_static(HACK_REGULAR)),
+        );
+        fonts.font_data.insert(
+            "NotoEmoji-Regular".to_owned(),
+            Arc::new(egui::FontData::from_static(NOTO_EMOJI_REGULAR)),
+        );
+        fonts.font_data.insert(
+            "Ubuntu-Light".to_owned(),
+            Arc::new(egui::FontData::from_static(UBUNTU_LIGHT)),
+        );
+        fonts.font_data.insert(
+            "emoji-icon-font".to_owned(),
+            Arc::new(egui::FontData::from_static(EMOJI_ICON)),
+        );
+        fonts.families.insert(
+            egui::FontFamily::Proportional,
+            vec![
+                "Ubuntu-Light".to_owned(),
+                "NotoEmoji-Regular".to_owned(),
+                "emoji-icon-font".to_owned(),
+            ],
+        );
+        fonts.families.insert(
+            egui::FontFamily::Monospace,
+            vec![
+                "Hack".to_owned(),
+                "NotoEmoji-Regular".to_owned(),
+                "emoji-icon-font".to_owned(),
+            ],
+        );
+        ctx.set_fonts(fonts);
+    }
+
     #[test]
     fn floating_windows_accept_cross_window_card_drops() {
         let folder = TestFolder::new();
@@ -3305,6 +3345,7 @@ mod tests {
         let far_away = egui::pos2(1500.0, 900.0);
 
         let ctx = egui::Context::default();
+        install_test_fonts(&ctx);
         // Alt+hover shows the preview immediately (no 800 ms timer to wait for).
         let alt = egui::Modifiers {
             alt: true,
@@ -3355,6 +3396,7 @@ mod tests {
         );
 
         let ctx = egui::Context::default();
+        install_test_fonts(&ctx);
         let folder_item = page
             .root
             .items
@@ -3480,6 +3522,114 @@ mod tests {
     }
 
     #[test]
+    fn folder_preview_keeps_real_card_layout_no_fake_overlaps() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let folder_id = page.workspace.create_container("Folder");
+        // Two snippets with titles long enough to wrap at the preview's scaled
+        // width but fit on one line at the real canvas width.
+        let mut add = |title: &str, y: f32| {
+            let snippet = Snippet {
+                id: EntityId::new(),
+                title: title.to_owned(),
+                content: "content".to_owned(),
+            };
+            page.store.save(&snippet).unwrap();
+            page.all_snippets.insert(snippet.id.clone(), snippet.clone());
+            let reference = page
+                .workspace
+                .add_snippet_reference(&folder_id, snippet.id)
+                .unwrap();
+            (reference, y)
+        };
+        let (r1, y1) = add("Title number one A", 24.0);
+        let (r2, y2) = add("Title number two BB", 70.0);
+        let mut layout = ContainerLayout::empty(folder_id.clone());
+        layout.items.insert(
+            r1,
+            CardLayout {
+                position: [24.0, y1],
+                color: None,
+            },
+        );
+        layout.items.insert(
+            r2,
+            CardLayout {
+                position: [24.0, y2],
+                color: None,
+            },
+        );
+        page.workspace_store.save_layout(&layout).unwrap();
+        page.workspace_store.save(&page.workspace).unwrap();
+
+let ctx = egui::Context::default();
+        install_test_fonts(&ctx);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = ui;
+        });
+        let container = page.workspace.containers[&folder_id].clone();
+        let mut os_file_drop_consumed = false;
+        let mut hover_preview = HoverPreview::default();
+        let cards = {
+            let data = canvas::CanvasData::new(
+                &mut page.all_snippets,
+                &mut page.workspace,
+                &page.workspace_store,
+                &page.store,
+                &mut page.clipboard,
+                &page.ai_boxes,
+                true,
+                true,
+                false,
+                false,
+                &mut os_file_drop_consumed,
+                &mut hover_preview,
+            );
+            let (cards, _) = canvas::container_preview_cards(&ctx, &container, &layout, &data);
+            cards
+        };
+        assert_eq!(cards.len(), 2);
+        // Real canvas rects (same heights) must not overlap.
+        let real_rects: Vec<egui::Rect> = cards
+            .iter()
+            .map(|c| {
+                egui::Rect::from_min_size(
+                    egui::pos2(c.position[0], c.position[1]),
+                    egui::vec2(CARD_WIDTH, c.height),
+                )
+            })
+            .collect();
+        assert!(
+            !real_rects[0].intersects(real_rects[1]),
+            "the real canvas cards do not overlap"
+        );
+        // The preview scales both positions and sizes by 0.8, so the relative
+        // layout (including the gap) must be preserved: no fake overlap.
+        const SCALE: f32 = 0.8;
+        let bbox_min = cards.iter().fold(egui::Vec2::splat(f32::MAX), |m, c| {
+            egui::vec2(m.x.min(c.position[0]), m.y.min(c.position[1]))
+        });
+        let preview_rects: Vec<egui::Rect> = cards
+            .iter()
+            .map(|c| {
+                egui::Rect::from_min_size(
+                    egui::pos2(
+                        (c.position[0] - bbox_min.x) * SCALE,
+                        (c.position[1] - bbox_min.y) * SCALE,
+                    ),
+                    egui::vec2(CARD_WIDTH * SCALE, c.height * SCALE),
+                )
+            })
+            .collect();
+        assert!(
+            !preview_rects[0].intersects(preview_rects[1]),
+            "mini preview cards must keep the real layout: {} vs {}",
+            preview_rects[0],
+            preview_rects[1]
+        );
+    }
+
+    #[test]
     fn folder_preview_cards_match_the_real_canvas() {
         let folder = TestFolder::new();
         let mut page = HomePage::new(&folder.0);
@@ -3511,6 +3661,7 @@ mod tests {
         page.workspace_store.save(&page.workspace).unwrap();
 
         let ctx = egui::Context::default();
+        install_test_fonts(&ctx);
         // Initialize the font atlas before measuring text.
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             let _ = ui;
