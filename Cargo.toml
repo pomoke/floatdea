@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "wayland", "wgpu", "x11"] }
 egui = { version = "0.35.0", default-features = false }
-egui_extras = { version = "0.35.0", features = ["svg"] }
+egui_extras = { version = "0.35.0", features = ["svg", "image"] }
 egui_commonmark = { version = "0.24", default-features = false, features = ["pulldown_cmark"] }
 epaint_default_fonts = "0.35.0"
 env_logger = "0.11.11"
@@ -25,6 +25,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 genai = "=0.6.5"
 tokio = { version = "1.47", features = ["rt-multi-thread", "sync", "time", "macros"] }
 
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+sha2 = "0.10"
 pdf-extract = "0.12"
 
 [profile.optimized]
@@ -34,5 +36,10 @@ incremental = false
 codegen-units = 1
 debug = false
 
+[profile.tiny]
+inherits = "optimized"
+opt-level = "z"
+strip = true
+panic = "abort"
+
 [profile.release]
-debug = "full"

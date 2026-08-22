@@ -738,6 +738,8 @@ impl HomePage {
                 CardLayout {
                     position,
                     color: None,
+                    size: None,
+                    image_fit: None,
                 },
             );
             canvas.save_layout(&self.workspace_store);

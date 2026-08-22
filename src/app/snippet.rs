@@ -1,6 +1,7 @@
 use egui::TextBuffer;
 
 use super::*;
+use super::image::{ImageBytesCache, ImageBytesKey};
 
 impl HomePage {
     /// Shared view-mode selection (`Source` / `Preview`). Returns the mode
@@ -53,7 +54,8 @@ impl HomePage {
 
     /// Renders the raw-markdown source editor (Source mode). `Esc` switches
     /// back to the preview. The right-click menu offers copy, "Insert Link…",
-    /// and pasting a clipboard reference link at the editor cursor.
+    /// "Insert Image…", "Insert Existing Image…", and pasting a clipboard
+    /// reference link at the editor cursor.
     fn render_snippet_content(
         ui: &mut egui::Ui,
         view: &mut View,
@@ -62,7 +64,8 @@ impl HomePage {
         pane_rect: egui::Rect,
         snippet_index: &[(EntityId, String, String)],
         clipboard: &Option<ClipboardEntry>,
-    ) {
+    ) -> ViewAction {
+        let mut action = ViewAction::None;
         // Global per-view id: independent of the parent `Ui` (columns created
         // by `ui.columns` share one stable id, which would otherwise make the
         // editor state ambiguous in Split mode). Also preserves cursor/IME
@@ -149,6 +152,21 @@ impl HomePage {
                 });
                 ui.close();
             }
+            if ui.button("Insert Image…").clicked() {
+                action = ViewAction::ChooseSnippetImage {
+                    view_id: view.id,
+                    cursor,
+                };
+                ui.close();
+            }
+            if ui.button("Insert Existing Image…").clicked() {
+                view.image_picker = Some(ImagePicker {
+                    cursor,
+                    filter: String::new(),
+                    focus_requested: false,
+                });
+                ui.close();
+            }
             // Paste a clipboard reference (Link/Move from a card's menu).
             if let Some(entry) = clipboard.as_ref()
                 && let ReferenceTarget::Snippet(target_id) = &entry.target
@@ -178,13 +196,17 @@ impl HomePage {
         {
             view.mode_menu = Some(pos);
         }
+        action
     }
 
     /// Renders the CommonMark preview. `![alt]({id}.md)` embeds render the
     /// target's whole document inline (non-recursively); local `.md` links are
     /// hooked so a click opens the target, with a transient error for broken
     /// ones. A right-click anywhere in the visible pane (content or the empty
-    /// area below it) opens the view-mode menu ([`View::mode_menu`]).
+    /// area below it) opens the view-mode menu ([`View::mode_menu`]). Local
+    /// image embeds (`![alt](attachments/{id}.{ext})`) render inline; clicking
+    /// one opens the in-app image viewer.
+    #[allow(clippy::too_many_arguments)]
     fn render_markdown_preview(
         ui: &mut egui::Ui,
         view: &mut View,
@@ -193,20 +215,25 @@ impl HomePage {
         snippet_index: &[(EntityId, String, String)],
         math_renderer: &MathRenderer,
         settings: &Settings,
-    ) -> Option<EntityId> {
-        // Only internal references (no URL scheme) are hooked so a click can be
-        // intercepted; scheme'd URLs remain normal hyperlinks.
+        images: &BTreeMap<AttachmentId, ImageAttachment>,
+        attachment_store: &AttachmentStore,
+        image_cache: &mut ImageBytesCache,
+    ) -> ViewAction {
+        // Internal references (no URL scheme) are hooked so a click can be
+        // intercepted; external URLs (with a scheme) are also hooked so we can
+        // show a confirmation dialog before opening them in the browser.
         let internal_links: Vec<String> = collect_local_links(&snippet.content)
             .into_iter()
             .filter(|url| !url.contains("://") && !url.starts_with("data:"))
             .collect();
-        for url in &internal_links {
+        let external_links: Vec<String> = collect_external_links(&snippet.content);
+        for url in internal_links.iter().chain(external_links.iter()) {
             // `prepare_show` resets hook values at the start of the frame, then
             // `Link::end` marks a hook true when its link is clicked.
             view.markdown_cache.add_link_hook(url.clone());
         }
 
-        let mut open_snippet = None;
+        let mut action = ViewAction::None;
         let segments = split_embeds(&snippet.content);
         let math_cap_scale = settings.math_cap_scale;
         let callback_renderer = math_renderer.clone();
@@ -227,14 +254,35 @@ impl HomePage {
                             .show(ui, &mut view.markdown_cache, text);
                     }
                     PreviewSegment::Embed { dest, .. } => {
-                        Self::render_embed_card(
+                        if let Some(embed_action) = Self::render_embed_card(
                             ui,
                             view,
                             dest,
                             snippet_index,
                             math_renderer,
                             settings,
-                        );
+                        ) {
+                            match embed_action {
+                                EmbedLinkAction::OpenSnippet(id) => {
+                                    action = ViewAction::OpenSnippet(id)
+                                }
+                                EmbedLinkAction::OpenExternal(url) => {
+                                    view.pending_external = Some(url);
+                                }
+                            }
+                        }
+                    }
+                    PreviewSegment::Image { alt, dest } => {
+                        if let Some(id) = render_preview_image(
+                            ui,
+                            dest,
+                            alt,
+                            images,
+                            attachment_store,
+                            image_cache,
+                        ) {
+                            action = ViewAction::OpenImage(id);
+                        }
                     }
                 }
             }
@@ -247,8 +295,16 @@ impl HomePage {
                 if is_broken_internal_link(url, snippet_index) {
                     view.link_error = Some((format!("{url}\ndoes not exist."), 180));
                 } else if let Some(id) = parse_snippet_link(url) {
-                    open_snippet = Some(id);
+                    action = ViewAction::OpenSnippet(id);
                 }
+            }
+            // A clicked external URL is queued for confirmation: FloatDea asks
+            // before handing it to the browser.
+            if let Some(url) = external_links
+                .iter()
+                .find(|url| view.markdown_cache.get_link_hook(url) == Some(true))
+            {
+                view.pending_external = Some(url.clone());
             }
         });
 
@@ -264,12 +320,13 @@ impl HomePage {
             view.mode_menu = Some(pos);
         }
 
-        open_snippet
+        action
     }
 
     /// Renders one inline embed as a framed card: the target's **whole
     /// document**, rendered once and non-recursively (nested `![` degrades to
-    /// plain links). No header is shown.
+    /// plain links). No header is shown. Returns the action for a link clicked
+    /// inside the embedded document (open a snippet, or an external URL).
     fn render_embed_card(
         ui: &mut egui::Ui,
         view: &mut View,
@@ -277,18 +334,31 @@ impl HomePage {
         snippet_index: &[(EntityId, String, String)],
         math_renderer: &MathRenderer,
         settings: &Settings,
-    ) {
+    ) -> Option<EmbedLinkAction> {
         let Some(id) = parse_snippet_link(dest) else {
             ui.colored_label(ui.visuals().warn_fg_color, format!("invalid embed: {dest}"));
-            return;
+            return None;
         };
         let Some((_, _, content)) = snippet_index
             .iter()
             .find(|(existing, _, _)| existing == &id)
         else {
             ui.colored_label(ui.visuals().warn_fg_color, format!("missing page: {dest}"));
-            return;
+            return None;
         };
+        // The embedded document is rendered non-recursively (nested `![]`
+        // degrade to plain links), so collect its links from the neutralized
+        // text and hook them so clicks resolve here.
+        let neutralized = neutralize_embeds(content);
+        let internal_links: Vec<String> = collect_local_links(&neutralized)
+            .into_iter()
+            .filter(|url| !url.contains("://") && !url.starts_with("data:"))
+            .collect();
+        let external_links: Vec<String> = collect_external_links(&neutralized);
+        for url in internal_links.iter().chain(external_links.iter()) {
+            view.markdown_cache.add_link_hook(url.clone());
+        }
+        let mut clicked: Option<EmbedLinkAction> = None;
         egui::Frame::new()
             .inner_margin(egui::Margin::same(8))
             .stroke(egui::Stroke::new(
@@ -305,9 +375,25 @@ impl HomePage {
                 };
                 let _ = egui_commonmark::CommonMarkViewer::new()
                     .render_math_fn(Some(&render_math))
-                    .show(ui, &mut view.markdown_cache, &neutralize_embeds(content));
+                    .show(ui, &mut view.markdown_cache, &neutralized);
             });
+        // A clicked internal link inside the embed opens the referenced snippet.
+        if let Some(url) = internal_links
+            .iter()
+            .find(|url| view.markdown_cache.get_link_hook(url) == Some(true))
+            && let Some(target_id) = parse_snippet_link(url)
+        {
+            clicked = Some(EmbedLinkAction::OpenSnippet(target_id));
+        }
+        // A clicked external URL inside the embed is queued for confirmation.
+        if let Some(url) = external_links
+            .iter()
+            .find(|url| view.markdown_cache.get_link_hook(url) == Some(true))
+        {
+            clicked = Some(EmbedLinkAction::OpenExternal(url.clone()));
+        }
         ui.add_space(8.0);
+        clicked
     }
 
     /// Renders the right-click view-mode menu as a manual `egui::Area` popup
@@ -338,6 +424,44 @@ impl HomePage {
                 .is_some_and(|pos| !menu_rect.contains(pos));
         if click_away || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             view.mode_menu = None;
+        }
+    }
+
+    /// Renders a confirmation dialog before opening an external URL in the
+    /// browser. Called when the user clicks a scheme'd link in a preview.
+    fn render_external_link_confirm(ctx: &egui::Context, view: &mut View) {
+        let Some(url) = view.pending_external.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut open_confirm = false;
+        let mut dismiss = false;
+        egui::Window::new("Open external link?")
+            .id(egui::Id::new(("external-link-confirm", view.id)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.label("This link will open in your browser:");
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(&url).weak());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Open").clicked() {
+                        open_confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+        if open_confirm {
+            view.pending_external = None;
+            let _ = open_path_externally(&url);
+        } else if dismiss || !open {
+            // "Cancel" button or the window's close button.
+            view.pending_external = None;
         }
     }
 
@@ -431,6 +555,93 @@ impl HomePage {
         view.link_picker = Some(picker);
     }
 
+    /// Renders the "Insert Existing Image…" picker window: a filterable list of
+    /// managed workspace images. Selecting one inserts
+    /// `![title](attachments/{id}.{ext})` at the captured editor cursor
+    /// (reusing the existing attachment, never copying the file again).
+    fn render_image_picker(
+        ctx: &egui::Context,
+        view: &mut View,
+        snippet: &mut Snippet,
+        store: &SnippetStore,
+        images: &BTreeMap<AttachmentId, ImageAttachment>,
+    ) {
+        let Some(mut picker) = view.image_picker.take() else {
+            return;
+        };
+        let mut selected: Option<AttachmentId> = None;
+        let mut cancelled = false;
+        let response = egui::Window::new("Insert Existing Image")
+            .id(egui::Id::new(("insert-image-picker", view.id)))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                let filter = ui.add(
+                    egui::TextEdit::singleline(&mut picker.filter)
+                        .id(egui::Id::new(("insert-image-filter", view.id)))
+                        .hint_text("Filter…"),
+                );
+                if !picker.focus_requested {
+                    filter.request_focus();
+                    picker.focus_requested = true;
+                }
+                ui.separator();
+                let list_height = (ui.ctx().viewport_rect().height() - 130.0).clamp(80.0, 300.0);
+                egui::ScrollArea::vertical()
+                    .id_salt(("insert-image-list", view.id))
+                    .max_height(list_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        let filter = picker.filter.as_str();
+                        let mut shown = 0;
+                        for image in images.values() {
+                            if !filter.is_empty() && !image.title.contains(filter) {
+                                continue;
+                            }
+                            shown += 1;
+                            if ui.selectable_label(false, &image.title).clicked() {
+                                selected = Some(image.id.clone());
+                            }
+                        }
+                        if shown == 0 {
+                            ui.label(if images.is_empty() {
+                                "(no images yet — use Insert Image… to add one)"
+                            } else {
+                                "(no matches)"
+                            });
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            ctx.input_mut(|i| i.consume_key(i.modifiers, egui::Key::Escape));
+            return;
+        }
+        if response.is_none() || cancelled {
+            return;
+        }
+        if let Some(id) = selected {
+            if let Some(image) = images.get(&id) {
+                let alt = markdown_alt_text(&image.title);
+                let markdown = format!("![{alt}]({})", image.relative_path);
+                let index = picker.cursor.min(snippet.content.chars().count());
+                snippet
+                    .content
+                    .insert_text(&markdown, egui::text::CharIndex(index));
+                let _ = store.save(snippet);
+            }
+            return;
+        }
+        // Not selected yet: keep the picker open.
+        view.image_picker = Some(picker);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn render_snippet_viewport(
         ui: &mut egui::Ui,
@@ -441,6 +652,9 @@ impl HomePage {
         clipboard: &Option<ClipboardEntry>,
         math_renderer: &MathRenderer,
         settings: &Settings,
+        images: &BTreeMap<AttachmentId, ImageAttachment>,
+        attachment_store: &AttachmentStore,
+        image_cache: &mut ImageBytesCache,
     ) -> ViewAction {
         ui.show_viewport_immediate(
             egui::ViewportId::from_hash_of(("snippet-view", view.id)),
@@ -457,6 +671,9 @@ impl HomePage {
                     clipboard,
                     math_renderer,
                     settings,
+                    images,
+                    attachment_store,
+                    image_cache,
                 );
                 if child_ui.input(|input| input.viewport().close_requested()) {
                     action = ViewAction::Close;
@@ -478,14 +695,18 @@ impl HomePage {
         clipboard: &Option<ClipboardEntry>,
         math_renderer: &MathRenderer,
         settings: &Settings,
+        images: &BTreeMap<AttachmentId, ImageAttachment>,
+        attachment_store: &AttachmentStore,
+        image_cache: &mut ImageBytesCache,
     ) -> ViewAction {
         let mut open = true;
+        let mut action = ViewAction::None;
         egui::Window::new(Self::view_title(view, &snippet.title))
         .id(egui::Id::new(("snippet-window", view.id)))
         .open(&mut open)
         .default_size([480.0, 320.0])
         .show(ui.ctx(), |ui| {
-            Self::render_snippet_panel(
+            action = Self::render_snippet_panel(
                 ui,
                 view,
                 snippet,
@@ -494,18 +715,20 @@ impl HomePage {
                 clipboard,
                 math_renderer,
                 settings,
+                images,
+                attachment_store,
+                image_cache,
             );
         });
-        if open {
-            ViewAction::None
-        } else {
-            ViewAction::Close
+        if !open {
+            action = ViewAction::Close;
         }
+        action
     }
 
     /// The body shared by the native snippet viewport and the floating snippet
     /// window: the content panel, cross-window drop target, error toast,
-    /// view-mode menu, and "Insert Link…" picker.
+    /// view-mode menu, and "Insert Link…"/"Insert Existing Image…" pickers.
     #[allow(clippy::too_many_arguments)]
     fn render_snippet_panel(
         ui: &mut egui::Ui,
@@ -516,6 +739,9 @@ impl HomePage {
         clipboard: &Option<ClipboardEntry>,
         math_renderer: &MathRenderer,
         settings: &Settings,
+        images: &BTreeMap<AttachmentId, ImageAttachment>,
+        attachment_store: &AttachmentStore,
+        image_cache: &mut ImageBytesCache,
     ) -> ViewAction {
         let mut action = ViewAction::None;
         // Linked Source previews never enter the editor (even if a stale state
@@ -539,7 +765,7 @@ impl HomePage {
                                 .id_salt(("preview-scroll", view.id))
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    if let Some(id) = Self::render_markdown_preview(
+                                    action = Self::render_markdown_preview(
                                         ui,
                                         view,
                                         snippet,
@@ -547,9 +773,10 @@ impl HomePage {
                                         snippet_index,
                                         math_renderer,
                                         settings,
-                                    ) {
-                                        action = ViewAction::OpenSnippet(id);
-                                    }
+                                        images,
+                                        attachment_store,
+                                        image_cache,
+                                    );
                                 });
                         }
                         ViewMode::Source => {
@@ -558,7 +785,7 @@ impl HomePage {
                                 .id_salt(("source-scroll", view.id))
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    Self::render_snippet_content(
+                                    action = Self::render_snippet_content(
                                         ui,
                                         view,
                                         snippet,
@@ -625,68 +852,140 @@ impl HomePage {
 
         // The right-click view-mode menu floats above the content.
         Self::render_view_mode_menu(ctx, view);
+        // Confirmation before opening an external URL clicked in a preview.
+        Self::render_external_link_confirm(ctx, view);
         // The "Insert Link…" picker window.
         Self::render_link_picker(ctx, view, snippet, store, snippet_index);
+        // The "Insert Existing Image…" picker window.
+        Self::render_image_picker(ctx, view, snippet, store, images);
         action
     }
 }
 
-/// One piece of a preview: plain markdown text, or an inline embed marker
-/// (`![alt](dest)`) that renders the target's whole document inline.
+/// One piece of a preview: plain markdown text, a `.md` inline embed that
+/// renders the target's whole document inline, or a managed-image embed.
 #[derive(Debug, PartialEq)]
-enum PreviewSegment {
+pub(super) enum PreviewSegment {
     Text(String),
     Embed { alt: String, dest: String },
+    Image { alt: String, dest: String },
 }
 
-/// Splits `content` at inline **document** embeds: `![alt](dest)` where `dest`
-/// is a local `*.md` reference. Images and external URLs (`.png`, `http://`,
-/// …) stay in the text segment and are left to CommonMark rendering — the
-/// syntax is shared with future real image embeds, disambiguated by extension.
-/// Code blocks are not handled specially yet.
-fn split_embeds(content: &str) -> Vec<PreviewSegment> {
+/// A link clicked inside an embedded document.
+#[derive(Debug, PartialEq)]
+enum EmbedLinkAction {
+    /// Open the referenced snippet.
+    OpenSnippet(EntityId),
+    /// Confirm and open an external URL in the browser.
+    OpenExternal(String),
+}
+
+/// Splits `content` at inline embeds using the unified local-target parser:
+/// `![alt](dest)` where `dest` is a local `*.md` reference becomes an
+/// [`PreviewSegment::Embed`]; `attachments/{id}.{ext}` becomes an
+/// [`PreviewSegment::Image`]. Plain links and external URLs stay in the text
+/// segment (handled by CommonMark). Fenced code blocks, inline code and escaped
+/// characters are skipped by the parser.
+pub(super) fn split_embeds(content: &str) -> Vec<PreviewSegment> {
+    let targets = parse_local_markdown_targets(content);
     let mut segments = Vec::new();
-    let bytes = content.as_bytes();
     let mut text_start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'!' && bytes.get(i + 1) == Some(&b'[') {
-            let alt_start = i + 2;
-            let mut close = alt_start;
-            while close < bytes.len() && bytes[close] != b']' {
-                close += 1;
-            }
-            if close < bytes.len() && bytes.get(close + 1) == Some(&b'(') {
-                let mut end = close + 2;
-                while end < bytes.len() && bytes[end] != b')' {
-                    end += 1;
-                }
-                if end < bytes.len() {
-                    let dest = &content[close + 2..end];
-                    let is_document_embed = dest.ends_with(".md")
-                        && !dest.contains("://")
-                        && !dest.starts_with("data:");
-                    if is_document_embed {
-                        if text_start < i {
-                            segments.push(PreviewSegment::Text(content[text_start..i].to_owned()));
-                        }
-                        segments.push(PreviewSegment::Embed {
-                            alt: content[alt_start..close].to_owned(),
-                            dest: dest.to_owned(),
-                        });
-                        i = end + 1;
-                        text_start = i;
-                        continue;
-                    }
-                }
-            }
+    for parsed in &targets {
+        if !parsed.is_image {
+            continue;
         }
-        i += 1;
+        let segment = match &parsed.target {
+            LocalMarkdownTarget::Snippet(_) => Some(PreviewSegment::Embed {
+                alt: parsed.label.clone(),
+                dest: parsed.dest.clone(),
+            }),
+            LocalMarkdownTarget::Image(_) => Some(PreviewSegment::Image {
+                alt: parsed.label.clone(),
+                dest: parsed.dest.clone(),
+            }),
+            LocalMarkdownTarget::UnresolvedLocal(_) => None,
+        };
+        let Some(segment) = segment else {
+            continue;
+        };
+        if text_start < parsed.start {
+            segments.push(PreviewSegment::Text(content[text_start..parsed.start].to_owned()));
+        }
+        segments.push(segment);
+        text_start = parsed.end;
     }
     if text_start < content.len() {
         segments.push(PreviewSegment::Text(content[text_start..].to_owned()));
     }
     segments
+}
+
+/// Renders one managed-image embed (`![alt](attachments/{id}.{ext})`) with its
+/// natural aspect ratio, capped at the available width. Missing or corrupt
+/// images render a placeholder with the alt text. Returns the `AttachmentId`
+/// when the image was clicked (opens the in-app viewer).
+#[allow(clippy::too_many_arguments)]
+fn render_preview_image(
+    ui: &mut egui::Ui,
+    dest: &str,
+    alt: &str,
+    images: &BTreeMap<AttachmentId, ImageAttachment>,
+    attachment_store: &AttachmentStore,
+    image_cache: &mut ImageBytesCache,
+) -> Option<AttachmentId> {
+    let Some(id) = parse_attachment_link(dest) else {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!("invalid image embed: {dest}"),
+        );
+        return None;
+    };
+    let Some(image) = images.get(&id).cloned() else {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!("missing image: {dest}"),
+        );
+        return None;
+    };
+
+    // Size: max width = available text width, height by pixel ratio.
+    let avail = ui.available_width();
+    let [w, h] = image.pixel_size;
+    let (w, h) = (w.max(1) as f32, h.max(1) as f32);
+    let display = if w > avail {
+        let scale = avail / w;
+        egui::vec2(avail, (h * scale).max(1.0))
+    } else {
+        egui::vec2(w, h)
+    };
+
+    let key = ImageBytesKey::Attachment(image.id.clone());
+    let bytes = if let Some(bytes) = image_cache.get(&key) {
+        bytes
+    } else {
+        let Ok(raw) = image::load_attachment_bytes(attachment_store, &image) else {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("could not read image: {alt}"),
+            );
+            return None;
+        };
+        let bytes: egui::load::Bytes = raw.into();
+        image_cache.insert(key, bytes.clone());
+        bytes
+    };
+    let source = image::attachment_source(&image, bytes);
+    let (rect, response) = ui.allocate_exact_size(display, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        egui::Image::new(source)
+            .texture_options(egui::TextureOptions::LINEAR)
+            .fit_to_exact_size(display)
+            .paint_at(ui, rect);
+    }
+    if response.clicked() {
+        return Some(image.id);
+    }
+    None
 }
 
 /// Replaces inline-embed markers with plain links (`![` → `[`), used when
@@ -729,6 +1028,69 @@ fn collect_local_links(text: &str) -> Vec<String> {
                     }
                 }
                 i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    links
+}
+
+/// Collects the destinations of inline markdown links that point outside the
+/// workspace: any destination carrying a URL scheme (`://`, e.g. `https://…`)
+/// or a `data:` URI. Embed markers (`![alt](dest)`) are excluded. External
+/// links are hooked and confirmed before being opened in the browser.
+pub(crate) fn collect_external_links(text: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b']' && bytes.get(i + 1) == Some(&b'(') {
+            // `![alt](dest)` is an embed, not a link.
+            let mut open = i;
+            while open > 0 && bytes[open] != b'[' {
+                open -= 1;
+            }
+            let is_embed = open > 0 && bytes[open - 1] == b'!';
+            if !is_embed {
+                let mut end = i + 2;
+                let mut depth = 1usize;
+                while end < bytes.len() && depth > 0 {
+                    match bytes[end] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                if depth == 0 {
+                    let destination = &text[i + 2..end - 1];
+                    if destination.contains("://") || destination.starts_with("data:") {
+                        links.push(destination.to_owned());
+                    }
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    // Also collect angle-bracket autolinks (`<https://…>`), which pulldown
+    // parses as links with the same destination. Only URL autolinks carry a
+    // scheme; bare `<…>` (e.g. an HTML tag) is ignored.
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            let mut end = i + 1;
+            while end < bytes.len() && bytes[end] != b'>' {
+                end += 1;
+            }
+            if end < bytes.len() {
+                let destination = &text[i + 1..end];
+                if destination.contains("://") || destination.starts_with("data:") {
+                    links.push(destination.to_owned());
+                }
+                i = end + 1;
                 continue;
             }
         }
@@ -785,6 +1147,26 @@ mod tests {
                     and ![img](p.png) and ![emb](0123456789abcdef0123.md)";
         // Links only: embeds (`![...]`) are excluded.
         assert_eq!(collect_local_links(text), vec!["hello--abc.md"]);
+    }
+
+    #[test]
+    fn collects_external_links() {
+        let text = "see [site](https://example.com/x) and [docs](https://docs.rs/egui) \
+                    and [data](data:image/png;base64,abc) and [local](0123456789abcdef0123.md) \
+                    and ![img](p.png) and ![emb](https://x.example/a.md) \
+                    and autolink <https://autolink.example.org> and <span>tag</span>";
+        // Scheme'd link destinations only; embeds (`![...]`) excluded; local
+        // `.md` references excluded; angle-bracket autolinks included; bare
+        // `<span>` (no scheme) excluded.
+        assert_eq!(
+            collect_external_links(text),
+            vec![
+                "https://example.com/x".to_owned(),
+                "https://docs.rs/egui".to_owned(),
+                "data:image/png;base64,abc".to_owned(),
+                "https://autolink.example.org".to_owned(),
+            ]
+        );
     }
 
     #[test]

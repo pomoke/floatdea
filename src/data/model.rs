@@ -46,10 +46,24 @@ stable_id! {
     /// Identity of a single AI turn task (one request—streamed-response round).
     TurnTaskId
 }
+stable_id! {
+    /// Identity of a managed image attachment stored in the workspace's
+    /// `attachments/` directory. The ID is stable: renaming the display title
+    /// or moving the image between boxes does not change it.
+    AttachmentId
+}
 
 impl EntityId {
     /// Rebuilds an id from its string form (e.g. parsed out of a
     /// `{title}--{id}.md` filename in a markdown link).
+    pub fn from_string(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl AttachmentId {
+    /// Rebuilds an id from its string form (e.g. parsed out of an
+    /// `attachments/{id}.{ext}` markdown image destination).
     pub fn from_string(value: &str) -> Self {
         Self(value.to_owned())
     }
@@ -74,6 +88,7 @@ mod tests {
             ContainerId::new().0,
             ReferenceId::new().0,
             TextId::new().0,
+            AttachmentId::new().0,
         ] {
             assert_eq!(id.len(), 20);
             assert!(

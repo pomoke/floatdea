@@ -6,7 +6,10 @@ use std::{
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use super::{ContainerId, ConversationId, EntityId, ExternalFileId, ReferenceId, Snippet, TextId};
+use super::{
+    AttachmentId, ContainerId, ConversationId, EntityId, ExternalFileId, ReferenceId, Snippet,
+    TextId,
+};
 
 const WORKSPACE_VERSION: u32 = 1;
 const LAYOUT_VERSION: u32 = 1;
@@ -68,6 +71,10 @@ impl SpecialKind {
 /// records only the absolute path and a display title; the file itself is
 /// never imported or copied. Clicking the card opens it with the operating
 /// system's default application, and removing the card never deletes the file.
+///
+/// When `media_type` is set to an image type (e.g. `"image/jpeg"`) the canvas
+/// renders the file content directly as an image instead of showing a card.
+/// This is used for source files that exceed the managed inline size limit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalFileRef {
     /// Stable identity of the file link. Cards that link the same file share
@@ -77,6 +84,46 @@ pub struct ExternalFileRef {
     pub path: String,
     /// Display title shown on the canvas card (defaults to the file stem).
     pub title: String,
+    /// MIME type hint for the file content. When `Some("image/…")` the canvas
+    /// renders the file as an image rather than as a card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+}
+
+/// How an image is fitted inside its canvas display rectangle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageFit {
+    /// The entire image is visible, letter-boxed if the aspect ratio differs.
+    #[default]
+    Contain,
+    /// The image fills the rectangle, cropping the longer dimension.
+    Cover,
+}
+
+/// A managed image attachment stored in the workspace's `attachments/`
+/// directory. The image is copied from its source, verified, and assigned a
+/// stable identity. Multiple canvas references can point to the same
+/// `ImageAttachment` without duplicating the file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    pub id: AttachmentId,
+    /// Workspace-relative path, always `attachments/{id}.{ext}`.
+    pub relative_path: String,
+    /// Display title (defaults to the source file stem). Renaming the title
+    /// does not change the file name on disk.
+    pub title: String,
+    /// MIME type, e.g. `"image/jpeg"` or `"image/png"`.
+    pub media_type: String,
+    /// File size in bytes.
+    pub byte_len: u64,
+    /// SHA-256 hex digest of the file content.
+    pub content_hash: String,
+    /// Pixel dimensions `[width, height]` after applying EXIF orientation.
+    pub pixel_size: [u32; 2],
+    /// Original source file stem before any sanitisation, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +139,8 @@ pub enum ReferenceTarget {
     Conversation(ConversationId),
     /// A card that opens an external file with the system's default app.
     ExternalFile(ExternalFileRef),
+    /// A managed image attachment displayed directly on the canvas.
+    Image(AttachmentId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +180,8 @@ pub struct Workspace {
     pub version: u32,
     pub root: ContainerId,
     pub containers: BTreeMap<ContainerId, Container>,
+    #[serde(default)]
+    pub images: BTreeMap<AttachmentId, ImageAttachment>,
 }
 
 impl Workspace {
@@ -146,6 +197,7 @@ impl Workspace {
             version: WORKSPACE_VERSION,
             root: root.clone(),
             containers: BTreeMap::from([(root, container)]),
+            images: BTreeMap::new(),
         }
     }
 
@@ -254,6 +306,29 @@ impl Workspace {
         file: ExternalFileRef,
     ) -> io::Result<ReferenceId> {
         self.add_reference(container, ReferenceTarget::ExternalFile(file))
+    }
+
+    /// Registers a managed image attachment in the workspace. The image file
+    /// must already be present at `attachments/{id}.{ext}`.
+    pub fn add_image(&mut self, image: ImageAttachment) -> io::Result<AttachmentId> {
+        let id = image.id.clone();
+        if self.images.contains_key(&id) {
+            return Err(invalid_data("image attachment id already exists"));
+        }
+        self.images.insert(id.clone(), image);
+        Ok(id)
+    }
+
+    /// Creates a new reference pointing to an existing image attachment.
+    pub fn add_image_reference(
+        &mut self,
+        container: &ContainerId,
+        image: AttachmentId,
+    ) -> io::Result<ReferenceId> {
+        if !self.images.contains_key(&image) {
+            return Err(invalid_data("reference targets a missing image attachment"));
+        }
+        self.add_reference(container, ReferenceTarget::Image(image))
     }
 
     pub fn remove_reference(
@@ -377,6 +452,11 @@ impl Workspace {
                 {
                     return Err(invalid_data("reference targets a missing container"));
                 }
+                if let ReferenceTarget::Image(id) = &reference.target
+                    && !self.images.contains_key(id)
+                {
+                    return Err(invalid_data("reference targets a missing image attachment"));
+                }
             }
         }
         Ok(())
@@ -388,6 +468,14 @@ pub struct CardLayout {
     pub position: [f32; 2],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[u8; 4]>,
+    /// Display size in logical points. For image references this is the image
+    /// rectangle; for other references the field is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<[f32; 2]>,
+    /// How the image is fitted inside the display rectangle. Only meaningful
+    /// for `ReferenceTarget::Image` references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_fit: Option<ImageFit>,
 }
 
 /// A canvas-local text annotation. Texts are not part of the entity-reference
@@ -566,6 +654,8 @@ mod tests {
             CardLayout {
                 position: [41.0, 73.0],
                 color: None,
+                size: None,
+                image_fit: None,
             },
         );
 

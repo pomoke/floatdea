@@ -1,10 +1,13 @@
 use super::*;
+use super::image::ImageBytesCache;
 
 pub(super) struct CanvasData<'a> {
     snippets: &'a mut BTreeMap<EntityId, Snippet>,
     workspace: &'a mut Workspace,
     workspace_store: &'a WorkspaceStore,
     snippet_store: &'a SnippetStore,
+    attachment_store: &'a AttachmentStore,
+    image_cache: &'a mut ImageBytesCache,
     clipboard: &'a mut Option<ClipboardEntry>,
     /// AI sidecar state cache: conversation titles and per-box data used to
     /// render conversation cards inside AI boxes.
@@ -37,6 +40,8 @@ impl<'a> CanvasData<'a> {
         workspace: &'a mut Workspace,
         workspace_store: &'a WorkspaceStore,
         snippet_store: &'a SnippetStore,
+        attachment_store: &'a AttachmentStore,
+        image_cache: &'a mut ImageBytesCache,
         clipboard: &'a mut Option<ClipboardEntry>,
         ai: &'a BTreeMap<ContainerId, AiBoxData>,
         snap_to_grid: bool,
@@ -51,6 +56,8 @@ impl<'a> CanvasData<'a> {
             workspace,
             workspace_store,
             snippet_store,
+            attachment_store,
+            image_cache,
             clipboard,
             ai,
             snap_to_grid,
@@ -109,6 +116,8 @@ impl HomePage {
             &mut self.workspace,
             &self.workspace_store,
             &self.store,
+            &self.attachment_store,
+            &mut self.image_cache,
             &mut self.clipboard,
             &self.ai_boxes,
             self.settings.snap_to_grid,
@@ -204,6 +213,12 @@ impl HomePage {
                 *pending = None;
                 return DeleteDialogResult::None;
             }
+            // Image references are deleted without confirmation (the
+            // attachment file is never removed by removing a reference).
+            ReferenceTarget::Image(_) => {
+                *pending = None;
+                return DeleteDialogResult::None;
+            }
         };
         let mut confirmed = false;
         let mut cancelled = false;
@@ -253,6 +268,9 @@ impl HomePage {
                     RenameTarget::ExternalFile { id, .. } => {
                         self.rename_external_file(id, new_title)
                     }
+                    RenameTarget::Image { id, .. } => {
+                        self.rename_image(id, new_title)
+                    }
                 };
                 if ok {
                     self.rename_dialog.pending = None;
@@ -281,6 +299,7 @@ impl HomePage {
             RenameTarget::Folder { id, .. } => format!("folder:{}", id.as_str()),
             RenameTarget::Conversation { id, .. } => format!("conversation:{}", id.as_str()),
             RenameTarget::ExternalFile { id, .. } => format!("file:{}", id.as_str()),
+            RenameTarget::Image { id, .. } => format!("image:{}", id.as_str()),
         };
         let mut confirmed = false;
         let mut cancelled = false;
@@ -376,6 +395,8 @@ impl HomePage {
         workspace: &mut Workspace,
         workspace_store: &WorkspaceStore,
         snippet_store: &SnippetStore,
+        attachment_store: &AttachmentStore,
+        image_cache: &mut ImageBytesCache,
         snippets: &mut BTreeMap<EntityId, Snippet>,
         rename_dialog: &mut RenameDialogState,
         pending_delete: &mut Option<PendingDelete>,
@@ -401,6 +422,8 @@ impl HomePage {
                     workspace,
                     workspace_store,
                     snippet_store,
+                    attachment_store,
+                    image_cache,
                     clipboard,
                     ai,
                     snap_to_grid,
@@ -477,6 +500,8 @@ impl HomePage {
         workspace: &mut Workspace,
         workspace_store: &WorkspaceStore,
         snippet_store: &SnippetStore,
+        attachment_store: &AttachmentStore,
+        image_cache: &mut ImageBytesCache,
         snippets: &mut BTreeMap<EntityId, Snippet>,
         clipboard: &mut Option<ClipboardEntry>,
         os_file_drop_consumed: &mut bool,
@@ -498,6 +523,8 @@ impl HomePage {
                     workspace,
                     workspace_store,
                     snippet_store,
+                    attachment_store,
+                    image_cache,
                     clipboard,
                     ai,
                     snap_to_grid,
@@ -708,6 +735,242 @@ impl HomePage {
                 continue;
             };
             let item = &canvas.items[index];
+            // Images render as picture content instead of a text card: paint
+            // them, support moving/resizing, and skip the card/gallery path.
+            if kind == ItemKind::Image {
+                let reference_id = canvas.items[index].reference_id.clone();
+                let target = canvas.items[index].target.clone();
+                let size = canvas.items[index].size;
+                let rect = egui::Rect::from_min_size(
+                    canvas_rect.min + egui::vec2(item.position[0], item.position[1]),
+                    size,
+                );
+                pointer_over_card |= pointer_pos.is_some_and(|pos| rect.contains(pos));
+
+                let response = ui.interact(
+                    rect,
+                    egui::Id::new((
+                        "canvas-image",
+                        canvas.container_id.as_str(),
+                        reference_id.as_str(),
+                    )),
+                    egui::Sense::click_and_drag(),
+                );
+
+                // Image context menu.
+                if !canvas_is_ai_box {
+                    response.context_menu(|ui| {
+                        let origin = ui.ctx().viewport_id();
+                        match &target {
+                            ReferenceTarget::Image(id) => {
+                                if ui.button("Open").clicked() {
+                                    commands.push(CanvasCommand::OpenImage(id.clone()));
+                                    ui.close();
+                                }
+                                if ui.button("Rename…").clicked() {
+                                    commands.push(CanvasCommand::RenameImage(id.clone()));
+                                    ui.close();
+                                }
+                                if ui.button("Copy Markdown").clicked() {
+                                    if let Some(image) = data.workspace.images.get(id) {
+                                        ui.copy_text(format!(
+                                            "![{}]({})",
+                                            markdown_alt_text(&image.title),
+                                            image.relative_path
+                                        ));
+                                    }
+                                    ui.close();
+                                }
+                            }
+                            // Over-limit images are external references: opening
+                            // and renaming go through the external-file path.
+                            ReferenceTarget::ExternalFile(file) => {
+                                if ui.button("Open Externally").clicked() {
+                                    commands.push(CanvasCommand::OpenExternalFile(file.clone()));
+                                    ui.close();
+                                }
+                                if ui.button("Rename…").clicked() {
+                                    commands.push(
+                                        CanvasCommand::RenameExternalFile(file.id.clone()),
+                                    );
+                                    ui.close();
+                                }
+                            }
+                            _ => {}
+                        }
+                        ui.separator();
+                        if ui.button("Link").clicked() {
+                            *data.clipboard = Some(ClipboardEntry {
+                                source_container: canvas.container_id.clone(),
+                                reference_id: reference_id.clone(),
+                                target: target.clone(),
+                                semantics: ClipboardSemantics::Link,
+                                origin,
+                            });
+                            ui.close();
+                        }
+                        if ui.button("Move").clicked() {
+                            *data.clipboard = Some(ClipboardEntry {
+                                source_container: canvas.container_id.clone(),
+                                reference_id: reference_id.clone(),
+                                target: target.clone(),
+                                semantics: ClipboardSemantics::Move,
+                                origin,
+                            });
+                            ui.close();
+                        }
+                        if matches!(target, ReferenceTarget::Image(_))
+                            && ui.button("Reset Size").clicked()
+                        {
+                            commands.push(CanvasCommand::ResetImageSize(reference_id.clone()));
+                            ui.close();
+                        }
+                        ui.separator();
+                        let last_link = reference_count(data.workspace, &target) == 1;
+                        if ui
+                            .button(if last_link { "Remove" } else { "Remove from Box" })
+                            .clicked()
+                        {
+                            commands.push(CanvasCommand::DeleteReference {
+                                owner: canvas.container_id.clone(),
+                                reference: reference_id.clone(),
+                                target: target.clone(),
+                            });
+                            ui.close();
+                        }
+                    });
+                }
+
+                if response.clicked() {
+                    match &target {
+                        ReferenceTarget::Image(id) => {
+                            commands.push(CanvasCommand::OpenImage(id.clone()));
+                        }
+                        ReferenceTarget::ExternalFile(file) => {
+                            commands.push(CanvasCommand::OpenExternalFile(file.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Drag to move (publish the shared payload for cross-canvas
+                // drops), mirroring the card-drag handling below.
+                if response.drag_started() {
+                    let grab_offset = pointer_pos
+                        .map(|pointer| pointer - rect.min)
+                        .unwrap_or_default();
+                    canvas.dragging = Some(DragState {
+                        index,
+                        start_position: canvas.items[index].position,
+                        invalid: false,
+                        reference_id: reference_id.clone(),
+                        grab_offset,
+                    });
+                    egui::DragAndDrop::set_payload(
+                        ui.ctx(),
+                        DragPayload::Reference {
+                            source_container: canvas.container_id.clone(),
+                            reference_id: reference_id.clone(),
+                            target: target.clone(),
+                        },
+                    );
+                }
+                if canvas
+                    .dragging
+                    .as_ref()
+                    .is_some_and(|drag| drag.index == index)
+                    && response.dragged()
+                {
+                    dragged = Some(index);
+                    egui::DragAndDrop::set_payload(
+                        ui.ctx(),
+                        DragPayload::Reference {
+                            source_container: canvas.container_id.clone(),
+                            reference_id: reference_id.clone(),
+                            target: target.clone(),
+                        },
+                    );
+                }
+
+                // Paint the picture with a hover/drag border and a resize handle.
+                let hovering = pointer_pos.is_some_and(|pos| rect.contains(pos));
+                let is_dragging = canvas
+                    .dragging
+                    .as_ref()
+                    .is_some_and(|drag| drag.index == index);
+                let loaded = paint_canvas_image(ui, rect, &canvas.items[index], &title, data);
+
+                if hovering || is_dragging {
+                    let stroke = if is_dragging {
+                        ui.visuals().selection.stroke
+                    } else {
+                        egui::Stroke::new(
+                            1.5,
+                            ui.visuals().selection.stroke.color.gamma_multiply(0.8),
+                        )
+                    };
+                    painter.rect_stroke(
+                        rect,
+                        2.0,
+                        stroke,
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                let _ = loaded;
+
+                // Aspect-locked resize via the bottom-right handle.
+                let handle_size = egui::vec2(12.0, 12.0);
+                let handle_rect = egui::Rect::from_min_size(
+                    rect.max - handle_size,
+                    handle_size,
+                );
+                let handle_id = egui::Id::new((
+                    "canvas-image-resize",
+                    canvas.container_id.as_str(),
+                    reference_id.as_str(),
+                ));
+                let handle = ui.interact(handle_rect, handle_id, egui::Sense::drag());
+                if handle.dragged() {
+                    if let Some(pointer) = pointer_pos {
+                        let pixel = match &target {
+                            ReferenceTarget::Image(id) => data
+                                .workspace
+                                .images
+                                .get(id)
+                                .map(|image| image.pixel_size),
+                            _ => None,
+                        };
+                        let proxy = pixel.unwrap_or_else(|| {
+                            let size = canvas.items[index].size;
+                            [size.x.max(1.0) as u32, size.y.max(1.0) as u32]
+                        });
+                        let new_size = super::image::scale_preserving_size(
+                            proxy,
+                            egui::vec2(
+                                (pointer.x - rect.min.x).max(8.0),
+                                (pointer.y - rect.min.y).max(8.0),
+                            ),
+                        );
+                        canvas.items[index].size =
+                            egui::vec2(new_size[0], new_size[1]);
+                        if let Some(layout) = canvas.layout.items.get_mut(&reference_id) {
+                            layout.size = Some(new_size);
+                        }
+                    }
+                }
+                if handle.drag_stopped() {
+                    canvas.save_layout(data.workspace_store);
+                }
+                if (hovering || handle.dragged()) && !canvas_is_ai_box {
+                    painter.circle_filled(
+                        rect.max - egui::vec2(2.0, 2.0),
+                        4.0,
+                        ui.visuals().selection.stroke.color,
+                    );
+                }
+                continue;
+            }
+            let item = &canvas.items[index];
             let preview_target_for_hover = item.target.clone();
             let label = match kind {
                 ItemKind::Folder => format!("📁 {title}"),
@@ -718,6 +981,7 @@ impl HomePage {
                 ItemKind::AiBox => format!("AI {title}"),
                 ItemKind::Conversation => title,
                 ItemKind::ExternalFile => format!("📄 {title}"),
+                ItemKind::Image => title,
             };
             let galley = layout_title(
                 painter,
@@ -779,6 +1043,7 @@ impl HomePage {
                         Some(PreviewTarget::ExternalFile(file.id.clone()))
                     }
                     ReferenceTarget::Special(_) => None,
+                    ReferenceTarget::Image(_) => None,
                 };
                 if let Some(t) = preview_target {
                     hovered_preview = Some((t, rect));
@@ -957,6 +1222,7 @@ impl HomePage {
                                 ui.close();
                             }
                         }
+                        ReferenceTarget::Image(_) => {}
                     }
                     let last_link = reference_count(data.workspace, &target) == 1;
                     if ui
@@ -990,6 +1256,7 @@ impl HomePage {
                     ReferenceTarget::ExternalFile(file) => {
                         CanvasCommand::OpenExternalFile(file)
                     }
+                    ReferenceTarget::Image(id) => CanvasCommand::OpenImage(id),
                 });
             }
             // Every card (Special included) publishes a drag payload: the
@@ -1323,8 +1590,21 @@ impl HomePage {
                     continue;
                 };
                 let path = path.display().to_string();
-                log::info!("OS file drop -> inserting external file card: {path}");
-                create_external_file(canvas, data, path, position);
+                // Route by actual content: supported images (jpg/png/jpeg) are
+                // inserted as managed images (or external-image cards when over
+                // the inline limit); everything else becomes an external-file
+                // card. The background prepare validates format and limits.
+                if is_supported_image_path(&path) {
+                    log::info!("OS file drop -> inserting image: {path}");
+                    commands.push(CanvasCommand::InsertImagePath {
+                        container: canvas.container_id.clone(),
+                        path,
+                        position,
+                    });
+                } else {
+                    log::info!("OS file drop -> inserting external file card: {path}");
+                    create_external_file(canvas, data, path, position);
+                }
                 // Cascade additional files below the previous one.
                 position = position.map(|[x, y]| [x, y + 36.0]);
             }
@@ -1388,8 +1668,14 @@ impl HomePage {
                         // Conversation cards cannot be picked up to the
                         // clipboard; this arm is unreachable.
                         ReferenceTarget::Conversation(_) => "Conversation",
-                        ReferenceTarget::ExternalFile(file) => file.title.as_str(),
-                    };
+ReferenceTarget::ExternalFile(file) => file.title.as_str(),
+                        ReferenceTarget::Image(id) => data
+                            .workspace
+                            .images
+                            .get(id)
+                            .map(|img| img.title.as_str())
+                            .unwrap_or("Image"),
+                        };
                     let verb = match entry.semantics {
                         ClipboardSemantics::Link => "Paste (Link)",
                         ClipboardSemantics::Move => "Paste (Move)",
@@ -1423,6 +1709,17 @@ impl HomePage {
                     commands.push(CanvasCommand::OpenFileInsertDialog(
                         canvas.container_id.clone(),
                     ));
+                    ui.close();
+                }
+                // Images are not part of the AI workbench model yet: they can
+                // only be inserted into ordinary containers.
+                if !data.workspace.is_ai_box(&canvas.container_id)
+                    && ui.button("Insert Image…").clicked()
+                {
+                    commands.push(CanvasCommand::ChooseImage {
+                        container: canvas.container_id.clone(),
+                        position: anchor,
+                    });
                     ui.close();
                 }
                 if ui.button("New Text").clicked() {
@@ -1503,7 +1800,8 @@ pub(super) fn container_preview_cards(
             ReferenceTarget::Container(id) => data.workspace.containers.contains_key(id),
             ReferenceTarget::Special(_)
             | ReferenceTarget::Conversation(_)
-            | ReferenceTarget::ExternalFile(_) => true,
+            | ReferenceTarget::ExternalFile(_)
+            | ReferenceTarget::Image(_) => true,
         })
         .collect();
     let cards: Vec<PreviewCard> = members
@@ -1959,6 +2257,8 @@ pub(super) enum ItemKind {
     Conversation,
     /// An inserted external file (PDF, Markdown, …), opened externally on click.
     ExternalFile,
+    /// A managed image attachment displayed directly on the canvas.
+    Image,
 }
 
 pub(super) fn item_label(
@@ -1981,7 +2281,19 @@ pub(super) fn item_label(
         ReferenceTarget::Special(special) => (special.label(), ItemKind::Special),
         // External file cards are self-contained: the title travels with the
         // reference (renamed via the card's context menu).
-        ReferenceTarget::ExternalFile(file) => (file.title.as_str(), ItemKind::ExternalFile),
+        ReferenceTarget::ExternalFile(file) => {
+            // Over-limit images are recorded as external file references but
+            // rendered as images on the canvas.
+            if file
+                .media_type
+                .as_deref()
+                .is_some_and(|media| media.starts_with("image/"))
+            {
+                (file.title.as_str(), ItemKind::Image)
+            } else {
+                (file.title.as_str(), ItemKind::ExternalFile)
+            }
+        }
         // The conversation title is resolved from the AI sidecar store when the
         // canvas is rendered inside an AI box; the placeholder keeps the card
         // renderable even if the sidecar entry is missing.
@@ -1992,6 +2304,10 @@ pub(super) fn item_label(
                 .map(|conversation| conversation.title.as_str())
                 .unwrap_or("Conversation");
             (title, ItemKind::Conversation)
+        }
+        ReferenceTarget::Image(id) => {
+            let image = workspace.images.get(id)?;
+            (image.title.as_str(), ItemKind::Image)
         }
     };
     (!title.is_empty()).then(|| (title.to_owned(), kind))
@@ -2013,6 +2329,7 @@ fn create_external_file(
         id: ExternalFileId::new(),
         title: file_stem(&path),
         path,
+        media_type: None,
     };
     let is_ai_box = data.workspace.is_ai_box(&canvas.container_id);
     let result = if is_ai_box {
@@ -2037,6 +2354,8 @@ fn create_external_file(
         CardLayout {
             position,
             color: None,
+            size: None,
+            image_fit: None,
         },
     );
     let _ = data.workspace_store.save_layout(&canvas.layout);
@@ -2075,6 +2394,8 @@ fn create_snippet(
         CardLayout {
             position,
             color: None,
+            size: None,
+            image_fit: None,
         },
     );
     let _ = data.workspace_store.save_layout(&canvas.layout);
@@ -2109,6 +2430,8 @@ fn create_folder(
         CardLayout {
             position,
             color: None,
+            size: None,
+            image_fit: None,
         },
     );
     let _ = data.workspace_store.save_layout(&canvas.layout);
@@ -2171,6 +2494,7 @@ pub(super) fn clipboard_valid_for(
         // External files can now be linked into AI boxes as model-readable
         // sources; their content is extracted at conversation time.
         ReferenceTarget::ExternalFile(_) => true,
+        ReferenceTarget::Image(_) => true,
     }
 }
 
@@ -2204,6 +2528,7 @@ pub(super) fn drop_valid_for(
         // External files can now be linked into AI boxes as model-readable
         // sources; their content is extracted at conversation time.
         ReferenceTarget::ExternalFile(_) => true,
+        ReferenceTarget::Image(_) => true,
     }
 }
 
@@ -2238,6 +2563,12 @@ fn render_clipboard_status(ui: &mut egui::Ui, data: &mut CanvasData<'_>) {
         ReferenceTarget::Special(special) => special.label().to_owned(),
         // Conversation cards cannot be picked up to the clipboard; unreachable.
         ReferenceTarget::Conversation(_) => "Conversation".to_owned(),
+        ReferenceTarget::Image(id) => data
+            .workspace
+            .images
+            .get(id)
+            .map(|img| img.title.clone())
+            .unwrap_or_else(|| "Image".to_owned()),
     };
     let verb = match entry.semantics {
         ClipboardSemantics::Link => "Link",
@@ -2570,6 +2901,100 @@ pub(super) fn delete_text(
 
 fn card_rect(item: &CanvasItem) -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2(item.position[0], item.position[1]), item.size)
+}
+
+/// Whether a file path looks like a supported image (jpg/jpeg/png). Actual
+/// validation (magic bytes, limits) happens in the background prepare step.
+fn is_supported_image_path(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    matches!(ext.as_deref(), Some("jpg") | Some("jpeg") | Some("png"))
+}
+
+/// Resolves the bytes of an image item (managed attachment or over-limit
+/// external image), populating the shared cache on first access. Returns the
+/// `ImageSource` ready for painting, or `None` when the file is missing/corrupt.
+fn image_source_for(
+    data: &mut CanvasData<'_>,
+    item: &CanvasItem,
+) -> Option<egui::ImageSource<'static>> {
+    match &item.target {
+        ReferenceTarget::Image(id) => {
+            let image = data.workspace.images.get(id)?.clone();
+            let key = super::image::ImageBytesKey::Attachment(image.id.clone());
+            let bytes = if let Some(bytes) = data.image_cache.get(&key) {
+                bytes
+            } else {
+                let raw = super::image::load_attachment_bytes(data.attachment_store, &image).ok()?;
+                let bytes: egui::load::Bytes = raw.into();
+                data.image_cache.insert(key, bytes.clone());
+                bytes
+            };
+            Some(super::image::attachment_source(&image, bytes))
+        }
+        ReferenceTarget::ExternalFile(file) => {
+            if !file
+                .media_type
+                .as_deref()
+                .is_some_and(|media| media.starts_with("image/"))
+            {
+                return None;
+            }
+            let key = super::image::ImageBytesKey::External(file.id.clone());
+            let bytes = if let Some(bytes) = data.image_cache.get(&key) {
+                bytes
+            } else {
+                let raw = super::image::load_external_bytes(file).ok()?;
+                let bytes: egui::load::Bytes = raw.into();
+                data.image_cache.insert(key, bytes.clone());
+                bytes
+            };
+            Some(super::image::external_source(file, bytes))
+        }
+        _ => None,
+    }
+}
+
+/// Paints one image item at `rect`: the image content (or a missing-file
+/// placeholder). Returns whether the image content is currently available.
+fn paint_canvas_image(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    item: &CanvasItem,
+    title: &str,
+    data: &mut CanvasData<'_>,
+) -> bool {
+    let painter = ui.painter();
+    let visuals = ui.visuals();
+    match image_source_for(data, item) {
+        Some(source) => {
+            let image = egui::Image::new(source)
+                .texture_options(egui::TextureOptions::LINEAR)
+                .fit_to_exact_size(rect.size());
+            image.paint_at(ui, rect);
+            true
+        }
+        None => {
+            // Missing/corrupt placeholder: same rect so layout never jumps.
+            painter.rect_filled(rect, 3.0, visuals.extreme_bg_color.gamma_multiply(0.6));
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "⚠",
+                egui::FontId::proportional(18.0),
+                visuals.weak_text_color(),
+            );
+            let galley = layout_title(painter, title, rect.width() - 8.0, visuals.weak_text_color(), 11.0);
+            painter.galley(
+                rect.min + egui::vec2(4.0, rect.height() - galley.size().y - 4.0),
+                galley,
+                visuals.weak_text_color(),
+            );
+            false
+        }
+    }
 }
 
 /// Whether `rect` overlaps any card or any text, excluding the dragged element

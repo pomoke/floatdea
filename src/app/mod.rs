@@ -4,11 +4,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use eframe::{App, egui};
+use egui::TextBuffer;
 use tokio::sync::mpsc;
 
+use floatdea::data::attachment::{self, AttachmentStore, ImageError, PreparedImage};
 use floatdea::data::{
-    ContainerId, ContainerKind, ConversationId, EntityId, ExternalFileId, ReferenceId, Snippet,
-    TextId, TurnTaskId,
+    AttachmentId, ContainerId, ContainerKind, ConversationId, EntityId, ExternalFileId, ReferenceId,
+    Snippet, TextId, TurnTaskId,
     ai::{
         AiBoxData, AiErrorKind, AiStore, AiWorker, BoundSource, ChatMessage, ChatProvider,
         ChatRequest, Conversation, Message, MessageRole, MessageStatus, ProviderKind,
@@ -16,16 +18,18 @@ use floatdea::data::{
         ToolRegistry, ToolStatus, TurnEvent, TurnIdentity, TurnRequest, build_provider,
         content_hash, now_unix,
     },
+    markdown_targets::{LocalMarkdownTarget, parse_attachment_link, parse_local_markdown_targets},
     settings::{Settings, SettingsStore, ThemeSetting, WindowMode},
     storage::SnippetStore,
     workspace::{
-        CanvasText, CardLayout, Container, ContainerLayout, ExternalFileRef, MemberRole,
-        Reference, ReferenceTarget, SpecialKind, Workspace, WorkspaceStore,
+        CanvasText, CardLayout, Container, ContainerLayout, ExternalFileRef, ImageAttachment,
+        MemberRole, Reference, ReferenceTarget, SpecialKind, Workspace, WorkspaceStore,
     },
 };
 
 mod ai_chat;
 mod canvas;
+mod image;
 mod math;
 mod settings;
 mod snippet;
@@ -112,6 +116,19 @@ pub(crate) struct HomePage {
     /// a thread is spawned to run the blocking `rfd` file dialog. The result is
     /// received here on the next frame and processed immediately.
     pending_file_picker: Option<ExternalFilePending>,
+    /// Pending image insert: a background thread runs the file dialog and
+    /// validates/prepares the picked image. The result (managed attachment or
+    /// over-limit fallback) is committed here on the next frame.
+    pending_image: Option<ImagePending>,
+    /// Bytes cache for rendered images (managed attachments and over-limit
+    /// external image files), keyed by id. Texture decoding is cached by egui.
+    image_cache: image::ImageBytesCache,
+    /// The open in-app image viewer, if any.
+    image_viewer: Option<image::ImageViewer>,
+    /// Transient image error toast: message, originating viewport, frames left.
+    image_error: Option<(String, egui::ViewportId, u32)>,
+    /// Managed image attachment store (reads/writes `attachments/`).
+    attachment_store: AttachmentStore,
     /// Cache of extracted text content for external files, keyed by
     /// `ExternalFileId`. Populated in the background after a conversation is
     /// created, so PDF extraction never blocks the UI thread. Uses `Mutex` for
@@ -126,6 +143,39 @@ pub(crate) struct HomePage {
 struct ExternalFilePending {
     container: ContainerId,
     rx: std::sync::mpsc::Receiver<Option<String>>,
+}
+
+/// Where an in-flight image insert should land when the background thread
+/// finishes validating the picked file.
+#[derive(Clone, Debug)]
+enum ImageInsertTarget {
+    Canvas {
+        container: ContainerId,
+        position: Option<[f32; 2]>,
+    },
+    Snippet {
+        view_id: u64,
+        cursor: usize,
+    },
+}
+
+/// A background image-pick result: either a prepared managed attachment, or an
+/// over-limit image path that must be inserted as an external file card.
+enum PickedImage {
+    /// The file dialog was cancelled; nothing to do.
+    Cancelled,
+    /// The file exceeds the inline size limit; insert as an external image.
+    OverLimit(String),
+    /// A validated managed attachment ready to commit.
+    Managed(PreparedImage),
+}
+
+/// State of an in-flight image insert. The background thread runs the blocking
+/// file dialog and `AttachmentStore::prepare_image` (size check, decode,
+/// hash), sending the result over a channel.
+struct ImagePending {
+    target: ImageInsertTarget,
+    rx: std::sync::mpsc::Receiver<Result<PickedImage, ImageError>>,
 }
 
 /// State of the global search window. Like the rename/delete dialogs, the
@@ -247,6 +297,17 @@ struct LinkPicker {
     embed: bool,
 }
 
+/// State of the "Insert Existing Image…" picker for a snippet viewport.
+#[derive(Clone, Debug)]
+struct ImagePicker {
+    /// Char index in the note body where the image is inserted.
+    cursor: usize,
+    /// Substring filter over image titles.
+    filter: String,
+    /// Focus the filter field only once when the picker opens (IME-safe).
+    focus_requested: bool,
+}
+
 /// Display mode of a snippet viewport.
 #[derive(Debug)]
 struct View {
@@ -266,9 +327,14 @@ struct View {
     mode_menu: Option<egui::Pos2>,
     /// Transient: open "Insert Link…" picker, if any.
     link_picker: Option<LinkPicker>,
+    /// Transient: open "Insert Existing Image…" picker, if any.
+    image_picker: Option<ImagePicker>,
     /// Transient: last broken-link click error (message + remaining frames),
     /// auto-dismissed after a short while.
     link_error: Option<(String, u32)>,
+    /// Transient: an external URL awaiting confirmation before it is opened in
+    /// the browser. Set when the user clicks an external link in a preview.
+    pending_external: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -292,6 +358,12 @@ enum RenameTarget {
         id: ExternalFileId,
         origin: egui::ViewportId,
     },
+    /// Rename the display title of a managed image attachment (the attachment
+    /// file name is never changed).
+    Image {
+        id: AttachmentId,
+        origin: egui::ViewportId,
+    },
 }
 
 impl RenameTarget {
@@ -300,7 +372,8 @@ impl RenameTarget {
             RenameTarget::Snippet { origin, .. }
             | RenameTarget::Folder { origin, .. }
             | RenameTarget::Conversation { origin, .. }
-            | RenameTarget::ExternalFile { origin, .. } => *origin,
+            | RenameTarget::ExternalFile { origin, .. }
+            | RenameTarget::Image { origin, .. } => *origin,
         }
     }
 }
@@ -371,6 +444,13 @@ enum ViewAction {
     /// Open another snippet, requested by clicking a local markdown link in a
     /// preview pane.
     OpenSnippet(EntityId),
+    /// Spawn the file dialog to insert a new image at the recorded cursor.
+    ChooseSnippetImage {
+        view_id: u64,
+        cursor: usize,
+    },
+    /// Open the in-app image viewer for a managed attachment.
+    OpenImage(AttachmentId),
 }
 
 #[derive(Debug)]
@@ -518,16 +598,45 @@ enum CanvasCommand {
     OpenExternalFile(ExternalFileRef),
     /// Open the rename dialog for an external-file card's display title.
     RenameExternalFile(ExternalFileId),
+    /// Open the image viewer for a managed image attachment.
+    OpenImage(AttachmentId),
+    /// Open the file dialog to insert an image into `container` at `position`
+    /// (a free default slot when `None`). The picked image becomes a managed
+    /// attachment (or an external-image card when over the inline size limit).
+    ChooseImage {
+        container: ContainerId,
+        position: Option<[f32; 2]>,
+    },
+    /// Insert an image already known to be a supported image path (OS drop).
+    /// Routing/validation runs in a background thread; the result lands on the
+    /// canvas as a managed image or an external-image card.
+    InsertImagePath {
+        container: ContainerId,
+        path: String,
+        position: Option<[f32; 2]>,
+    },
+    /// Reset an image reference to its default bounding box.
+    ResetImageSize(ReferenceId),
+    /// Open the rename dialog for an image attachment's display title.
+    RenameImage(AttachmentId),
 }
 
 impl ContainerCanvas {
     fn save_layout(&mut self, store: &WorkspaceStore) {
         for item in &self.items {
+            let size = match &item.target {
+                ReferenceTarget::Image(_) => {
+                    Some([item.size.x, item.size.y])
+                }
+                _ => None,
+            };
             self.layout.items.insert(
                 item.reference_id.clone(),
                 CardLayout {
                     position: item.position,
                     color: None,
+                    size,
+                    image_fit: None,
                 },
             );
         }
@@ -638,6 +747,8 @@ impl HomePage {
         let workspace = workspace_store
             .load_or_initialize(&snippets)
             .expect("failed to load workspace metadata");
+        let attachment_store =
+            AttachmentStore::open(&workspace_path).expect("failed to open attachment store");
         let settings_store =
             SettingsStore::open(&workspace_path).expect("failed to open settings store");
         let settings = settings_store.load();
@@ -697,6 +808,11 @@ impl HomePage {
             external_open_error: None,
             os_file_drop_consumed: false,
             pending_file_picker: None,
+            pending_image: None,
+            image_cache: image::ImageBytesCache::default(),
+            image_viewer: None,
+            image_error: None,
+            attachment_store,
             file_content_cache: Arc::new(Mutex::new(HashMap::new())),
             hover_preview: HoverPreview::default(),
         }
@@ -725,18 +841,38 @@ impl HomePage {
                 // file itself may be missing, the card still opens it on click).
                 ReferenceTarget::Special(_)
                 | ReferenceTarget::Conversation(_)
-                | ReferenceTarget::ExternalFile(_) => true,
+                | ReferenceTarget::ExternalFile(_)
+                | ReferenceTarget::Image(_) => true,
             })
             .enumerate()
-            .map(|(index, reference)| CanvasItem {
-                reference_id: reference.id.clone(),
-                target: reference.target.clone(),
-                role: reference.role,
-                position: layout
-                    .items
-                    .get(&reference.id)
-                    .map_or_else(|| default_card_position(index), |item| item.position),
-                size: egui::vec2(CARD_WIDTH, 25.0),
+            .map(|(index, reference)| {
+                let layout_item = layout.items.get(&reference.id);
+                let mut size = egui::vec2(CARD_WIDTH, 25.0);
+                if let ReferenceTarget::Image(id) = &reference.target {
+                    size = layout_item
+                        .and_then(|item| item.size)
+                        .map(|[w, h]| egui::vec2(w, h))
+                        .or_else(|| {
+                            workspace
+                                .images
+                                .get(id)
+                                .map(|image| {
+                                    let s = image::default_image_size(image.pixel_size);
+                                    egui::vec2(s[0], s[1])
+                                })
+                        })
+                        .unwrap_or_else(|| egui::vec2(CARD_WIDTH, 25.0));
+                }
+                CanvasItem {
+                    reference_id: reference.id.clone(),
+                    target: reference.target.clone(),
+                    role: reference.role,
+                    position: layout_item.map_or_else(
+                        || default_card_position(index),
+                        |item| item.position,
+                    ),
+                    size,
+                }
             })
             .collect();
 
@@ -779,7 +915,9 @@ impl HomePage {
             focus_edit: false,
             mode_menu: None,
             link_picker: None,
+            image_picker: None,
             link_error: None,
+            pending_external: None,
         });
     }
 
@@ -802,7 +940,9 @@ impl HomePage {
             focus_edit: false,
             mode_menu: None,
             link_picker: None,
+            image_picker: None,
             link_error: None,
+            pending_external: None,
         });
     }
 
@@ -955,6 +1095,9 @@ impl HomePage {
                         RenameTarget::ExternalFile { id, .. } => {
                             self.rename_external_file(id, new_title)
                         }
+                        RenameTarget::Image { id, .. } => {
+                            self.rename_image(id, new_title)
+                        }
                     };
                     if ok {
                         self.rename_dialog.pending = None;
@@ -1074,6 +1217,47 @@ impl HomePage {
                         self.rename_dialog.focus_requested = false;
                     }
                 }
+                CanvasCommand::OpenImage(id) => self.open_image(&id, origin),
+                CanvasCommand::ChooseImage {
+                    container,
+                    position,
+                } => self.spawn_image_picker(ImageInsertTarget::Canvas {
+                    container,
+                    position,
+                }),
+                CanvasCommand::InsertImagePath {
+                    container,
+                    path,
+                    position,
+                } => {
+                    if path_has_image_extension(&path) {
+                        self.spawn_image_prepare(
+                            ImageInsertTarget::Canvas {
+                                container,
+                                position,
+                            },
+                            Some(std::path::PathBuf::from(&path)),
+                        );
+                    } else {
+                        // Not a supported image: fall back to an external file
+                        // card exactly as before.
+                        let file = ExternalFileRef {
+                            id: ExternalFileId::new(),
+                            title: file_stem(&path),
+                            path,
+                            media_type: None,
+                        };
+                        self.insert_external_file(&container, file, position);
+                    }
+                }
+                CanvasCommand::ResetImageSize(reference) => self.reset_image_size(&reference),
+                CanvasCommand::RenameImage(id) => {
+                    if let Some(image) = self.workspace.images.get(&id) {
+                        self.rename_dialog.buffer = image.title.clone();
+                        self.rename_dialog.pending = Some(RenameTarget::Image { id, origin });
+                        self.rename_dialog.focus_requested = false;
+                    }
+                }
             }
         }
     }
@@ -1168,6 +1352,9 @@ impl HomePage {
             // External-file cards are deleted without confirmation (see the
             // `DeleteReference` command), so the dialog never opens for them.
             ReferenceTarget::ExternalFile(_) => {}
+            // Image references are removed without confirmation (the
+            // attachment file is never deleted by removing a reference).
+            ReferenceTarget::Image(_) => {}
         }
         self.pending_delete = None;
     }
@@ -1237,6 +1424,8 @@ impl HomePage {
                 CardLayout {
                     position,
                     color: None,
+                    size: None,
+                    image_fit: None,
                 },
             );
             canvas.save_layout(&self.workspace_store);
@@ -1313,6 +1502,366 @@ impl HomePage {
         }
     }
 
+    // ---- Managed image attachments ----
+
+    /// Spawns a background thread that runs the blocking file dialog and
+    /// validates/prepares the picked image, then stores the receiver so the
+    /// result is committed on the next frame.
+    fn spawn_image_picker(&mut self, target: ImageInsertTarget) {
+        self.spawn_image_prepare(target, None);
+    }
+
+    /// Like [`Self::spawn_image_picker`] but prepares a known path instead of
+    /// running the file dialog (used by OS file drops).
+    fn spawn_image_prepare(
+        &mut self,
+        target: ImageInsertTarget,
+        path: Option<std::path::PathBuf>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = self.workspace_store_root();
+        std::thread::spawn(move || {
+            let picked = match path {
+                Some(path) => Some(path),
+                None => rfd::FileDialog::new()
+                    .add_filter("Images", &["jpg", "jpeg", "png"])
+                    .pick_file(),
+            };
+            let result = match picked {
+                None => Ok(PickedImage::Cancelled),
+                Some(path) => {
+                    let source = path.to_path_buf();
+                    let meta = std::fs::metadata(&source);
+                    let over_limit = meta
+                        .map(|m| m.len() > attachment::MAX_INLINE_IMAGE_BYTES)
+                        .unwrap_or(false);
+                    if over_limit {
+                        Ok(PickedImage::OverLimit(path.display().to_string()))
+                    } else {
+                        let store = AttachmentStore::open(root).expect("attachment store");
+                        match store.prepare_image(&source) {
+                            Ok(prepared) => Ok(PickedImage::Managed(prepared)),
+                            Err(ImageError::OverInlineLimit(_)) => {
+                                Ok(PickedImage::OverLimit(path.display().to_string()))
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
+            };
+            let _ = tx.send(result);
+        });
+        self.pending_image = Some(ImagePending { target, rx });
+    }
+
+    /// Returns the workspace root path used by the background image thread.
+    fn workspace_store_root(&self) -> std::path::PathBuf {
+        // `WorkspaceStore` keeps its root private; the attachment store is
+        // constructed from the same root in `HomePage::new`, so mirror it via
+        // the attachment store's attachments directory parent.
+        self.attachment_store
+            .attachments_dir()
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Opens the in-app viewer for a managed image attachment.
+    fn open_image(&mut self, id: &AttachmentId, origin: egui::ViewportId) {
+        let Some(image) = self.workspace.images.get(id).cloned() else {
+            self.image_error = Some((
+                "This image no longer exists in the workspace.".to_owned(),
+                origin,
+                180,
+            ));
+            return;
+        };
+        let key = image::ImageBytesKey::Attachment(image.id.clone());
+        let bytes = if let Some(bytes) = self.image_cache.get(&key) {
+            bytes
+        } else {
+            match self.attachment_store.read(&image) {
+                Ok(raw) => {
+                    let bytes: egui::load::Bytes = raw.into();
+                    self.image_cache.insert(key.clone(), bytes.clone());
+                    bytes
+                }
+                Err(_) => {
+                    self.image_error = Some((
+                        format!("Could not read image \"{}\".", image.title),
+                        origin,
+                        180,
+                    ));
+                    return;
+                }
+            }
+        };
+        let uri = image::attachment_uri(&image);
+        let original_path = self
+            .attachment_store
+            .image_path(&image)
+            .to_str()
+            .map(str::to_owned);
+        self.image_viewer = Some(image::ImageViewer::new(
+            key,
+            image.title,
+            uri,
+            bytes,
+            Some(image.pixel_size),
+            Some(image.byte_len),
+            original_path,
+        ));
+    }
+
+    /// Commits a prepared managed image into the workspace and (for canvas
+    /// targets) creates the reference + layout. For snippet targets the caller
+    /// inserts the Markdown reference.
+    fn commit_prepared_image(
+        &mut self,
+        prepared: PreparedImage,
+    ) -> Option<AttachmentId> {
+        let committed = self.attachment_store.commit(prepared).ok()?;
+        let id = committed.id.clone();
+        if self.workspace.add_image(committed).is_err() {
+            return None;
+        }
+        let _ = self.workspace_store.save(&self.workspace);
+        Some(id)
+    }
+
+    /// Inserts a managed image reference into a canvas at `position`.
+    fn insert_image_reference(
+        &mut self,
+        container: &ContainerId,
+        id: &AttachmentId,
+        position: Option<[f32; 2]>,
+    ) {
+        let is_ai_box = self.workspace.is_ai_box(container);
+        let Ok(reference_id) = self.workspace.add_image_reference(container, id.clone()) else {
+            return;
+        };
+        let _ = self.workspace_store.save(&self.workspace);
+        let position = position.unwrap_or_else(|| {
+            self.canvas_for(container)
+                .map(|canvas| {
+                    canvas::default_position_for(
+                        container,
+                        &canvas.items,
+                        &self.all_snippets,
+                        &self.workspace,
+                        &self.ai_boxes,
+                        &canvas::approx_text_rects(&canvas.texts),
+                    )
+                })
+                .unwrap_or_else(|| default_card_position(0))
+        });
+        let image = self.workspace.images.get(id);
+        let size = image
+            .map(|img| image::default_image_size(img.pixel_size))
+            .unwrap_or([image::IMAGE_DEFAULT_WIDTH, image::IMAGE_DEFAULT_WIDTH]);
+        let target_canvas = if container == &self.root.container_id {
+            Some(&mut self.root)
+        } else {
+            self.folder_views.get_mut(container)
+        };
+        if let Some(canvas) = target_canvas {
+            let role = if is_ai_box { MemberRole::Source } else { MemberRole::Normal };
+            canvas.items.push(CanvasItem {
+                reference_id: reference_id.clone(),
+                target: ReferenceTarget::Image(id.clone()),
+                role,
+                position,
+                size: egui::vec2(size[0], size[1]),
+            });
+            canvas.layout.items.insert(
+                reference_id,
+                CardLayout {
+                    position,
+                    color: None,
+                    size: Some(size),
+                    image_fit: None,
+                },
+            );
+            canvas.save_layout(&self.workspace_store);
+        }
+    }
+
+    /// Inserts an over-limit image as an external-file card (absolute path only,
+    /// no copy, never exported/imported), rendered as an image on the canvas.
+    fn insert_over_limit_image(
+        &mut self,
+        container: &ContainerId,
+        path: String,
+        position: Option<[f32; 2]>,
+    ) {
+        let media_type = image_ext_as_media_type(&path);
+        let file = ExternalFileRef {
+            id: ExternalFileId::new(),
+            title: file_stem(&path),
+            path,
+            media_type,
+        };
+        self.insert_external_file(container, file, position);
+    }
+
+    /// Polls the in-flight image picker result and commits it. Both canvas and
+    /// snippet targets are handled here so late results can never land in the
+    /// wrong window.
+    fn poll_pending_image(&mut self) {
+        let Some(pending) = self.pending_image.as_ref() else {
+            return;
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending_image = None;
+                return;
+            }
+        };
+        let target = pending.target.clone();
+        self.pending_image = None;
+
+        let picked = match result {
+            Ok(picked) => picked,
+            Err(error) => {
+                self.image_error = Some((
+                    format!("Could not insert image: {error}"),
+                    egui::ViewportId::ROOT,
+                    180,
+                ));
+                return;
+            }
+        };
+        match picked {
+            PickedImage::Cancelled => {}
+            PickedImage::OverLimit(path) => match target {
+                ImageInsertTarget::Canvas { container, position } => {
+                    self.insert_over_limit_image(&container, path, position);
+                }
+                ImageInsertTarget::Snippet { .. } => {
+                    self.image_error = Some((
+                        "This image is larger than 20 MB and cannot be embedded in a note; try inserting it onto a canvas instead.".to_owned(),
+                        egui::ViewportId::ROOT,
+                        240,
+                    ));
+                }
+            },
+            PickedImage::Managed(prepared) => {
+                let Some(id) = self.commit_prepared_image(prepared) else {
+                    self.image_error = Some((
+                        "Could not save the image into the workspace.".to_owned(),
+                        egui::ViewportId::ROOT,
+                        180,
+                    ));
+                    return;
+                };
+                match target {
+                    ImageInsertTarget::Canvas { container, position } => {
+                        self.insert_image_reference(&container, &id, position);
+                    }
+                    ImageInsertTarget::Snippet { view_id, cursor } => {
+                        self.insert_image_markdown(&id, view_id, cursor);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Inserts `![title](attachments/{id}.{ext})` into the snippet that opened
+    /// the insert request, at the recorded char cursor.
+    fn insert_image_markdown(&mut self, id: &AttachmentId, view_id: u64, cursor: usize) {
+        let Some(image) = self.workspace.images.get(id) else {
+            return;
+        };
+        let view = self.views.iter_mut().find(|view| view.id == view_id);
+        let Some(view) = view else {
+            return;
+        };
+        let Some(snippet) = self.all_snippets.get_mut(&view.entity_id) else {
+            return;
+        };
+        let rel = &image.relative_path;
+        let alt = markdown_alt_text(&image.title);
+        let markdown = format!("![{alt}]({rel})");
+        let index = cursor.min(snippet.content.chars().count());
+        snippet
+            .content
+            .insert_text(&markdown, egui::text::CharIndex(index));
+        let _ = self.store.save(snippet);
+    }
+
+    /// Renames the **display title** of an image attachment. The attachment
+    /// file name and the Markdown references never change.
+    fn rename_image(&mut self, id: &AttachmentId, new_title: String) -> bool {
+        let new_title = new_title.trim().to_owned();
+        if new_title.is_empty() {
+            return false;
+        }
+        let Some(image) = self.workspace.images.get_mut(id) else {
+            return false;
+        };
+        image.title = new_title.clone();
+        // Keep open canvas items in sync (they cache a clone of the title via
+        // `workspace.images`, which they read live each frame — no extra sync).
+        let _ = self.workspace_store.save(&self.workspace);
+        true
+    }
+
+    /// Resets an image reference's display size to its default bounding box.
+    fn reset_image_size(&mut self, reference: &ReferenceId) {
+        let mut found: Option<(ContainerId, AttachmentId)> = None;
+        for (container_id, canvas) in [(&self.root.container_id, &self.root)]
+            .into_iter()
+            .chain(self.folder_views.iter().map(|(id, c)| (id, c)))
+        {
+            if let Some(item) = canvas.items.iter().find(|item| &item.reference_id == reference) {
+                if let ReferenceTarget::Image(id) = &item.target {
+                    found = Some((container_id.clone(), id.clone()));
+                    break;
+                }
+            }
+        }
+        let Some((container_id, id)) = found else {
+            return;
+        };
+        let Some(pixel) = self.workspace.images.get(&id).map(|i| i.pixel_size) else {
+            return;
+        };
+        let size = image::default_image_size(pixel);
+        let target_canvas = if container_id == self.root.container_id {
+            Some(&mut self.root)
+        } else {
+            self.folder_views.get_mut(&container_id)
+        };
+        if let Some(canvas) = target_canvas {
+            if let Some(item) = canvas
+                .items
+                .iter_mut()
+                .find(|item| &item.reference_id == reference)
+            {
+                item.size = egui::vec2(size[0], size[1]);
+            }
+            if let Some(layout) = canvas.layout.items.get_mut(reference) {
+                layout.size = Some(size);
+            }
+            canvas.save_layout(&self.workspace_store);
+        }
+    }
+
+    /// Returns the canvas item size (and persisted layout size) for a target.
+    /// Image references use their default bounding box; everything else uses the
+    /// fixed card size.
+    fn card_size_for(&self, target: &ReferenceTarget) -> (egui::Vec2, Option<[f32; 2]>) {
+        if let ReferenceTarget::Image(id) = target {
+            if let Some(image) = self.workspace.images.get(id) {
+                let size = image::default_image_size(image.pixel_size);
+                return (egui::vec2(size[0], size[1]), Some(size));
+            }
+        }
+        (egui::vec2(CARD_WIDTH, 25.0), None)
+    }
+
     // ---- AI workbench operations (阶段 1: no-model workbench) ----
 
     /// Creates a new AI box container and places its card in `owner`'s canvas.
@@ -1360,6 +1909,8 @@ impl HomePage {
                 CardLayout {
                     position,
                     color: None,
+                    size: None,
+                    image_fit: None,
                 },
             );
             canvas.save_layout(&self.workspace_store);
@@ -1479,6 +2030,8 @@ impl HomePage {
                 CardLayout {
                     position,
                     color: None,
+                    size: None,
+                    image_fit: None,
                 },
             );
             canvas.save_layout(&self.workspace_store);
@@ -1528,6 +2081,8 @@ impl HomePage {
                 CardLayout {
                     position,
                     color: None,
+                    size: None,
+                    image_fit: None,
                 },
             );
             canvas.save_layout(&self.workspace_store);
@@ -1671,6 +2226,15 @@ impl HomePage {
                 };
                 id
             }
+            ReferenceTarget::Image(id) => {
+                if is_ai_box {
+                    return false;
+                }
+                let Ok(id) = self.workspace.add_image_reference(container, id.clone()) else {
+                    return false;
+                };
+                id
+            }
         };
         let role = if is_ai_box {
             MemberRole::Source
@@ -1687,6 +2251,7 @@ impl HomePage {
                 &canvas::approx_text_rects(&canvas.texts),
             )
         });
+        let (size, layout_size) = self.card_size_for(&entry.target);
         let target_canvas = if container == &self.root.container_id {
             Some(&mut self.root)
         } else {
@@ -1699,13 +2264,15 @@ impl HomePage {
                 target: entry.target.clone(),
                 role,
                 position,
-                size: egui::vec2(CARD_WIDTH, 25.0),
+                size,
             });
             canvas.layout.items.insert(
                 new_reference_id,
                 CardLayout {
                     position,
                     color: None,
+                    size: layout_size,
+                    image_fit: None,
                 },
             );
             canvas.save_layout(&self.workspace_store);
@@ -1810,6 +2377,15 @@ impl HomePage {
                 };
                 id
             }
+            ReferenceTarget::Image(id) => {
+                if is_ai_box {
+                    return false;
+                }
+                let Ok(id) = self.workspace.add_image_reference(container, id.clone()) else {
+                    return false;
+                };
+                id
+            }
         };
         let role = if is_ai_box {
             MemberRole::Source
@@ -1833,6 +2409,7 @@ impl HomePage {
                 )
             }
         };
+        let (size, layout_size) = self.card_size_for(&target);
         let target_canvas = if container == &self.root.container_id {
             Some(&mut self.root)
         } else {
@@ -1844,13 +2421,15 @@ impl HomePage {
                 target: target.clone(),
                 role,
                 position,
-                size: egui::vec2(CARD_WIDTH, 25.0),
+                size,
             });
             canvas.layout.items.insert(
                 new_reference_id.clone(),
                 CardLayout {
                     position,
                     color: None,
+                    size: layout_size,
+                    image_fit: None,
                 },
             );
             canvas.save_layout(&self.workspace_store);
@@ -1865,6 +2444,8 @@ impl HomePage {
                 CardLayout {
                     position,
                     color: None,
+                    size: None,
+                    image_fit: None,
                 },
             );
             let _ = self.workspace_store.save_layout(&layout);
@@ -2177,6 +2758,29 @@ fn render_external_open_error(ui: &egui::Ui, state: &Option<(String, egui::Viewp
         });
 }
 
+impl HomePage {
+    /// Counts down and renders the transient image error toast.
+    fn render_image_error(&mut self, ctx: &egui::Context) {
+        let Some((message, origin, frames)) = &mut self.image_error else {
+            return;
+        };
+        if *frames == 0 {
+            self.image_error = None;
+            return;
+        }
+        *frames -= 1;
+        egui::Window::new("image-error")
+            .id(egui::Id::new(("image-error", *origin)))
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -44.0))
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .show(ctx, |ui| {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+            });
+    }
+}
+
 /// Opens `path` with the operating system's default application
 /// (`xdg-open` on Linux, `open` on macOS, `cmd /C start` on Windows).
 /// The child process is detached: FloatDea does not wait for it to exit.
@@ -2216,6 +2820,45 @@ fn file_stem(path: &str) -> String {
         .and_then(|stem| stem.to_str())
         .map(str::to_owned)
         .unwrap_or_else(|| path.to_owned())
+}
+
+/// Maps an image file extension to a MIME type for over-limit external images.
+fn image_ext_as_media_type(path: &str) -> Option<String> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("jpg") | Some("jpeg") => Some("image/jpeg".to_owned()),
+        Some("png") => Some("image/png".to_owned()),
+        _ => None,
+    }
+}
+
+/// Whether a path carries a supported image extension (same rule as the canvas
+/// drop routing).
+fn path_has_image_extension(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    matches!(ext.as_deref(), Some("jpg") | Some("jpeg") | Some("png"))
+}
+
+/// Sanitizes a title for use as Markdown alt text: `]`, newlines and control
+/// characters would break the `![…](…)` syntax.
+fn markdown_alt_text(title: &str) -> String {
+    title
+        .chars()
+        .map(|c| match c {
+            ']' => "\\]".to_owned(),
+            '\n' | '\r' => " ".to_owned(),
+            c if c.is_control() => String::new(),
+            c => c.to_string(),
+        })
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 /// Case-insensitive substring search over all snippets. Title hits come first,
@@ -2308,6 +2951,8 @@ impl HomePage {
             .collect();
         let mut closed_views = Vec::new();
         let mut open_views = Vec::new();
+        let mut pending_image_inserts: Vec<(u64, usize)> = Vec::new();
+        let mut pending_image_opens: Vec<(AttachmentId, egui::ViewportId)> = Vec::new();
         for view in &mut self.views {
             let Some(item) = self.all_snippets.get_mut(&view.entity_id) else {
                 continue;
@@ -2322,6 +2967,9 @@ impl HomePage {
                     &self.clipboard,
                     &self.math_renderer,
                     &self.settings,
+                    &self.workspace.images,
+                    &self.attachment_store,
+                    &mut self.image_cache,
                 )
             } else {
                 Self::render_snippet_viewport(
@@ -2333,11 +2981,20 @@ impl HomePage {
                     &self.clipboard,
                     &self.math_renderer,
                     &self.settings,
+                    &self.workspace.images,
+                    &self.attachment_store,
+                    &mut self.image_cache,
                 )
             };
             match action {
                 ViewAction::Close => closed_views.push(view.id),
                 ViewAction::OpenSnippet(id) => open_views.push(id),
+                ViewAction::ChooseSnippetImage { view_id, cursor } => {
+                    pending_image_inserts.push((view_id, cursor));
+                }
+                ViewAction::OpenImage(id) => {
+                    pending_image_opens.push((id, ui.ctx().viewport_id()));
+                }
                 ViewAction::None => {}
             }
         }
@@ -2346,6 +3003,12 @@ impl HomePage {
             if self.all_snippets.contains_key(&id) {
                 self.open_view(id);
             }
+        }
+        for (view_id, cursor) in pending_image_inserts {
+            self.spawn_image_picker(ImageInsertTarget::Snippet { view_id, cursor });
+        }
+        for (id, origin) in pending_image_opens {
+            self.open_image(&id, origin);
         }
 
         let mut commands_by_viewport: Vec<(egui::ViewportId, Vec<CanvasCommand>)> = Vec::new();
@@ -2364,6 +3027,8 @@ impl HomePage {
                     &mut self.workspace,
                     &self.workspace_store,
                     &self.store,
+                    &self.attachment_store,
+                    &mut self.image_cache,
                     &mut self.all_snippets,
                     &mut self.clipboard,
                     &mut self.os_file_drop_consumed,
@@ -2380,6 +3045,8 @@ impl HomePage {
                     &mut self.workspace,
                     &self.workspace_store,
                     &self.store,
+                    &self.attachment_store,
+                    &mut self.image_cache,
                     &mut self.all_snippets,
                     &mut self.rename_dialog,
                     &mut self.pending_delete,
@@ -2436,6 +3103,7 @@ impl HomePage {
                     id: ExternalFileId::new(),
                     title: file_stem(&path),
                     path,
+                    media_type: None,
                 };
                 self.pending_file_picker = None;
                 self.insert_external_file(&container, file, None);
@@ -2446,6 +3114,27 @@ impl HomePage {
         }
         // The transient "could not open external file" toast.
         render_external_open_error(ui, &self.external_open_error);
+        // Poll and commit the in-flight image insert (canvas or snippet).
+        self.poll_pending_image();
+        // The transient image error toast.
+        self.render_image_error(ui.ctx());
+        // The in-app image viewer (read-only; closing never modifies layout).
+        if let Some(mut viewer) = self.image_viewer.take() {
+            match image::render_viewer(ui, &mut viewer) {
+                image::ViewerAction::None => self.image_viewer = Some(viewer),
+                image::ViewerAction::OpenOriginal(path) => {
+                    if let Err(error) = open_path_externally(&path) {
+                        self.image_error = Some((
+                            format!("Could not open the original image: {error}"),
+                            egui::ViewportId::ROOT,
+                            180,
+                        ));
+                    }
+                    self.image_viewer = Some(viewer);
+                }
+                image::ViewerAction::Close => {}
+            }
+        }
         // Diagnostics: a frame-global OS file drop that no canvas consumed means
         // the events arrived but were rejected (e.g. the drag did not offer
         // `text/uri-list`), which is worth reporting to the user.
@@ -2762,6 +3451,9 @@ mod tests {
             ReferenceTarget::ExternalFile(_) => {
                 panic!("clipboard entries never target external files")
             }
+            ReferenceTarget::Image(_) => {
+                panic!("clipboard entries never target images")
+            }
         }));
     }
 
@@ -2945,6 +3637,7 @@ mod tests {
             ReferenceTarget::Special(_) => panic!("root cards are snippets"),
             ReferenceTarget::Conversation(_) => panic!("root cards are snippets"),
             ReferenceTarget::ExternalFile(_) => panic!("root cards are snippets"),
+            ReferenceTarget::Image(_) => panic!("root cards are snippets"),
         };
         page.open_view(snippet_id);
         assert!(page.clipboard.is_none());
@@ -3225,6 +3918,7 @@ mod tests {
             ReferenceTarget::Special(_) => panic!("root cards are snippets"),
             ReferenceTarget::Conversation(_) => panic!("root cards are snippets"),
             ReferenceTarget::ExternalFile(_) => panic!("root cards are snippets"),
+            ReferenceTarget::Image(_) => panic!("root cards are snippets"),
         };
         (entity_id, page.root.items[0].reference_id.clone())
     }
@@ -3337,6 +4031,8 @@ mod tests {
                 &mut page.workspace,
                 &page.workspace_store,
                 &page.store,
+                &page.attachment_store,
+                &mut page.image_cache,
                 &mut page.clipboard,
                 &page.ai_boxes,
                 page.settings.snap_to_grid,
@@ -3372,6 +4068,8 @@ mod tests {
                 &mut page.workspace,
                 &page.workspace_store,
                 &page.store,
+                &page.attachment_store,
+                &mut page.image_cache,
                 &mut page.clipboard,
                 &page.ai_boxes,
                 page.settings.snap_to_grid,
@@ -3617,6 +4315,8 @@ mod tests {
                 &mut page.workspace,
                 &page.workspace_store,
                 &page.store,
+                &page.attachment_store,
+                &mut page.image_cache,
                 &mut page.clipboard,
                 &page.ai_boxes,
                 true,
@@ -3738,6 +4438,8 @@ mod tests {
             CardLayout {
                 position: [24.0, y1],
                 color: None,
+                size: None,
+                image_fit: None,
             },
         );
         layout.items.insert(
@@ -3745,6 +4447,8 @@ mod tests {
             CardLayout {
                 position: [24.0, y2],
                 color: None,
+                size: None,
+                image_fit: None,
             },
         );
         page.workspace_store.save_layout(&layout).unwrap();
@@ -3764,6 +4468,8 @@ let ctx = egui::Context::default();
                 &mut page.workspace,
                 &page.workspace_store,
                 &page.store,
+                &page.attachment_store,
+                &mut page.image_cache,
                 &mut page.clipboard,
                 &page.ai_boxes,
                 true,
@@ -3843,6 +4549,8 @@ let ctx = egui::Context::default();
             CardLayout {
                 position: [10.0, 20.0],
                 color: None,
+                size: None,
+                image_fit: None,
             },
         );
         page.workspace_store.save_layout(&layout).unwrap();
@@ -3883,6 +4591,8 @@ let ctx = egui::Context::default();
                 &mut page.workspace,
                 &page.workspace_store,
                 &page.store,
+                &page.attachment_store,
+                &mut page.image_cache,
                 &mut page.clipboard,
                 &page.ai_boxes,
                 true,
@@ -4118,6 +4828,7 @@ let ctx = egui::Context::default();
             id: ExternalFileId::new(),
             path: path.to_owned(),
             title: file_stem(path),
+            media_type: None,
         }
     }
 
@@ -4235,6 +4946,7 @@ let ctx = egui::Context::default();
             id,
             path: "/tmp/report.md".to_owned(),
             title: "Architecture Notes".to_owned(),
+            media_type: None,
         });
         assert!(page
             .root
@@ -4316,6 +5028,7 @@ let ctx = egui::Context::default();
             id: ExternalFileId::new(),
             title: "Test Source".to_owned(),
             path: file_path.to_str().unwrap().to_owned(),
+            media_type: None,
         };
         // Link the external file as a Source into the AI box.
         page.process_canvas_commands(
@@ -4456,5 +5169,245 @@ let ctx = egui::Context::default();
             1,
             "the native viewport's single canvas consumes the drop exactly once"
         );
+    }
+
+    #[test]
+    fn external_link_confirmation_dialog_renders_and_cancel_dismisses() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let snippet = Snippet {
+            id: EntityId::new(),
+            title: "with link".to_owned(),
+            content: "see [site](https://example.com/x)".to_owned(),
+        };
+        page.store.save(&snippet).unwrap();
+        page.all_snippets.insert(snippet.id.clone(), snippet.clone());
+        page.open_view(snippet.id.clone());
+        let view = page.views.last_mut().unwrap();
+        view.pending_external = Some("https://example.com/x".to_owned());
+        let view_id = view.id;
+
+        let ctx = egui::Context::default();
+        // Render the view: the confirmation dialog stays open (the URL remains
+        // pending) rather than auto-opening the browser or being dismissed.
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| page.ui_impl(ui));
+        assert!(
+            page.views.iter().any(|v| {
+                v.id == view_id && v.pending_external.as_deref() == Some("https://example.com/x")
+            }),
+            "the pending external link persists while the dialog is open"
+        );
+    }
+
+    #[test]
+    fn external_link_collector_ignores_embeds_and_local_links() {
+        let text = "see [a](hello--abc.md) and [b](https://example.com/x) \
+                    and ![emb](0123456789abcdef0123.md) and ![ext](https://x.example/a.md) \
+                    and <https://auto.example.com>";
+        assert_eq!(
+            snippet::collect_external_links(text),
+            vec!["https://example.com/x".to_owned(), "https://auto.example.com".to_owned()]
+        );
+    }
+
+    // ---- Image attachment tests ----
+
+    /// Writes a small valid PNG to `dir/pic.png` and returns its path.
+    fn write_test_png(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("pic.png");
+        let img = ::image::RgbaImage::from_pixel(120, 80, ::image::Rgba([200, 30, 30, 255]));
+        img.save(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn image_insert_copies_attachment_and_creates_reference() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let src = write_test_png(&folder.0);
+        let src_bytes = fs::read(&src).unwrap();
+
+        let prepared = page
+            .attachment_store
+            .prepare_image(&src)
+            .expect("prepare succeeds for a valid small PNG");
+        let id = page.commit_prepared_image(prepared).expect("commit succeeds");
+        let image = page.workspace.images.get(&id).expect("registered");
+        assert_eq!(image.pixel_size, [120, 80]);
+        assert_eq!(image.byte_len, src_bytes.len() as u64);
+        // The original file is untouched and the workspace file is a copy.
+        assert_eq!(fs::read(&src).unwrap(), src_bytes);
+        let committed = fs::read(page.attachment_store.image_path(image)).unwrap();
+        assert_eq!(committed, src_bytes);
+
+        let root = page.root.container_id.clone();
+        page.insert_image_reference(&root, &id, Some([10.0, 20.0]));
+        let item = page
+            .root
+            .items
+            .iter()
+            .find(|item| matches!(&item.target, ReferenceTarget::Image(rid) if rid == &id))
+            .expect("image card on the canvas");
+        // Default size follows the pixel aspect ratio.
+        assert!((item.size.x - image::IMAGE_DEFAULT_WIDTH).abs() < 0.01);
+        assert!((item.size.y - 160.0).abs() < 0.01);
+        // The saved layout carries the size so a restart restores it.
+        let layout = page.workspace_store.load_layout(&root).unwrap();
+        let layout_size = layout.items[&item.reference_id].size;
+        assert_eq!(layout_size, Some([item.size.x, item.size.y]));
+    }
+
+    #[test]
+    fn image_size_persists_across_restart() {
+        let folder = TestFolder::new();
+        {
+            let mut page = HomePage::new(&folder.0);
+            let src = write_test_png(&folder.0);
+            let id = page
+                .commit_prepared_image(
+                    page.attachment_store.prepare_image(&src).unwrap(),
+                )
+                .unwrap();
+            let root = page.root.container_id.clone();
+            page.insert_image_reference(&root, &id, Some([10.0, 20.0]));
+            let reference = page
+                .root
+                .items
+                .iter()
+                .find(|item| matches!(&item.target, ReferenceTarget::Image(rid) if rid == &id))
+                .unwrap()
+                .reference_id
+                .clone();
+            // Resize like the canvas resize handle would.
+            page.reset_image_size(&reference);
+            let item = page.root.items.iter().find(|i| i.reference_id == reference).unwrap();
+            assert!(item.size.x > 0.0);
+        }
+        let reloaded = HomePage::new(&folder.0);
+        assert_eq!(reloaded.workspace.images.len(), 1);
+        assert!(reloaded.root.items.iter().any(|item| {
+            matches!(&item.target, ReferenceTarget::Image(_))
+        }));
+        let image_id = reloaded.workspace.images.keys().next().unwrap().clone();
+        let item = reloaded
+            .root
+            .items
+            .iter()
+            .find(|item| matches!(&item.target, ReferenceTarget::Image(rid) if rid == &image_id))
+            .expect("image card restored");
+        assert!(
+            (item.size.x - image::IMAGE_DEFAULT_WIDTH).abs() < 0.01,
+            "default image size is restored from pixel_size"
+        );
+    }
+
+    #[test]
+    fn linking_an_image_shares_the_attachment_without_copying() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let src = write_test_png(&folder.0);
+        let id = page
+            .commit_prepared_image(page.attachment_store.prepare_image(&src).unwrap())
+            .unwrap();
+        let box_a = page.workspace.create_container("Box A");
+        let box_b = page.workspace.create_container("Box B");
+        page.workspace.add_container_to_root(box_a.clone());
+        page.workspace.add_container_to_root(box_b.clone());
+        page.insert_image_reference(&box_a, &id, Some([10.0, 20.0]));
+
+        // Paste (Link) the image reference into the other box.
+        let entry = ClipboardEntry {
+            source_container: box_a.clone(),
+            reference_id: ReferenceId::new(),
+            target: ReferenceTarget::Image(id.clone()),
+            semantics: ClipboardSemantics::Link,
+            origin: egui::ViewportId::ROOT,
+        };
+        assert!(page.paste_clipboard(&box_b, &entry));
+        assert_eq!(page.workspace.images.len(), 1, "no duplicate attachment");
+        let members_b = &page.workspace.containers[&box_b].members;
+        assert!(
+            members_b
+                .iter()
+                .any(|r| matches!(&r.target, ReferenceTarget::Image(rid) if rid == &id))
+        );
+    }
+
+    #[test]
+    fn removing_an_image_reference_never_deletes_the_file() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let src = write_test_png(&folder.0);
+        let id = page
+            .commit_prepared_image(page.attachment_store.prepare_image(&src).unwrap())
+            .unwrap();
+        let root = page.root.container_id.clone();
+        page.insert_image_reference(&root, &id, Some([10.0, 20.0]));
+        let image_path = {
+            let image = &page.workspace.images[&id];
+            page.attachment_store.image_path(image)
+        };
+
+        let reference = page.root.items[0].reference_id.clone();
+        page.remove_reference_only(&root, &reference);
+
+        assert!(image_path.is_file(), "attachment file survives reference removal");
+        assert!(page.workspace.images.contains_key(&id));
+        assert!(page.root.items.iter().all(|i| i.reference_id != reference));
+    }
+
+    #[test]
+    fn over_limit_image_prepare_reports_over_inline_limit() {
+        let folder = TestFolder::new();
+        let mut page = HomePage::new(&folder.0);
+        let src = write_test_png(&folder.0);
+        let metadata = fs::metadata(&src).unwrap();
+        assert!(
+            metadata.len() < attachment::MAX_INLINE_IMAGE_BYTES,
+            "test png must be under the limit"
+        );
+        // A prepare on a >20MB synthetic file must not write anything.
+        let big = folder.0.join("big.png");
+        fs::write(&big, vec![0u8; (attachment::MAX_INLINE_IMAGE_BYTES + 1) as usize]).unwrap();
+        let result = page.attachment_store.prepare_image(&big);
+        assert!(matches!(result, Err(ImageError::OverInlineLimit(_))));
+        // The file is never copied into attachments/ (the `.tmp` work dir
+        // exists but holds no committed image files).
+        let committed: Vec<_> = fs::read_dir(page.attachment_store.attachments_dir())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry.file_name() != ".tmp" && entry.file_name().to_string_lossy().ends_with(".png")
+            })
+            .collect();
+        assert!(committed.is_empty());
+    }
+
+    #[test]
+    fn snippet_split_embeds_distinguishes_document_and_image_embeds() {
+        use floatdea::data::markdown_targets::parse_attachment_link;
+        let content = "before ![doc](Hello--0123456789abcdef0123.md) \
+                       mid ![pic](attachments/abcdef0123456789abcd.png) after";
+        let segments = snippet::split_embeds(&content);
+        let kinds: Vec<&str> = segments
+            .iter()
+            .map(|segment| match segment {
+                snippet::PreviewSegment::Text(_) => "text",
+                snippet::PreviewSegment::Embed { .. } => "embed",
+                snippet::PreviewSegment::Image { dest, .. } => {
+                    assert!(parse_attachment_link(dest).is_some());
+                    "image"
+                }
+            })
+            .collect();
+        assert_eq!(kinds, vec!["text", "embed", "text", "image", "text"]);
+    }
+
+    #[test]
+    fn markdown_alt_text_sanitizes_syntax_breaking_characters() {
+        assert_eq!(markdown_alt_text("a]b"), "a\\]b");
+        assert_eq!(markdown_alt_text("line\nbreak"), "line break");
+        assert_eq!(markdown_alt_text("  title  "), "title");
+        assert_eq!(markdown_alt_text("ctl\u{1}char"), "ctlchar");
     }
 }
